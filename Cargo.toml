@@ -49,6 +49,7 @@ members = [
     "crates/google_ai",
     "crates/gpui",
     "crates/gpui_macros",
+    "crates/harpoon",
     "crates/html_to_markdown",
     "crates/http_client",
     "crates/image_viewer",
@@ -232,6 +233,7 @@ gpui = { path = "crates/gpui", default-features = false, features = [
     "http_client",
 ] }
 gpui_macros = { path = "crates/gpui_macros" }
+harpoon = { path = "crates/harpoon" }
 html_to_markdown = { path = "crates/html_to_markdown" }
 http_client = { path = "crates/http_client" }
 image_viewer = { path = "crates/image_viewer" }
