@@ -5,8 +5,8 @@ use collections::HashMap;
 use editor::items::entry_git_aware_label_color;
 use gpui::{
     actions, impl_actions, rems, Action, AnyElement, AppContext, DismissEvent, EntityId,
-    EventEmitter, FocusHandle, FocusableView, Model, Modifiers, MouseButton, MouseUpEvent,
-    ParentElement, Render, Styled, Task, View, ViewContext, VisualContext, WeakView,
+    EventEmitter, FocusHandle, FocusableView, KeyContext, Model, Modifiers, MouseButton,
+    MouseUpEvent, ParentElement, Render, Styled, Task, View, ViewContext, VisualContext, WeakView,
 };
 use picker::{Picker, PickerDelegate};
 use project::Project;
@@ -29,11 +29,22 @@ pub struct Toggle {
     pub select_last: bool,
 }
 
-impl_actions!(harpoon, [Toggle]);
-actions!(harpoon, [CloseSelectedItem]);
+#[derive(Clone, Deserialize, PartialEq)]
+struct Number(usize);
+
+impl_actions!(harpoon, [Toggle, Number]);
+actions!(harpoon, [CloseSelectedItem, Add, Delete, Swap]);
+
+enum HarpoonState {
+    Go(Option<usize>),
+    Add(Option<usize>),
+    Delete(Option<usize>),
+    Swap(Option<usize>, Option<usize>),
+}
 
 pub struct Harpoon {
     picker: View<Picker<HarpoonDelegate>>,
+    state: HarpoonState,
     // init_modifiers: Option<Modifiers>,
 }
 
@@ -46,16 +57,58 @@ pub fn init(cx: &mut AppContext) {
 impl Harpoon {
     fn register(workspace: &mut Workspace, _: &mut ViewContext<Workspace>) {
         workspace.register_action(|workspace, action: &Toggle, cx| {
-            // let Some(harpoon) = workspace.active_modal::<Self>(cx) else {
             Self::open(action, workspace, cx);
             return;
-            // };
+        });
 
-            // harpoon.update(cx, |harpoon, cx| {
-            //     harpoon
-            //         .picker
-            //         .update(cx, |picker, cx| picker.cycle_selection(cx))
-            // });
+        workspace.register_action(|workspace, action: &Add, cx| {
+            let Some(mut harpoon) = workspace.active_modal(cx) else {
+                return;
+            };
+            harpoon.update(cx, |harpoon: &mut Harpoon, cx| {
+                harpoon.state = HarpoonState::Add(None);
+                harpoon.handle(cx);
+            });
+        });
+        workspace.register_action(|workspace, action: &Delete, cx| {
+            let Some(mut harpoon) = workspace.active_modal(cx) else {
+                return;
+            };
+            harpoon.update(cx, |harpoon: &mut Harpoon, cx| {
+                harpoon.state = HarpoonState::Delete(None);
+                harpoon.handle(cx);
+            });
+        });
+        workspace.register_action(|workspace, action: &Swap, cx| {
+            let Some(mut harpoon) = workspace.active_modal(cx) else {
+                return;
+            };
+            harpoon.update(cx, |harpoon: &mut Harpoon, cx| {
+                harpoon.state = HarpoonState::Swap(None, None);
+                harpoon.handle(cx);
+            });
+        });
+        workspace.register_action(|workspace, action: &Number, cx| {
+            let Some(mut harpoon) = workspace.active_modal(cx) else {
+                return;
+            };
+            harpoon.update(cx, |harpoon: &mut Harpoon, cx| {
+                match harpoon.state {
+                    HarpoonState::Go(None) => harpoon.state = HarpoonState::Go(Some(action.0)),
+                    HarpoonState::Add(None) => harpoon.state = HarpoonState::Add(Some(action.0)),
+                    HarpoonState::Delete(None) => {
+                        harpoon.state = HarpoonState::Delete(Some(action.0))
+                    }
+                    HarpoonState::Swap(None, None) => {
+                        harpoon.state = HarpoonState::Swap(Some(action.0), None)
+                    }
+                    HarpoonState::Swap(Some(n), None) => {
+                        harpoon.state = HarpoonState::Swap(Some(n), Some(action.0))
+                    }
+                    _ => {}
+                }
+                harpoon.handle(cx);
+            });
         });
     }
 
@@ -90,8 +143,29 @@ impl Harpoon {
     fn new(delegate: HarpoonDelegate, cx: &mut ViewContext<Self>) -> Self {
         Self {
             picker: cx.new_view(|cx| Picker::nonsearchable_uniform_list(delegate, cx)),
+            state: HarpoonState::Go(None),
             // init_modifiers: cx.modifiers().modified().then_some(cx.modifiers()),
         }
+    }
+
+    fn handle(&mut self, cx: &mut ViewContext<Self>) {
+        match self.state {
+            HarpoonState::Add(Some(at)) => self.picker.update(cx, |picker, cx| {
+                picker.delegate.add_match(at, cx);
+                self.state = HarpoonState::Go(None);
+            }),
+            HarpoonState::Delete(Some(at)) => self.picker.update(cx, |picker, cx| {
+                picker.delegate.remove_match(at, cx);
+                self.state = HarpoonState::Go(None);
+            }),
+            HarpoonState::Swap(Some(from), Some(to)) => self.picker.update(cx, |picker, cx| {
+                picker.delegate.swap_match(from, to, cx);
+                self.state = HarpoonState::Go(None);
+            }),
+
+            _ => {}
+        }
+        cx.notify();
     }
 
     // fn handle_modifiers_changed(
@@ -112,13 +186,13 @@ impl Harpoon {
     //     }
     // }
 
-    fn handle_close_selected_item(&mut self, _: &CloseSelectedItem, cx: &mut ViewContext<Self>) {
-        self.picker.update(cx, |picker, cx| {
-            picker
-                .delegate
-                .close_item_at(picker.delegate.selected_index(), cx)
-        });
-    }
+    // fn handle_close_selected_item(&mut self, _: &CloseSelectedItem, cx: &mut ViewContext<Self>) {
+    //     self.picker.update(cx, |picker, cx| {
+    //         picker
+    //             .delegate
+    //             .close_item_at(picker.delegate.selected_index(), cx)
+    //     });
+    // }
 }
 
 impl EventEmitter<DismissEvent> for Harpoon {}
@@ -134,7 +208,7 @@ impl Render for Harpoon {
         v_flex()
             .key_context("Harpoon")
             .w(rems(PANEL_WIDTH_REMS))
-            .on_action(cx.listener(Self::handle_close_selected_item))
+            // .on_action(cx.listener(Self::handle_close_selected_item))
             .child(self.picker.clone())
     }
 }
@@ -152,7 +226,7 @@ pub struct HarpoonDelegate {
     selected_index: usize,
     pane: WeakView<Pane>,
     project: Model<Project>,
-    matches: Vec<TabMatch>,
+    matches: HashMap<usize, TabMatch>,
 }
 
 impl HarpoonDelegate {
@@ -170,7 +244,7 @@ impl HarpoonDelegate {
             selected_index: 0,
             pane,
             project,
-            matches: Vec::new(),
+            matches: HashMap::new(),
         }
     }
 
@@ -178,102 +252,142 @@ impl HarpoonDelegate {
         let Some(pane) = pane.upgrade() else {
             return;
         };
-        cx.subscribe(&pane, |harpoon, _, event, cx| {
-            match event {
-                PaneEvent::AddItem { .. }
-                | PaneEvent::RemovedItem { .. }
-                | PaneEvent::Remove { .. } => harpoon.picker.update(cx, |picker, cx| {
-                    let selected_item_id = picker.delegate.selected_item_id();
-                    picker.delegate.update_matches(cx);
-                    if let Some(item_id) = selected_item_id {
-                        picker.delegate.select_item(item_id, cx);
-                    }
-                    cx.notify();
-                }),
-                _ => {}
-            };
-        })
-        .detach();
+        // cx.subscribe(&pane, |harpoon, _, event, cx| {
+        //     match event {
+        //         PaneEvent::AddItem { .. }
+        //         | PaneEvent::RemovedItem { .. }
+        //         | PaneEvent::Remove { .. } => harpoon.picker.update(cx, |picker, cx| {
+        //             let selected_item_id = picker.delegate.selected_item_id();
+        //             // picker.delegate.update_matches(cx);
+        //             if let Some(item_id) = selected_item_id {
+        //                 picker.delegate.select_item(item_id, cx);
+        //             }
+        //             cx.notify();
+        //         }),
+        //         _ => {}
+        //     };
+        // })
+        // .detach();
     }
 
-    fn update_matches(&mut self, cx: &mut WindowContext) {
-        self.matches.clear();
+    fn add_match(&mut self, at: usize, cx: &mut WindowContext) {
         let Some(pane) = self.pane.upgrade() else {
             return;
         };
-
         let pane = pane.read(cx);
-        let mut history_indices = HashMap::default();
-        pane.activation_history().iter().rev().enumerate().for_each(
-            |(history_index, history_entry)| {
-                history_indices.insert(history_entry.entity_id, history_index);
+        let Some(active_tab) = pane.active_item() else {
+            return;
+        };
+        self.matches.insert(
+            at,
+            TabMatch {
+                item_index: 0,
+                item: active_tab.boxed_clone(),
+                detail: 0,
+                preview: false,
             },
         );
-
-        let items: Vec<Box<dyn ItemHandle>> = pane.items().map(|item| item.boxed_clone()).collect();
-        items
-            .iter()
-            .enumerate()
-            .zip(tab_details(&items, cx))
-            .map(|((item_index, item), detail)| TabMatch {
-                item_index,
-                item: item.boxed_clone(),
-                detail,
-                preview: pane.is_active_preview_item(item.item_id()),
-            })
-            .for_each(|tab_match| self.matches.push(tab_match));
-
-        let non_history_base = history_indices.len();
-        self.matches.sort_by(move |a, b| {
-            let a_score = *history_indices
-                .get(&a.item.item_id())
-                .unwrap_or(&(a.item_index + non_history_base));
-            let b_score = *history_indices
-                .get(&b.item.item_id())
-                .unwrap_or(&(b.item_index + non_history_base));
-            a_score.cmp(&b_score)
-        });
-
-        if self.matches.len() > 1 {
-            if self.select_last {
-                self.selected_index = self.matches.len() - 1;
-            } else {
-                self.selected_index = 1;
-            }
-        }
     }
 
-    fn selected_item_id(&self) -> Option<EntityId> {
-        self.matches
-            .get(self.selected_index())
-            .map(|tab_match| tab_match.item.item_id())
+    fn remove_match(&mut self, at: usize, cx: &mut WindowContext) {
+        self.matches.remove(&at);
     }
 
-    fn select_item(
-        &mut self,
-        item_id: EntityId,
-        cx: &mut ViewContext<'_, Picker<HarpoonDelegate>>,
-    ) {
-        let selected_idx = self
-            .matches
-            .iter()
-            .position(|tab_match| tab_match.item.item_id() == item_id)
-            .unwrap_or(0);
-        self.set_selected_index(selected_idx, cx);
-    }
-
-    fn close_item_at(&mut self, ix: usize, cx: &mut ViewContext<'_, Picker<HarpoonDelegate>>) {
-        let Some(tab_match) = self.matches.get(ix) else {
+    fn swap_match(&mut self, from: usize, to: usize, cx: &mut WindowContext) {
+        // let Some(from) = self.matches..get_mut(&from) else {
+        //     return;
+        // };
+        // let Some(to) = self.matches.get_mut(&to) else {
+        //     return;
+        // };
+        let Some(value1) = self.matches.remove(&from) else {
             return;
         };
-        let Some(pane) = self.pane.upgrade() else {
+        let Some(value2) = self.matches.remove(&to) else {
             return;
         };
-        pane.update(cx, |pane, cx| {
-            pane.close_item_by_id(tab_match.item.item_id(), SaveIntent::Close, cx)
-                .detach_and_log_err(cx);
-        });
+        self.matches.insert(from, value2);
+        self.matches.insert(to, value1);
     }
+
+    // fn update_matches(&mut self, cx: &mut WindowContext) {
+    //     self.matches.clear();
+    //     let Some(pane) = self.pane.upgrade() else {
+    //         return;
+    //     };
+
+    //     let pane = pane.read(cx);
+    //     let mut history_indices = HashMap::default();
+    //     pane.activation_history().iter().rev().enumerate().for_each(
+    //         |(history_index, history_entry)| {
+    //             history_indices.insert(history_entry.entity_id, history_index);
+    //         },
+    //     );
+
+    //     let items: Vec<Box<dyn ItemHandle>> = pane.items().map(|item| item.boxed_clone()).collect();
+    //     items
+    //         .iter()
+    //         .enumerate()
+    //         .zip(tab_details(&items, cx))
+    //         .map(|((item_index, item), detail)| TabMatch {
+    //             item_index,
+    //             item: item.boxed_clone(),
+    //             detail,
+    //             preview: pane.is_active_preview_item(item.item_id()),
+    //         })
+    //         .for_each(|tab_match| self.matches.push(tab_match));
+
+    //     let non_history_base = history_indices.len();
+    //     self.matches.sort_by(move |a, b| {
+    //         let a_score = *history_indices
+    //             .get(&a.item.item_id())
+    //             .unwrap_or(&(a.item_index + non_history_base));
+    //         let b_score = *history_indices
+    //             .get(&b.item.item_id())
+    //             .unwrap_or(&(b.item_index + non_history_base));
+    //         a_score.cmp(&b_score)
+    //     });
+
+    //     if self.matches.len() > 1 {
+    //         if self.select_last {
+    //             self.selected_index = self.matches.len() - 1;
+    //         } else {
+    //             self.selected_index = 1;
+    //         }
+    //     }
+    // }
+
+    // fn selected_item_id(&self) -> Option<EntityId> {
+    //     self.matches
+    //         .get(self.selected_index())
+    //         .map(|tab_match| tab_match.item.item_id())
+    // }
+
+    // fn select_item(
+    //     &mut self,
+    //     item_id: EntityId,
+    //     cx: &mut ViewContext<'_, Picker<HarpoonDelegate>>,
+    // ) {
+    //     let selected_idx = self
+    //         .matches
+    //         .iter()
+    //         .position(|tab_match| tab_match.item.item_id() == item_id)
+    //         .unwrap_or(0);
+    //     self.set_selected_index(selected_idx, cx);
+    // }
+
+    // fn close_item_at(&mut self, ix: usize, cx: &mut ViewContext<'_, Picker<HarpoonDelegate>>) {
+    //     let Some(tab_match) = self.matches.get(ix) else {
+    //         return;
+    //     };
+    //     let Some(pane) = self.pane.upgrade() else {
+    //         return;
+    //     };
+    //     pane.update(cx, |pane, cx| {
+    //         pane.close_item_by_id(tab_match.item.item_id(), SaveIntent::Close, cx)
+    //             .detach_and_log_err(cx);
+    //     });
+    // }
 }
 
 impl PickerDelegate for HarpoonDelegate {
@@ -309,7 +423,7 @@ impl PickerDelegate for HarpoonDelegate {
         _raw_query: String,
         cx: &mut ViewContext<Picker<Self>>,
     ) -> Task<()> {
-        self.update_matches(cx);
+        // self.update_matches(cx);
         Task::ready(())
     }
 
@@ -317,7 +431,7 @@ impl PickerDelegate for HarpoonDelegate {
         let Some(pane) = self.pane.upgrade() else {
             return;
         };
-        let Some(selected_match) = self.matches.get(self.selected_index()) else {
+        let Some(selected_match) = self.matches.get(&self.selected_index) else {
             return;
         };
         pane.update(cx, |pane, cx| {
@@ -337,10 +451,7 @@ impl PickerDelegate for HarpoonDelegate {
         selected: bool,
         cx: &mut ViewContext<Picker<Self>>,
     ) -> Option<Self::ListItem> {
-        let tab_match = self
-            .matches
-            .get(ix)
-            .expect("Invalid matches state: no element for index {ix}");
+        let (key, tab_match) = self.matches.iter().nth(ix)?;
 
         let params = TabContentParams {
             detail: Some(tab_match.detail),
@@ -382,6 +493,7 @@ impl PickerDelegate for HarpoonDelegate {
             .children(indicator)
             .child(div().w_2())
             .into_any_element();
+        let number = Label::new(String::from(key.to_string()));
         let close_button = div()
             // We need this on_mouse_up here instead of on_click on the close
             // button because Picker intercepts the same events and handles them
@@ -391,7 +503,7 @@ impl PickerDelegate for HarpoonDelegate {
                 MouseButton::Right,
                 cx.listener(move |picker, _: &MouseUpEvent, cx| {
                     cx.stop_propagation();
-                    picker.delegate.close_item_at(ix, cx);
+                    // picker.delegate.close_item_at(ix, cx);
                 }),
             )
             .child(
@@ -416,7 +528,8 @@ impl PickerDelegate for HarpoonDelegate {
                         el.end_slot::<AnyElement>(indicator)
                             .end_hover_slot::<AnyElement>(close_button)
                     }
-                }),
+                })
+                .map(|el| el.start_slot::<Label>(number)),
         )
     }
 }

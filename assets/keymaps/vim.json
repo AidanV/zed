@@ -635,5 +635,24 @@
       "shift-g": "menu::SelectLast",
       "g g": "menu::SelectFirst"
     }
+  },
+  {
+    "context": "Harpoon",
+    "use_layout_keys": true,
+    "bindings": {
+      "a": "harpoon::Add",
+      "d": "harpoon::Delete",
+      "s": "harpoon::Swap",
+      "1": ["harpoon::Number", 1],
+      "2": ["harpoon::Number", 2],
+      "3": ["harpoon::Number", 3],
+      "4": ["harpoon::Number", 4],
+      "5": ["harpoon::Number", 5],
+      "6": ["harpoon::Number", 6],
+      "7": ["harpoon::Number", 7],
+      "8": ["harpoon::Number", 8],
+      "9": ["harpoon::Number", 9],
+      "0": ["harpoon::Number", 0]
+    }
   }
 ]
