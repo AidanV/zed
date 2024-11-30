@@ -1,19 +1,21 @@
 use std::{ops::Range, sync::Arc};
 
+use crate::{
+    motion::{self, Motion},
+    state::Mode,
+    Vim,
+};
 use editor::{
     display_map::{DisplaySnapshot, ToDisplayPoint},
     movement,
     scroll::Autoscroll,
     Anchor, Bias, DisplayPoint,
 };
-use gpui::ViewContext;
+use gpui::{Entity, ViewContext};
 use language::SelectionGoal;
-use workspace::{global_marks, ItemHandle, WeakItemHandle};
-
-use crate::{
-    motion::{self, Motion},
-    state::Mode,
-    Vim,
+use workspace::{
+    global_marks::{self, GlobalMarks},
+    ItemHandle, WeakItemHandle,
 };
 
 impl Vim {
@@ -28,21 +30,30 @@ impl Vim {
         }) else {
             return;
         };
-        if text.starts_with(|c| c.is_uppercase()) {
-            cx.global_mut::<GlobalMarks>().marks.insert(
-                text.to_string(),
-                global_marks::Mark {
-                    project_path: self.editor.upgrade()?.project_path(cx)?,
-                    absolute_path: None,
-                    mark_type: global_marks::MarkType::DynamicMark,
-                    entry: workspace::NavigationEntry {
-                        item: self.editor.upgrade()?.downgrade_item(),
-                        data: None, //self.editor.upgrade()?.map(|data| Box::new(data) as Box<dyn Any + Send>),
-                        timestamp: 0,
-                        is_preview: false,
+        if text.starts_with(|c: char| c.is_digit(10)) {
+            if let Some(editor) = self.editor.upgrade() {
+                let Some(project_path) = editor.project_path(cx) else {
+                    return;
+                };
+                println!("!");
+                let navigation_data = editor.update(cx, |editor, cx| {
+                    editor.get_navigation_data(editor.selections.newest_anchor().head(), cx)
+                });
+                cx.global_mut::<GlobalMarks>().marks.insert(
+                    text.to_string(),
+                    global_marks::Mark {
+                        project_path,
+                        absolute_path: None,
+                        mark_type: global_marks::MarkType::DynamicMark,
+                        entry: workspace::NavigationEntry {
+                            item: editor.downgrade_item().into(),
+                            data: navigation_data, //self.editor.upgrade()?.map(|data| Box::new(data) as Box<dyn Any + Send>),
+                            timestamp: 0,
+                            is_preview: false,
+                        },
                     },
-                },
-            );
+                );
+            }
         } else {
             self.marks.insert(text.to_string(), anchors);
         }
@@ -87,6 +98,14 @@ impl Vim {
     pub fn jump(&mut self, text: Arc<str>, line: bool, cx: &mut ViewContext<Self>) {
         self.pop_operator(cx);
 
+        if (*text).starts_with(|c: char| c.is_digit(10)) {
+            if let Some(workspace) = self.workspace(cx) {
+                workspace.update(cx, |workspace, cx| {
+                    global_marks::navigate_mark((*text).to_string(), workspace, cx);
+                })
+            }
+            return;
+        }
         let anchors = match &*text {
             "{" | "}" => self.update_editor(cx, |_, editor, cx| {
                 let (map, selections) = editor.selections.all_display(cx);

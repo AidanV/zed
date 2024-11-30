@@ -158,18 +158,18 @@ impl Harpoon {
     fn handle(&mut self, cx: &mut ViewContext<Self>) {
         match self.state {
             HarpoonState::Add => self.picker.update(cx, |picker, cx| {
-                picker.delegate.add_match(cx);
+                // picker.delegate.add_match(cx);
                 self.state = HarpoonState::Go(None);
             }),
             HarpoonState::Delete(Some(at)) => self.picker.update(cx, |picker, cx| {
-                picker.delegate.remove_match(at, cx);
+                // picker.delegate.remove_match(at, cx);
                 self.state = HarpoonState::Go(None);
             }),
             HarpoonState::Swap(Some(from), None) => self.picker.update(cx, |picker, cx| {
-                picker.delegate.set_selected_index(from, cx);
+                // picker.delegate.set_selected_index(from, cx);
             }),
             HarpoonState::Swap(Some(from), Some(to)) => self.picker.update(cx, |picker, cx| {
-                picker.delegate.swap_match(from, to, cx);
+                // picker.delegate.swap_match(from, to, cx);
                 self.state = HarpoonState::Go(None);
             }),
 
@@ -236,7 +236,7 @@ pub struct HarpoonDelegate {
     selected_index: usize,
     pane: WeakView<Pane>,
     project: Model<Project>,
-    matches: Vec<Path>,
+    matches: HashMap<usize, TabMatch>,
 }
 
 impl HarpoonDelegate {
@@ -254,7 +254,7 @@ impl HarpoonDelegate {
             selected_index: 0,
             pane,
             project,
-            matches: Vec::new(),
+            matches: HashMap::new(),
         }
     }
 
@@ -280,55 +280,66 @@ impl HarpoonDelegate {
         // .detach();
     }
 
-    fn add_match(&mut self, cx: &mut WindowContext) {
-        let Some(pane) = self.pane.upgrade() else {
-            return;
-        };
-        let pane = pane.read(cx);
-        let Some(active_tab) = pane.active_item() else {
-            return;
-        };
-        if self.matches.len() < MAX_HARPOON_LEN {
-            let Some(project_path) = active_tab.project_path(cx) else {
-                return;
-            };
-            self.matches.push(Path::from(project_path.path));
-            // self.matches.push(TabMatch {
-            //     item_index: 0,
-            //     item: active_tab.boxed_clone(),
-            //     detail: 0,
-            //     preview: false,
-            // });
-        }
-    }
+    // fn add_match(&mut self, cx: &mut WindowContext) {
+    //     let Some(pane) = self.pane.upgrade() else {
+    //         return;
+    //     };
+    //     let pane = pane.read(cx);
+    //     let Some(active_tab) = pane.active_item() else {
+    //         return;
+    //     };
+    //     if self.matches.len() < MAX_HARPOON_LEN {
+    //         let Some(project_path) = active_tab.project_path(cx) else {
+    //             return;
+    //         };
+    //         // self.matches.push(Path::from(project_path.path));
+    //         // self.matches.push(TabMatch {
+    //         //     item_index: 0,
+    //         //     item: active_tab.boxed_clone(),
+    //         //     detail: 0,
+    //         //     preview: false,
+    //         // });
+    //     }
+    // }
 
-    fn remove_match(&mut self, at: usize, cx: &mut WindowContext) {
-        if at < self.matches.len() {
-            self.matches.remove(at);
-        }
-    }
+    // fn remove_match(&mut self, at: usize, cx: &mut WindowContext) {
+    //     if at < self.matches.len() {
+    //         self.matches.remove(at);
+    //     }
+    // }
 
-    fn swap_match(&mut self, from: usize, to: usize, cx: &mut WindowContext) {
-        // let Some(from) = self.matches..get_mut(&from) else {
-        //     return;
-        // };
-        // let Some(to) = self.matches.get_mut(&to) else {
-        //     return;
-        // };
-        if from < self.matches.len() && to < self.matches.len() {
-            self.matches.swap(from, to);
-        }
-    }
+    // fn swap_match(&mut self, from: usize, to: usize, cx: &mut WindowContext) {
+    //     if !self.matches.contains_key(from) || !self.matches.contains_key(to) {
+    //         return;
+    //     }
+    //     let Some(from_tab) = self.matches.remove(&from) else {
+    //         return;
+    //     };
+    //     let Some(to_tab) = self.matches.remove(&to) else {
+    //         return;
+    //     };
+    //     self.matches.insert(from, to_tab);
+    //     self.matches.insert(to, from_tab);
+    //     // if from < self.matches.len() && to < self.matches.len() {
+    //     //     self.matches.swap(from, to);
+    //     // }
+    // }
 
     fn update_matches(&mut self, cx: &mut WindowContext) {
         self.matches.clear();
-        for mark in cx.global::<GlobalMarks>().get_dynamic_marks() {
-            self.matches.push(TabMatch {
-                item_index: 0,
-                item: mark.entry.item.upgrade()?,
-                detail: 0,
-                preview: false,
-            });
+        for (i, mark) in cx.global::<GlobalMarks>().get_dynamic_marks() {
+            let Some(item) = mark.entry.item.upgrade() else {
+                continue;
+            };
+            self.matches.insert(
+                i,
+                TabMatch {
+                    item_index: 0,
+                    item,
+                    detail: 0,
+                    preview: false,
+                },
+            );
         }
     }
 
@@ -453,7 +464,7 @@ impl PickerDelegate for HarpoonDelegate {
         let Some(pane) = self.pane.upgrade() else {
             return;
         };
-        let Some(selected_match) = self.matches.get(self.selected_index) else {
+        let Some(selected_match) = self.matches.get(&self.selected_index) else {
             return;
         };
         pane.update(cx, |pane, cx| {
@@ -488,8 +499,28 @@ impl PickerDelegate for HarpoonDelegate {
         //     break;
         //     // }
         // }
+        let mut count = 0;
+        let mut tab_match = None;
+        for i in 0..9 {
+            if self.matches.contains_key(&i) {
+                if count == ix {
+                    match self.matches.get(&i) {
+                        Some(tm) => {
+                            tab_match = Some((i, tm));
+                            break;
+                        }
+                        None => {}
+                    }
+                }
+                count += 1;
+            }
+        }
+        println!("!!");
 
-        let tab_match = self.matches.get(ix)?;
+        let Some((key, tab_match)) = tab_match else {
+            return None;
+        };
+        println!("!!!");
 
         let params = TabContentParams {
             detail: Some(tab_match.detail),
@@ -531,7 +562,7 @@ impl PickerDelegate for HarpoonDelegate {
             .children(indicator)
             .child(div().w_2())
             .into_any_element();
-        let number = Label::new(String::from((ix).to_string()));
+        let number = Label::new(String::from((key).to_string()));
         let close_button = div()
             // We need this on_mouse_up here instead of on_click on the close
             // button because Picker intercepts the same events and handles them

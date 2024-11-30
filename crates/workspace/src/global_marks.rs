@@ -51,61 +51,70 @@ impl GlobalMarks {
     // pub fn get_marks_mut(cx: &mut AppContext) -> &mut Self {
     //     cx.global_mut::<GlobalGlobalMarks>()
     // }
-    pub fn get_dynamic_marks(&self) -> Vec<&Mark> {
-        let mut v = Vec::new();
-        for (_, value) in &self.marks {
-            if value.mark_type == MarkType::DynamicMark {
-                v.push(value);
+    pub fn get_dynamic_marks(&self) -> HashMap<usize, &Mark> {
+        let mut hm = HashMap::new();
+        for (key, value) in &self.marks {
+            let i = key.parse::<usize>();
+            if i.is_ok() && value.mark_type == MarkType::DynamicMark {
+                hm.insert(i.expect("Failed to convert to int"), value);
             }
         }
-        v
-    }
-    pub fn navigate_mark(
-        &mut self,
-        mark_name: String,
-        workspace: &mut Workspace,
-        cx: &mut ViewContext<Workspace>,
-    ) {
-        match get_pane(mark_name.clone(), workspace, cx) {
-            Some(pane) => pane.update(cx, |pane, cx| {
-                if let Some(mark) = self.marks.get(&mark_name) {
-                    pane.focus(cx);
-                    if let Some(index) = mark
-                        .entry
-                        .item
-                        .upgrade()
-                        .and_then(|v| pane.index_for_item(v.as_ref()))
-                    {
-                        let prev_active_item_index = pane.active_item_index();
-                        pane.activate_item(index, true, true, cx);
-
-                        if let Some(active_item) = pane.active_item() {
-                            if let Some(data) = mark.entry.data {
-                                active_item.navigate(data, cx);
-                            }
-                        }
-                    }
-                }
-            }),
-            None => {
-                if let Some(mark) = self.marks.get(&mark_name) {
-                    workspace
-                        .launch_path(
-                            workspace.active_pane().downgrade(),
-                            mark.project_path.clone(),
-                            mark.absolute_path.clone(),
-                            &mark.entry,
-                            crate::NavigationMode::Normal,
-                            cx,
-                        )
-                        .detach();
-                }
-            }
-        };
+        hm
     }
 }
 
 impl Global for GlobalMarks {}
+
+pub fn navigate_mark(
+    mark_name: String,
+    workspace: &mut Workspace,
+    cx: &mut ViewContext<Workspace>,
+) {
+    println!("2");
+    match get_pane(mark_name.clone(), workspace, cx) {
+        Some(pane) => pane.update(cx, |pane, cx| {
+            pane.focus(cx);
+
+            println!("3");
+            let Some(mark) = cx.global::<GlobalMarks>().marks.get(&mark_name) else {
+                return;
+            };
+
+            println!("4");
+            if let Some(index) = mark
+                .entry
+                .item
+                .upgrade()
+                .and_then(|v| pane.index_for_item(v.as_ref()))
+            {
+                let prev_active_item_index = pane.active_item_index();
+                pane.activate_item(index, true, true, cx);
+
+                println!("5");
+                // if let Some(active_item) = pane.active_item() {
+                //     if let Some(data) = mark.entry.data {
+                //         active_item.navigate(data, cx);
+                //     }
+                // }
+            }
+        }),
+        None => {
+            println!("we went none");
+            // if let Some(mark) = self.marks.get(&mark_name) {
+            //     workspace
+            //         .launch_path(
+            //             workspace.active_pane().downgrade(),
+            //             mark.project_path.clone(),
+            //             mark.absolute_path.clone(),
+            //             &mark.enty,
+            //             crate::NavigationMode::Normal,
+            //             cx,
+            //         )
+            //         .detach();
+            // }
+        }
+    };
+}
 
 fn get_pane<'a>(
     mark_name: String,
@@ -118,13 +127,19 @@ fn get_pane<'a>(
         let entry_id = project_item.project_entry_ids(cx)[0];
         let project_path = project_item.project_path(cx);
 
+        println!("a {:?}", entry_id);
         let mut item = pane.read(cx).item_for_entry(entry_id, cx);
+        println!("b {}", item.is_some());
         if item.is_none() {
             if let Some(project_path) = project_path {
                 item = pane.read(cx).item_for_path(project_path, cx);
             }
         }
+        println!("c {}", item.is_some());
 
-        item.and_then(|item| item.downcast::<Pane>())
+        if item.is_some() {
+            return Some(pane.clone());
+        }
+        None
     });
 }

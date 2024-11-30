@@ -102,6 +102,7 @@ pub use proposed_changes_editor::{
     ProposedChangeLocation, ProposedChangesEditor, ProposedChangesEditorToolbar,
 };
 use similar::{ChangeTag, TextDiff};
+use std::any::Any;
 use std::iter::Peekable;
 use task::{ResolvedTask, TaskTemplate, TaskVariables};
 
@@ -8420,6 +8421,25 @@ impl Editor {
                 cx,
             );
         }
+    }
+
+    pub fn get_navigation_data(
+        &self,
+        cursor_anchor: Anchor,
+        cx: &ViewContext<Self>,
+    ) -> Option<Box<dyn Any + Send>> {
+        let buffer = self.buffer.read(cx).read(cx);
+        let cursor_position = cursor_anchor.to_point(&buffer);
+        let scroll_state = self.scroll_manager.anchor();
+        let scroll_top_row = scroll_state.top_row(&buffer);
+        drop(buffer);
+
+        Some(Box::new(NavigationData {
+            cursor_anchor,
+            cursor_position,
+            scroll_anchor: scroll_state,
+            scroll_top_row,
+        }))
     }
 
     pub fn select_to_end(&mut self, _: &SelectToEnd, cx: &mut ViewContext<Self>) {
