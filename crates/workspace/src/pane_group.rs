@@ -41,6 +41,22 @@ impl PaneGroup {
         }
     }
 
+    pub fn find<F>(&mut self, p: F) -> Option<View<Pane>>
+    where
+        F: Fn(&View<Pane>) -> Option<View<Pane>>,
+    {
+        fn rec<F>(root: &Member, p: &F) -> Option<View<Pane>>
+        where
+            F: Fn(&View<Pane>) -> Option<View<Pane>>,
+        {
+            match &root {
+                Member::Pane(pane) => p(pane),
+                Member::Axis(axis) => axis.members.iter().find_map(|member| rec(member, p)),
+            }
+        }
+        rec(&self.root, &p)
+    }
+
     pub fn split(
         &mut self,
         old_pane: &View<Pane>,

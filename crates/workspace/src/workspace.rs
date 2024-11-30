@@ -1,4 +1,5 @@
 pub mod dock;
+pub mod global_marks;
 pub mod item;
 mod modal_layer;
 pub mod notifications;
@@ -30,6 +31,7 @@ use futures::{
     future::try_join_all,
     Future, FutureExt, StreamExt,
 };
+use global_marks::GlobalMarks;
 use gpui::{
     action_as, actions, canvas, impl_action_as, impl_actions, point, relative, size,
     transparent_black, Action, AnyView, AnyWeakView, AppContext, AsyncAppContext,
@@ -324,6 +326,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut AppContext) {
     init_settings(cx);
     notifications::init(cx);
     theme_preview::init(cx);
+    global_marks::init(cx);
 
     cx.on_action(Workspace::close_global);
     cx.on_action(reload);
@@ -1348,6 +1351,90 @@ impl Workspace {
             .collect()
     }
 
+    fn launch_path(
+        &mut self,
+        pane: WeakView<Pane>,
+        project_path: ProjectPath,
+        abs_path: Option<PathBuf>,
+        entry: NavigationEntry,
+        mode: NavigationMode,
+        cx: &mut ViewContext<Workspace>,
+    ) -> Task<Result<()>> {
+        // If the item was no longer present, then load it again from its previous path, first try the local path
+        let open_by_project_path = self.load_path(project_path.clone(), cx);
+
+        cx.spawn(move |workspace, mut cx| async move {
+            let open_by_project_path = open_by_project_path.await;
+            let mut navigated = false;
+            match open_by_project_path
+                .with_context(|| format!("Navigating to {project_path:?}"))
+            {
+                Ok((project_entry_id, build_item)) => {
+                    let prev_active_item_id = pane.update(&mut cx, |pane, _| {
+                        pane.nav_history_mut().set_mode(mode);
+                        pane.active_item().map(|p| p.item_id())
+                    })?;
+
+                    pane.update(&mut cx, |pane, cx| {
+                        let item = pane.open_item(
+                            project_entry_id,
+                            true,
+                            entry.is_preview,
+                            None,
+                            cx,
+                            build_item,
+                        );
+                        navigated |= Some(item.item_id()) != prev_active_item_id;
+                        pane.nav_history_mut().set_mode(NavigationMode::Normal);
+                        if let Some(data) = entry.data {
+                            navigated |= item.navigate(data, cx);
+                        }
+                    })?;
+                }
+                Err(open_by_project_path_e) => {
+                    // Fall back to opening by abs path, in case an external file was opened and closed,
+                    // and its worktree is now dropped
+                    if let Some(abs_path) = abs_path {
+                        let prev_active_item_id = pane.update(&mut cx, |pane, _| {
+                            pane.nav_history_mut().set_mode(mode);
+                            pane.active_item().map(|p| p.item_id())
+                        })?;
+                        let open_by_abs_path = workspace.update(&mut cx, |workspace, cx| {
+                            workspace.open_abs_path(abs_path.clone(), false, cx)
+                        })?;
+                        match open_by_abs_path
+                            .await
+                            .with_context(|| format!("Navigating to {abs_path:?}"))
+                        {
+                            Ok(item) => {
+                                pane.update(&mut cx, |pane, cx| {
+                                    navigated |= Some(item.item_id()) != prev_active_item_id;
+                                    pane.nav_history_mut().set_mode(NavigationMode::Normal);
+                                    if let Some(data) = entry.data {
+                                        navigated |= item.navigate(data, cx);
+                                    }
+                                })?;
+                            }
+                            Err(open_by_abs_path_e) => {
+                                log::error!("Failed to navigate history: {open_by_project_path_e:#} and {open_by_abs_path_e:#}");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // if !navigated {
+            //     workspace
+            //         .update(&mut cx, |workspace, cx| {
+            //             Self::launch_path(workspace, pane, project_path, abs_path, entry, mode, cx)
+            //         })?
+            //         .await?;
+            // }
+
+            Ok(())
+        })
+    }
+
     fn navigate_history(
         &mut self,
         pane: WeakView<Pane>,
@@ -1395,79 +1482,7 @@ impl Workspace {
         };
 
         if let Some((project_path, abs_path, entry)) = to_load {
-            // If the item was no longer present, then load it again from its previous path, first try the local path
-            let open_by_project_path = self.load_path(project_path.clone(), cx);
-
-            cx.spawn(|workspace, mut cx| async move {
-                let open_by_project_path = open_by_project_path.await;
-                let mut navigated = false;
-                match open_by_project_path
-                    .with_context(|| format!("Navigating to {project_path:?}"))
-                {
-                    Ok((project_entry_id, build_item)) => {
-                        let prev_active_item_id = pane.update(&mut cx, |pane, _| {
-                            pane.nav_history_mut().set_mode(mode);
-                            pane.active_item().map(|p| p.item_id())
-                        })?;
-
-                        pane.update(&mut cx, |pane, cx| {
-                            let item = pane.open_item(
-                                project_entry_id,
-                                true,
-                                entry.is_preview,
-                                None,
-                                cx,
-                                build_item,
-                            );
-                            navigated |= Some(item.item_id()) != prev_active_item_id;
-                            pane.nav_history_mut().set_mode(NavigationMode::Normal);
-                            if let Some(data) = entry.data {
-                                navigated |= item.navigate(data, cx);
-                            }
-                        })?;
-                    }
-                    Err(open_by_project_path_e) => {
-                        // Fall back to opening by abs path, in case an external file was opened and closed,
-                        // and its worktree is now dropped
-                        if let Some(abs_path) = abs_path {
-                            let prev_active_item_id = pane.update(&mut cx, |pane, _| {
-                                pane.nav_history_mut().set_mode(mode);
-                                pane.active_item().map(|p| p.item_id())
-                            })?;
-                            let open_by_abs_path = workspace.update(&mut cx, |workspace, cx| {
-                                workspace.open_abs_path(abs_path.clone(), false, cx)
-                            })?;
-                            match open_by_abs_path
-                                .await
-                                .with_context(|| format!("Navigating to {abs_path:?}"))
-                            {
-                                Ok(item) => {
-                                    pane.update(&mut cx, |pane, cx| {
-                                        navigated |= Some(item.item_id()) != prev_active_item_id;
-                                        pane.nav_history_mut().set_mode(NavigationMode::Normal);
-                                        if let Some(data) = entry.data {
-                                            navigated |= item.navigate(data, cx);
-                                        }
-                                    })?;
-                                }
-                                Err(open_by_abs_path_e) => {
-                                    log::error!("Failed to navigate history: {open_by_project_path_e:#} and {open_by_abs_path_e:#}");
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if !navigated {
-                    workspace
-                        .update(&mut cx, |workspace, cx| {
-                            Self::navigate_history(workspace, pane, mode, cx)
-                        })?
-                        .await?;
-                }
-
-                Ok(())
-            })
+            self.launch_path(pane, project_path, abs_path, &entry, mode, cx)
         } else {
             Task::ready(Ok(()))
         }

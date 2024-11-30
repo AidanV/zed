@@ -9,13 +9,14 @@ use gpui::{
     MouseUpEvent, ParentElement, Render, Styled, Task, View, ViewContext, VisualContext, WeakView,
 };
 use picker::{Picker, PickerDelegate};
-use project::Project;
+use project::{project_settings::ProjectSettings, Project};
 use serde::Deserialize;
 use settings::Settings;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 use ui::{prelude::*, ListItem, ListItemSpacing, Tooltip};
 use util::ResultExt;
 use workspace::{
+    global_marks::GlobalMarks,
     item::{ItemHandle, ItemSettings, TabContentParams},
     pane::{render_item_indicator, tab_details, Event as PaneEvent},
     ModalView, Pane, SaveIntent, Workspace,
@@ -35,9 +36,11 @@ struct Number(usize);
 impl_actions!(harpoon, [Toggle, Number]);
 actions!(harpoon, [CloseSelectedItem, Add, Delete, Swap]);
 
+const MAX_HARPOON_LEN: usize = 9;
+
 enum HarpoonState {
     Go(Option<usize>),
-    Add(Option<usize>),
+    Add,
     Delete(Option<usize>),
     Swap(Option<usize>, Option<usize>),
 }
@@ -54,6 +57,11 @@ pub fn init(cx: &mut AppContext) {
     cx.observe_new_views(Harpoon::register).detach();
 }
 
+/// a to add a file
+/// d # to delete a file
+/// s # # to swap a file
+/// n to go to next in list
+/// p to go to prev in list
 impl Harpoon {
     fn register(workspace: &mut Workspace, _: &mut ViewContext<Workspace>) {
         workspace.register_action(|workspace, action: &Toggle, cx| {
@@ -66,7 +74,7 @@ impl Harpoon {
                 return;
             };
             harpoon.update(cx, |harpoon: &mut Harpoon, cx| {
-                harpoon.state = HarpoonState::Add(None);
+                harpoon.state = HarpoonState::Add;
                 harpoon.handle(cx);
             });
         });
@@ -95,7 +103,6 @@ impl Harpoon {
             harpoon.update(cx, |harpoon: &mut Harpoon, cx| {
                 match harpoon.state {
                     HarpoonState::Go(None) => harpoon.state = HarpoonState::Go(Some(action.0)),
-                    HarpoonState::Add(None) => harpoon.state = HarpoonState::Add(Some(action.0)),
                     HarpoonState::Delete(None) => {
                         harpoon.state = HarpoonState::Delete(Some(action.0))
                     }
@@ -150,13 +157,16 @@ impl Harpoon {
 
     fn handle(&mut self, cx: &mut ViewContext<Self>) {
         match self.state {
-            HarpoonState::Add(Some(at)) => self.picker.update(cx, |picker, cx| {
-                picker.delegate.add_match(at, cx);
+            HarpoonState::Add => self.picker.update(cx, |picker, cx| {
+                picker.delegate.add_match(cx);
                 self.state = HarpoonState::Go(None);
             }),
             HarpoonState::Delete(Some(at)) => self.picker.update(cx, |picker, cx| {
                 picker.delegate.remove_match(at, cx);
                 self.state = HarpoonState::Go(None);
+            }),
+            HarpoonState::Swap(Some(from), None) => self.picker.update(cx, |picker, cx| {
+                picker.delegate.set_selected_index(from, cx);
             }),
             HarpoonState::Swap(Some(from), Some(to)) => self.picker.update(cx, |picker, cx| {
                 picker.delegate.swap_match(from, to, cx);
@@ -226,7 +236,7 @@ pub struct HarpoonDelegate {
     selected_index: usize,
     pane: WeakView<Pane>,
     project: Model<Project>,
-    matches: HashMap<usize, TabMatch>,
+    matches: Vec<Path>,
 }
 
 impl HarpoonDelegate {
@@ -244,7 +254,7 @@ impl HarpoonDelegate {
             selected_index: 0,
             pane,
             project,
-            matches: HashMap::new(),
+            matches: Vec::new(),
         }
     }
 
@@ -270,7 +280,7 @@ impl HarpoonDelegate {
         // .detach();
     }
 
-    fn add_match(&mut self, at: usize, cx: &mut WindowContext) {
+    fn add_match(&mut self, cx: &mut WindowContext) {
         let Some(pane) = self.pane.upgrade() else {
             return;
         };
@@ -278,19 +288,24 @@ impl HarpoonDelegate {
         let Some(active_tab) = pane.active_item() else {
             return;
         };
-        self.matches.insert(
-            at,
-            TabMatch {
-                item_index: 0,
-                item: active_tab.boxed_clone(),
-                detail: 0,
-                preview: false,
-            },
-        );
+        if self.matches.len() < MAX_HARPOON_LEN {
+            let Some(project_path) = active_tab.project_path(cx) else {
+                return;
+            };
+            self.matches.push(Path::from(project_path.path));
+            // self.matches.push(TabMatch {
+            //     item_index: 0,
+            //     item: active_tab.boxed_clone(),
+            //     detail: 0,
+            //     preview: false,
+            // });
+        }
     }
 
     fn remove_match(&mut self, at: usize, cx: &mut WindowContext) {
-        self.matches.remove(&at);
+        if at < self.matches.len() {
+            self.matches.remove(at);
+        }
     }
 
     fn swap_match(&mut self, from: usize, to: usize, cx: &mut WindowContext) {
@@ -300,14 +315,21 @@ impl HarpoonDelegate {
         // let Some(to) = self.matches.get_mut(&to) else {
         //     return;
         // };
-        let Some(value1) = self.matches.remove(&from) else {
-            return;
-        };
-        let Some(value2) = self.matches.remove(&to) else {
-            return;
-        };
-        self.matches.insert(from, value2);
-        self.matches.insert(to, value1);
+        if from < self.matches.len() && to < self.matches.len() {
+            self.matches.swap(from, to);
+        }
+    }
+
+    fn update_matches(&mut self, cx: &mut WindowContext) {
+        self.matches.clear();
+        for mark in cx.global::<GlobalMarks>().get_dynamic_marks() {
+            self.matches.push(TabMatch {
+                item_index: 0,
+                item: mark.entry.item.upgrade()?,
+                detail: 0,
+                preview: false,
+            });
+        }
     }
 
     // fn update_matches(&mut self, cx: &mut WindowContext) {
@@ -398,7 +420,7 @@ impl PickerDelegate for HarpoonDelegate {
     }
 
     fn no_matches_text(&self, _cx: &mut WindowContext) -> SharedString {
-        "No tabs".into()
+        "a        to add current tab\n\nd #     to delete\n\ns # #   to swap".into()
     }
 
     fn match_count(&self) -> usize {
@@ -423,7 +445,7 @@ impl PickerDelegate for HarpoonDelegate {
         _raw_query: String,
         cx: &mut ViewContext<Picker<Self>>,
     ) -> Task<()> {
-        // self.update_matches(cx);
+        self.update_matches(cx);
         Task::ready(())
     }
 
@@ -431,7 +453,7 @@ impl PickerDelegate for HarpoonDelegate {
         let Some(pane) = self.pane.upgrade() else {
             return;
         };
-        let Some(selected_match) = self.matches.get(&self.selected_index) else {
+        let Some(selected_match) = self.matches.get(self.selected_index) else {
             return;
         };
         pane.update(cx, |pane, cx| {
@@ -451,7 +473,23 @@ impl PickerDelegate for HarpoonDelegate {
         selected: bool,
         cx: &mut ViewContext<Picker<Self>>,
     ) -> Option<Self::ListItem> {
-        let (key, tab_match) = self.matches.iter().nth(ix)?;
+        // let tab_match;
+        // // self.project.read_with(cx, |project, cx| {
+        // //     tab_match = cx.global_mut::<ProjectSettings>().harpoon.paths.get(ix);
+        // // });
+        // for (key, mark) in cx.global::<GlobalMarks>().marks {
+        //     // if ('A'..'Z').contains(key.get(0)?) {
+        //     tab_match = TabMatch {
+        //         item_index: 0,
+        //         item: mark.entry.item.upgrade()?,
+        //         detail: 0,
+        //         preview: false,
+        //     };
+        //     break;
+        //     // }
+        // }
+
+        let tab_match = self.matches.get(ix)?;
 
         let params = TabContentParams {
             detail: Some(tab_match.detail),
@@ -493,7 +531,7 @@ impl PickerDelegate for HarpoonDelegate {
             .children(indicator)
             .child(div().w_2())
             .into_any_element();
-        let number = Label::new(String::from(key.to_string()));
+        let number = Label::new(String::from((ix).to_string()));
         let close_button = div()
             // We need this on_mouse_up here instead of on_click on the close
             // button because Picker intercepts the same events and handles them

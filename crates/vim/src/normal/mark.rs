@@ -8,6 +8,7 @@ use editor::{
 };
 use gpui::ViewContext;
 use language::SelectionGoal;
+use workspace::{global_marks, ItemHandle, WeakItemHandle};
 
 use crate::{
     motion::{self, Motion},
@@ -27,7 +28,25 @@ impl Vim {
         }) else {
             return;
         };
-        self.marks.insert(text.to_string(), anchors);
+        if text.starts_with(|c| c.is_uppercase()) {
+            cx.global_mut::<GlobalMarks>().marks.insert(
+                text.to_string(),
+                global_marks::Mark {
+                    project_path: self.editor.upgrade()?.project_path(cx)?,
+                    absolute_path: None,
+                    mark_type: global_marks::MarkType::DynamicMark,
+                    entry: workspace::NavigationEntry {
+                        item: self.editor.upgrade()?.downgrade_item(),
+                        data: None, //self.editor.upgrade()?.map(|data| Box::new(data) as Box<dyn Any + Send>),
+                        timestamp: 0,
+                        is_preview: false,
+                    },
+                },
+            );
+        } else {
+            self.marks.insert(text.to_string(), anchors);
+        }
+
         self.clear_operator(cx);
     }
 
