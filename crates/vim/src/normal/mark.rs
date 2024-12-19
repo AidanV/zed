@@ -33,21 +33,24 @@ impl Vim {
         if text.starts_with(|c: char| c.is_digit(10)) {
             if let Some(editor) = self.editor.upgrade() {
                 let Some(project_path) = editor.project_path(cx) else {
+                    // We cannot harpoon this editor if it does not have an associated file
+                    self.clear_operator(cx);
                     return;
                 };
                 println!("!");
                 let navigation_data = editor.update(cx, |editor, cx| {
                     editor.get_navigation_data(editor.selections.newest_anchor().head(), cx)
                 });
+                let absolute_path = editor.read(cx).abs_path_current_buffer(cx);
                 cx.global_mut::<GlobalMarks>().marks.insert(
                     text.to_string(),
                     global_marks::Mark {
                         project_path,
-                        absolute_path: None,
+                        absolute_path,
                         mark_type: global_marks::MarkType::DynamicMark,
                         entry: workspace::NavigationEntry {
                             item: editor.downgrade_item().into(),
-                            data: navigation_data, //self.editor.upgrade()?.map(|data| Box::new(data) as Box<dyn Any + Send>),
+                            data: None, //navigation_data, //self.editor.upgrade()?.map(|data| Box::new(data) as Box<dyn Any + Send>),
                             timestamp: 0,
                             is_preview: false,
                         },
@@ -99,6 +102,7 @@ impl Vim {
         self.pop_operator(cx);
 
         if (*text).starts_with(|c: char| c.is_digit(10)) {
+            println!("1");
             if let Some(workspace) = self.workspace(cx) {
                 workspace.update(cx, |workspace, cx| {
                     global_marks::navigate_mark((*text).to_string(), workspace, cx);

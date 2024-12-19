@@ -311,7 +311,7 @@ fn assert_match_at_position(
     let match_item = tab_switcher
         .delegate
         .matches
-        .get(match_index)
+        .get(&match_index)
         .unwrap_or_else(|| panic!("Tab Switcher has no match for index {match_index}"));
     assert_eq!(match_item.item.item_id(), expected_item.item_id());
 }

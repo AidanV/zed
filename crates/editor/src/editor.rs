@@ -11757,6 +11757,15 @@ impl Editor {
         None
     }
 
+    pub fn abs_path_current_buffer(&self, cx: &WindowContext) -> Option<PathBuf> {
+        if let Some(buffer) = self.buffer().read(cx).as_singleton() {
+            if let Some(file) = buffer.read(cx).file().and_then(|f| f.as_local()) {
+                Some(file.abs_path(cx))
+            }
+        }
+        None
+    }
+
     fn target_file<'a>(&self, cx: &'a AppContext) -> Option<&'a dyn language::LocalFile> {
         self.active_excerpt(cx)?
             .1

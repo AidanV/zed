@@ -99,19 +99,72 @@ pub fn navigate_mark(
             }
         }),
         None => {
-            println!("we went none");
-            // if let Some(mark) = self.marks.get(&mark_name) {
-            //     workspace
-            //         .launch_path(
-            //             workspace.active_pane().downgrade(),
-            //             mark.project_path.clone(),
-            //             mark.absolute_path.clone(),
-            //             &mark.enty,
-            //             crate::NavigationMode::Normal,
-            //             cx,
-            //         )
-            //         .detach();
-            // }
+            let pane = workspace.active_pane;
+            if let Some(mark) = cx.global::<GlobalMarks>().marks.get(&mark_name) {
+                let open_by_project_path = workspace.load_path(mark.project_path.clone(), cx);
+                cx.spawn(|workspace, mut cx| async move {
+                    let open_by_project_path = open_by_project_path.await;
+                    match open_by_project_path
+                    {
+                        Ok((project_entry_id, build_item)) => {
+                            let prev_active_item_id = pane.update(&mut cx, |pane, _| {
+                                pane.active_item().map(|p| p.item_id())
+                            })?;
+
+                            pane.update(&mut cx, |pane, cx| {
+                                let item = pane.open_item(
+                                    project_entry_id,
+                                    true,
+                                    mark.entry.is_preview,
+                                    None,
+                                    cx,
+                                    build_item,
+                                );
+                                if let Some(data) = mark.entry.data {
+                                    _ = item.navigate(data, cx);
+                                }
+                            })?;
+                        }
+                        Err(open_by_project_path_e) => {
+                            // Fall back to opening by abs path, in case an external file was opened and closed,
+                            // and its worktree is now dropped
+                            if let Some(abs_path) = mark.absolute_path{
+                                let prev_active_item_id = pane.update(&mut cx, |pane, _| {
+                                    pane.active_item().map(|p| p.item_id())
+                                })?;
+                                let open_by_abs_path = workspace.update(&mut cx, |workspace, cx| {
+                                    workspace.open_abs_path(abs_path.clone(), false, cx)
+                                })?;
+                                match open_by_abs_path
+                                    .await
+                                {
+                                    Ok(item) => {
+                                        pane.update(&mut cx, |pane, cx| {
+                                            if let Some(data) = mark.entry.data {
+                                                _ = item.navigate(data, cx);
+                                            }
+                                        })?;
+                                    }
+                                    Err(open_by_abs_path_e) => {
+                                        log::error!("Failed to navigate: {open_by_project_path_e:#} and {open_by_abs_path_e:#}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Ok(())
+                }).detach();
+                // .launch_path(
+                //     workspace.active_pane().downgrade(),
+                //     mark.project_path.clone(),
+                //     mark.absolute_path.clone(),
+                //     mark.entry,
+                //     crate::NavigationMode::Normal,
+                //     cx,
+                // )
+                // .detach();
+            }
         }
     };
 }
@@ -122,7 +175,8 @@ fn get_pane<'a>(
     cx: &'a AppContext,
 ) -> Option<View<Pane>> {
     let mark = cx.global::<GlobalMarks>().marks.get(&mark_name)?;
-    return workspace.center.find(|pane| {
+    let preferred_pane = workspace.active_pane();
+    let is_pane_by_mark = |pane: &View<Pane>| {
         let project_item = mark.entry.item.upgrade()?;
         let entry_id = project_item.project_entry_ids(cx)[0];
         let project_path = project_item.project_path(cx);
@@ -141,5 +195,9 @@ fn get_pane<'a>(
             return Some(pane.clone());
         }
         None
-    });
+    };
+    if let Some(preferred_pane) = is_pane_by_mark(preferred_pane) {
+        return Some(preferred_pane);
+    }
+    return workspace.center.find(is_pane_by_mark);
 }
