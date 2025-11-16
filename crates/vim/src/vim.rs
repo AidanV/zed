@@ -1156,6 +1156,9 @@ impl Vim {
         if mode != Mode::Insert && mode != Mode::Replace {
             Vim::take_count(cx);
         }
+        if mode == Mode::Normal && last_mode == Mode::Insert {
+            self.stop_recording_immediately(SwitchToNormalMode.boxed_clone(), cx);
+        }
 
         // Sync editor settings like clip mode
         self.sync_vim_settings(window, cx);
@@ -1596,6 +1599,15 @@ impl Vim {
             globals.stop_recording_after_next_action = false;
         }
         self.exit_temporary_mode = self.temp_mode;
+    }
+
+    /// Drop the currently recorded actions and stop recording
+    pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {
+        let globals = Vim::globals(cx);
+        globals.dot_recording = false;
+        globals.stop_recording_after_next_action = false;
+        globals.recording_actions.clear();
+        globals.recording_count = None;
     }
 
     /// Explicitly record one action (equivalents to start_recording and stop_recording)

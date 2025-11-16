@@ -1,7 +1,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use crate::{
-    Vim,
+    SwitchToNormalMode, Vim,
     insert::NormalBefore,
     motion::Motion,
     normal::InsertBefore,
@@ -348,11 +348,13 @@ impl Vim {
         // vim doesn't treat 3a1 as though you literally repeated a1
         // 3 times, instead it inserts the content thrice at the insert position.
         if let Some(to_repeat) = repeatable_insert(&actions[0]) {
-            if let Some(ReplayableAction::Action(action)) = actions.last()
-                && NormalBefore.partial_eq(&**action)
+            let escaped_action = if let Some(ReplayableAction::Action(action)) = actions.last()
+                && (NormalBefore.partial_eq(&**action) || SwitchToNormalMode.partial_eq(&**action))
             {
-                actions.pop();
-            }
+                actions.pop()
+            } else {
+                None
+            };
 
             let mut new_actions = actions.clone();
             actions[0] = ReplayableAction::Action(to_repeat.boxed_clone());
@@ -368,7 +370,9 @@ impl Vim {
             for _ in 1..count {
                 new_actions.append(actions.clone().as_mut());
             }
-            new_actions.push(ReplayableAction::Action(NormalBefore.boxed_clone()));
+            let action =
+                escaped_action.unwrap_or(ReplayableAction::Action(NormalBefore.boxed_clone()));
+            new_actions.push(action);
             actions = new_actions;
         }
 
@@ -396,6 +400,7 @@ mod test {
     use gpui::EntityInputHandler;
 
     use crate::{
+        SwitchToNormalMode,
         state::Mode,
         test::{NeovimBackedTestContext, VimTestContext},
     };
@@ -748,6 +753,19 @@ mod test {
         cx.shared_state().await.assert_eq("hello..ˇ.");
         cx.simulate_shared_keystrokes("u").await;
         cx.shared_state().await.assert_eq("hellˇo");
+    }
+
+    #[gpui::test]
+    async fn test_switch_to_normal_repeat(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        cx.set_state("ˇhello world", Mode::Normal);
+        cx.simulate_keystrokes("i t e s t");
+        cx.dispatch_action(SwitchToNormalMode);
+        cx.run_until_parked();
+        cx.assert_state("testˇhello world", Mode::Normal);
+        cx.simulate_keystroke(".");
+        cx.assert_state("testtestˇhello world", Mode::Normal);
     }
 
     #[gpui::test]

@@ -82,6 +82,7 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_recording(cx);
         self.switch_mode(Mode::Normal, true, window, cx);
         self.temp_mode = true;
     }
