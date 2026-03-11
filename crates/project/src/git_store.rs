@@ -3593,6 +3593,7 @@ impl BufferGitState {
 
     #[ztracing::instrument(skip_all)]
     fn recalculate_diffs(&mut self, buffer: text::BufferSnapshot, cx: &mut Context<Self>) {
+        dbg!("recalculating");
         *self.recalculating_tx.borrow_mut() = true;
 
         let language = self.language.clone();
@@ -3649,6 +3650,7 @@ impl BufferGitState {
                     })
                     .await,
                 );
+                dbg!("we have a new unstaged diff");
             }
 
             // Dropping BufferDiff can be expensive, so yield back to the event loop
@@ -3658,8 +3660,10 @@ impl BufferGitState {
             let mut new_uncommitted_diff = None;
             if let Some(uncommitted_diff) = &uncommitted_diff {
                 new_uncommitted_diff = if index_matches_head {
+                    dbg!("index matches head");
                     new_unstaged_diff.clone()
                 } else {
+                    dbg!("index does not match head");
                     Some(
                         cx.update(|cx| {
                             uncommitted_diff.read(cx).update_diff(

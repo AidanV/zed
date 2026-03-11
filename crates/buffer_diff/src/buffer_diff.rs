@@ -90,7 +90,7 @@ pub enum DiffHunkSecondaryStatus {
     NoSecondaryHunk,
     /// We are unstaging
     SecondaryHunkAdditionPending,
-    /// We are stagind
+    /// We are staging
     SecondaryHunkRemovalPending,
 }
 
@@ -1128,6 +1128,7 @@ fn compute_hunks(
     if let Some((diff_base, diff_base_rope)) = diff_base {
         let buffer_text = buffer.as_rope().to_string();
 
+        // dbg!(&diff_base, &buffer_text);
         let mut options = GitOptions::default();
         options.context_lines(0);
         let patch = GitPatch::from_buffers(
@@ -1158,6 +1159,7 @@ fn compute_hunks(
         }
 
         if let Some(patch) = patch {
+            // dbg!(&patch);
             let mut divergence = 0;
             for hunk_index in 0..patch.num_hunks() {
                 let hunk = process_patch_hunk(
@@ -1749,7 +1751,13 @@ impl BufferDiff {
                 }
                 None => (hunk_task.await, None),
             };
-
+            // dbg!("BufferDiffUpdate");
+            // dbg!(
+            //     &inner.hunks,
+            //     &inner.pending_hunks,
+            //     &base_text_edits,
+            //     &base_text_changed
+            // );
             BufferDiffUpdate {
                 inner,
                 buffer_snapshot,

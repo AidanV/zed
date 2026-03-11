@@ -31,6 +31,8 @@ actions!(
         // per-hunk
         /// Toggles the staged state of the hunk or status entry at cursor.
         ToggleStaged,
+        /// TODO
+        ToggleStagedSelectedLines,
         /// Stage status entries between an anchor entry and the cursor.
         StageRange,
         /// Stages the current hunk and moves to the next one.
@@ -43,6 +45,8 @@ actions!(
         /// Restores the selected hunks to their original state and moves to the
         /// next one.
         RestoreAndNext,
+        /// TODO
+        RestoreSelectedLines,
         // per-file
         /// Shows git blame information for the current file.
         #[action(deprecated_aliases = ["editor::ToggleGitBlame"])]

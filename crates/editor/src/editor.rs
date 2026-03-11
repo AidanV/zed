@@ -88,7 +88,10 @@ pub use split::{SplittableEditor, ToggleSplitDiff};
 pub use split_editor_view::SplitEditorView;
 pub use text::Bias;
 
-use ::git::{Restore, blame::BlameEntry, commit::ParsedCommitMessage, status::FileStatus};
+use ::git::{
+    Restore, RestoreSelectedLines, blame::BlameEntry, commit::ParsedCommitMessage,
+    status::FileStatus,
+};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, BuildError};
 use anyhow::{Context as _, Result, anyhow, bail};
 use blink_manager::BlinkManager;
@@ -331,6 +334,7 @@ enum DisplayDiffHunk {
         multi_buffer_range: Range<Anchor>,
         status: DiffHunkStatus,
         word_diffs: Vec<Range<MultiBufferOffset>>,
+        staged_lines: Option<Vec<bool>>,
     },
 }
 
@@ -12182,6 +12186,22 @@ impl Editor {
             window,
             cx,
         );
+    }
+
+    pub fn git_restore_selected_lines(
+        &mut self,
+        _: &RestoreSelectedLines,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.hide_mouse_cursor(HideMouseCursorOrigin::TypingAction, cx);
+        let selections = self
+            .selections
+            .all(&self.display_snapshot(cx))
+            .into_iter()
+            .map(|s| s.range())
+            .collect();
+        self.restore_hunks_in_ranges(selections, window, cx);
     }
 
     pub fn restore_hunks_in_ranges(
@@ -28601,6 +28621,7 @@ impl EditorSnapshot {
                         display_row_range: hunk_display_start.row()..end_row,
                         multi_buffer_range,
                         is_created_file,
+                        staged_lines: hunk.staged_lines.clone(),
                     }
                 };
 
