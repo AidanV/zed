@@ -21550,6 +21550,23 @@ impl Editor {
         self.stage_or_unstage_diff_hunks(stage, ranges, cx);
     }
 
+    pub fn toggle_staged_selected_lines(
+        &mut self,
+        _: &::git::ToggleStagedSelectedLines,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let ranges: Vec<_> = self
+            .selections
+            .disjoint_anchors()
+            .iter()
+            .map(|s| s.range())
+            .collect();
+        let stage = self.has_stageable_diff_hunks_in_ranges(&ranges, &snapshot);
+        self.stage_or_unstage_diff_hunks(stage, ranges, cx);
+    }
+
     pub fn set_render_diff_hunk_controls(
         &mut self,
         render_diff_hunk_controls: RenderDiffHunkControlsFn,
@@ -21698,6 +21715,7 @@ impl Editor {
                         diff_base_byte_range: hunk.diff_base_byte_range.start.0
                             ..hunk.diff_base_byte_range.end.0,
                         secondary_status: hunk.status.secondary,
+                        staged_lines: hunk.staged_lines.clone(),
                         range: Point::zero()..Point::zero(), // unused
                     })
                     .collect::<Vec<_>>(),

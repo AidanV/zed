@@ -3513,13 +3513,7 @@ impl MultiBufferSnapshot {
                 Anchor::range_in_buffer(excerpt.path_key_index, buffer_range.clone());
             dbg!(&hunk.range);
             dbg!(&status_kind);
-            let staged_lines = (hunk.secondary_status
-                == DiffHunkSecondaryStatus::OverlapsWithSecondaryHunk)
-                .then_some({
-                    // calculate partial line diffs
-                    dbg!("partially staged");
-                    vec![true, false, true]
-                });
+            dbg!(&hunk.staged_lines);
             Some(MultiBufferDiffHunk {
                 row_range: MultiBufferRow(range.start.row)..MultiBufferRow(end_row),
                 buffer_id: buffer_snapshot.remote_id(),
@@ -3533,7 +3527,7 @@ impl MultiBufferSnapshot {
                 },
                 excerpt_range: excerpt.range.clone(),
                 multi_buffer_range,
-                staged_lines,
+                staged_lines: hunk.staged_lines,
             })
         })
     }

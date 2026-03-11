@@ -108,6 +108,8 @@ pub struct DiffHunk {
     pub buffer_word_diffs: Vec<Range<Anchor>>,
     // Offsets relative to the start of the deleted diff that represent word diff locations
     pub base_word_diffs: Vec<Range<usize>>,
+    /// TODO
+    pub staged_lines: Option<Vec<bool>>,
 }
 
 /// We store [`InternalDiffHunk`]s internally so we don't need to store the additional row range.
@@ -1029,6 +1031,7 @@ impl BufferDiffInner<language::BufferSnapshot> {
                     }
                 }
 
+                let mut staged_lines = None;
                 if let (Some(secondary_cursor), false) = (secondary_cursor.as_mut(), has_pending) {
                     if start_anchor
                         .cmp(&secondary_cursor.start().buffer_range.start, buffer)
@@ -1053,6 +1056,42 @@ impl BufferDiffInner<language::BufferSnapshot> {
                             secondary_status = DiffHunkSecondaryStatus::OverlapsWithSecondaryHunk;
                         }
                     }
+                    staged_lines = (secondary_status
+                        == DiffHunkSecondaryStatus::OverlapsWithSecondaryHunk)
+                        .then_some({
+                            let mut staged_lines: Vec<bool> = (start_point.row..end_point.row)
+                                .into_iter()
+                                .map(|_| true)
+                                .collect();
+                            while let Some(secondary_hunk) = secondary_cursor.item() {
+                                dbg!("here");
+                                let mut secondary_range =
+                                    secondary_hunk.buffer_range.to_point(buffer);
+                                if secondary_range.end.column > 0 {
+                                    secondary_range.end.row += 1;
+                                    secondary_range.end.column = 0;
+                                }
+                                let new_staged_lines: Vec<bool> = (start_point.row..end_point.row)
+                                    .into_iter()
+                                    .map(|row| {
+                                        row < secondary_range.start.row
+                                            || secondary_range.end.row <= row
+                                    })
+                                    .collect();
+
+                                // If there are no unstanged lines then break
+                                if !new_staged_lines.iter().any(|staged| !staged) {
+                                    break;
+                                }
+                                staged_lines = staged_lines
+                                    .iter()
+                                    .zip(new_staged_lines)
+                                    .map(|(l, r)| *l && r)
+                                    .collect();
+                                secondary_cursor.next();
+                            }
+                            staged_lines
+                        });
                 }
 
                 return Some(DiffHunk {
@@ -1062,6 +1101,7 @@ impl BufferDiffInner<language::BufferSnapshot> {
                     base_word_diffs,
                     buffer_word_diffs,
                     secondary_status,
+                    staged_lines,
                 });
             }
         })
@@ -1088,6 +1128,7 @@ impl BufferDiffInner<language::BufferSnapshot> {
                 secondary_status: DiffHunkSecondaryStatus::NoSecondaryHunk,
                 base_word_diffs: hunk.base_word_diffs.clone(),
                 buffer_word_diffs: hunk.buffer_word_diffs.clone(),
+                staged_lines: None,
             })
         })
     }
