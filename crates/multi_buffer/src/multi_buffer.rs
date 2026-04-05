@@ -142,7 +142,10 @@ pub struct MultiBufferDiffHunk {
     pub word_diffs: Vec<Range<MultiBufferOffset>>,
     pub excerpt_range: ExcerptRange<text::Anchor>,
     pub multi_buffer_range: Range<Anchor>,
-    /// TODO
+    /// For hunks that are partially staged, records whether each row of the hunk
+    /// (relative to `row_range.start`) is currently staged in the index.
+    /// `true` means the row matches the index; `false` means it has not yet been staged.
+    /// `None` when the hunk is uniformly staged or unstaged.
     pub staged_lines: Option<Vec<bool>>,
 }
 
@@ -3511,9 +3514,6 @@ impl MultiBufferSnapshot {
             };
             let multi_buffer_range =
                 Anchor::range_in_buffer(excerpt.path_key_index, buffer_range.clone());
-            dbg!(&hunk.range);
-            dbg!(&status_kind);
-            dbg!(&hunk.staged_lines);
             Some(MultiBufferDiffHunk {
                 row_range: MultiBufferRow(range.start.row)..MultiBufferRow(end_row),
                 buffer_id: buffer_snapshot.remote_id(),

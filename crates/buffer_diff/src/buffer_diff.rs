@@ -3,7 +3,7 @@ use git2::{DiffLineType as GitDiffLineType, DiffOptions as GitOptions, Patch as 
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task};
 use language::{
     Capability, Diff, DiffOptions, Language, LanguageName, LanguageRegistry,
-    language_settings::LanguageSettings, word_diff_ranges,
+    language_settings::LanguageSettings, line_diff, word_diff_ranges,
 };
 use rope::Rope;
 use std::{
@@ -108,7 +108,10 @@ pub struct DiffHunk {
     pub buffer_word_diffs: Vec<Range<Anchor>>,
     // Offsets relative to the start of the deleted diff that represent word diff locations
     pub base_word_diffs: Vec<Range<usize>>,
-    /// TODO
+    /// For hunks that are partially staged, records whether each row of the hunk
+    /// (relative to `range.start.row`) is currently staged in the index.
+    /// `true` means the row matches the index; `false` means it has not yet been staged.
+    /// `None` when the hunk is uniformly staged or unstaged.
     pub staged_lines: Option<Vec<bool>>,
 }
 
@@ -707,6 +710,16 @@ impl BufferDiffSnapshot {
     }
 }
 
+fn partial_stage_text(
+    head_hunk_text: &str,
+    buffer_hunk_text: &str,
+    index_hunk_text: &str,
+    selected_rows: &Range<u32>,
+    stage: bool,
+) -> String {
+    if stage { "".into() } else { "".into() }
+}
+
 impl BufferDiffInner<Entity<language::Buffer>> {
     /// Returns the new index text and new pending hunks.
     fn stage_or_unstage_hunks_impl(
@@ -928,6 +941,95 @@ impl BufferDiffInner<Entity<language::Buffer>> {
         new_index_text.append(index_cursor.suffix());
         Some(new_index_text)
     }
+
+    /// Stages or unstages only the rows identified by `selected_rows` (0-based
+    /// relative to each hunk's start) within their respective hunks, leaving
+    /// the staging state of all other rows unchanged.
+    fn stage_or_unstage_lines_impl(
+        &mut self,
+        unstaged_diff: &Self,
+        stage: bool,
+        hunks_with_rows: &[(DiffHunk, Range<u32>)],
+        buffer: &text::BufferSnapshot,
+        cx: &mut Context<BufferDiff>,
+    ) -> Option<Rope> {
+        let head_text = self
+            .base_text_exists
+            .then(|| self.base_text.read(cx).as_rope().clone())?;
+        let index_text = unstaged_diff
+            .base_text_exists
+            .then(|| unstaged_diff.base_text.read(cx).as_rope().clone())?;
+
+        let mut unstaged_hunk_cursor = unstaged_diff.hunks.cursor::<DiffHunkSummary>(buffer);
+        unstaged_hunk_cursor.next();
+
+        let mut prev_unstaged_hunk_buffer_end = 0usize;
+        let mut prev_unstaged_hunk_base_text_end = 0usize;
+        let mut edits = Vec::<(Range<usize>, String)>::new();
+
+        for (hunk, selected_rows) in hunks_with_rows {
+            let skipped_unstaged = unstaged_hunk_cursor.slice(&hunk.buffer_range.start, Bias::Left);
+            if let Some(unstaged_hunk) = skipped_unstaged.last() {
+                prev_unstaged_hunk_base_text_end = unstaged_hunk.diff_base_byte_range.end;
+                prev_unstaged_hunk_buffer_end = unstaged_hunk.buffer_range.end.to_offset(buffer);
+            }
+
+            let buffer_offset_range = hunk.buffer_range.to_offset(buffer);
+            let start_overshoot = buffer_offset_range
+                .start
+                .saturating_sub(prev_unstaged_hunk_buffer_end);
+            let mut index_start = prev_unstaged_hunk_base_text_end + start_overshoot;
+            let mut expanded_buffer_end = buffer_offset_range.end;
+
+            loop {
+                if let Some(unstaged_hunk) = unstaged_hunk_cursor.item() {
+                    let unstaged_range = unstaged_hunk.buffer_range.to_offset(buffer);
+                    if unstaged_range.start <= expanded_buffer_end {
+                        prev_unstaged_hunk_base_text_end = unstaged_hunk.diff_base_byte_range.end;
+                        prev_unstaged_hunk_buffer_end = unstaged_range.end;
+                        index_start = index_start.min(unstaged_hunk.diff_base_byte_range.start);
+                        expanded_buffer_end = expanded_buffer_end.max(unstaged_range.end);
+                        unstaged_hunk_cursor.next();
+                        continue;
+                    }
+                }
+                break;
+            }
+
+            let end_overshoot = expanded_buffer_end.saturating_sub(prev_unstaged_hunk_buffer_end);
+            let index_end =
+                (prev_unstaged_hunk_base_text_end + end_overshoot).min(index_text.len());
+            let index_start = index_start.min(index_end);
+
+            let head_hunk_text: String = head_text
+                .chunks_in_range(hunk.diff_base_byte_range.clone())
+                .collect();
+            let buffer_hunk_text: String = buffer.text_for_range(buffer_offset_range).collect();
+            let index_hunk_text: String =
+                index_text.chunks_in_range(index_start..index_end).collect();
+
+            let replacement = partial_stage_text(
+                &head_hunk_text,
+                &buffer_hunk_text,
+                &index_hunk_text,
+                selected_rows,
+                stage,
+            );
+
+            edits.push((index_start..index_end, replacement));
+        }
+
+        let mut new_index_text = Rope::new();
+        let mut index_cursor = index_text.cursor(0);
+        for (old_range, replacement_text) in edits {
+            new_index_text.append(index_cursor.slice(old_range.start));
+            index_cursor.seek_forward(old_range.end);
+            new_index_text.push(&replacement_text);
+        }
+        new_index_text.append(index_cursor.suffix());
+
+        Some(new_index_text)
+    }
 }
 
 impl BufferDiffInner<language::BufferSnapshot> {
@@ -1064,7 +1166,6 @@ impl BufferDiffInner<language::BufferSnapshot> {
                                 .map(|_| true)
                                 .collect();
                             while let Some(secondary_hunk) = secondary_cursor.item() {
-                                dbg!("here");
                                 let mut secondary_range =
                                     secondary_hunk.buffer_range.to_point(buffer);
                                 if secondary_range.end.column > 0 {
@@ -1694,6 +1795,51 @@ impl BufferDiff {
                 extended_range: changed_range,
             }));
         }
+        new_index_text
+    }
+
+    /// Stages or unstages only specific lines within each hunk. `hunks_with_rows`
+    /// pairs each hunk with a range of rows (0-based, relative to the hunk's
+    /// start) that should be affected. Rows outside that range keep their
+    /// current staging state.
+    pub fn stage_or_unstage_lines(
+        &mut self,
+        stage: bool,
+        hunks_with_rows: &[(DiffHunk, Range<u32>)],
+        buffer: &text::BufferSnapshot,
+        file_exists: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Rope> {
+        if !file_exists || hunks_with_rows.is_empty() {
+            return None;
+        }
+
+        let new_index_text = self
+            .secondary_diff
+            .as_ref()?
+            .update(cx, |secondary_diff, cx| {
+                self.inner.stage_or_unstage_lines_impl(
+                    &secondary_diff.inner,
+                    stage,
+                    hunks_with_rows,
+                    buffer,
+                    cx,
+                )
+            });
+
+        cx.emit(BufferDiffEvent::HunksStagedOrUnstaged(
+            new_index_text.clone(),
+        ));
+        // if let Some((first, last)) = hunks_with_rows.first().zip(hunks_with_rows.last()) {
+        //     let changed_range = Some(first.0.buffer_range.start..last.0.buffer_range.end);
+        //     let base_text_changed_range =
+        //         Some(first.0.diff_base_byte_range.start..last.0.diff_base_byte_range.end);
+        //     cx.emit(BufferDiffEvent::DiffChanged(DiffChanged {
+        //         changed_range: changed_range.clone(),
+        //         base_text_changed_range,
+        //         extended_range: changed_range,
+        //     }));
+        // }
         new_index_text
     }
 

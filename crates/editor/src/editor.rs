@@ -95,7 +95,7 @@ use ::git::{
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, BuildError};
 use anyhow::{Context as _, Result, anyhow, bail};
 use blink_manager::BlinkManager;
-use buffer_diff::DiffHunkStatus;
+use buffer_diff::{DiffHunkSecondaryStatus, DiffHunkStatus};
 use client::{Collaborator, ParticipantIndex, parse_zed_link};
 use clock::ReplicaId;
 use code_context_menus::{
@@ -21533,6 +21533,96 @@ impl Editor {
         hunks.any(|hunk| hunk.status().has_secondary_hunk())
     }
 
+    /// Returns `true` if any buffer row that is both covered by `ranges` and
+    /// part of a diff hunk is not yet staged, meaning the action should stage.
+    /// Returns `false` when all such rows are already staged, meaning the
+    /// action should unstage.
+    pub fn has_stageable_lines_in_ranges(
+        &self,
+        ranges: &[Range<Anchor>],
+        snapshot: &MultiBufferSnapshot,
+    ) -> bool {
+        for hunk in self.diff_hunks_in_ranges(ranges, snapshot) {
+            match hunk.status().secondary {
+                DiffHunkSecondaryStatus::HasSecondaryHunk => return true,
+                DiffHunkSecondaryStatus::NoSecondaryHunk => continue,
+                DiffHunkSecondaryStatus::OverlapsWithSecondaryHunk => {
+                    let staged_lines = match &hunk.staged_lines {
+                        Some(lines) => lines,
+                        None => return true,
+                    };
+                    let hunk_start = hunk.row_range.start.0;
+                    for range in ranges {
+                        let range_point = range.to_point(snapshot);
+                        let sel_start = range_point.start.row;
+                        let sel_end = range_point.end.row + 1;
+                        let intersect_start = sel_start.max(hunk_start);
+                        let intersect_end = sel_end.min(hunk.row_range.end.0);
+                        for row in intersect_start..intersect_end {
+                            let idx = (row - hunk_start) as usize;
+                            if staged_lines.get(idx).copied() == Some(false) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// For each diff hunk that intersects `ranges`, returns the hunk paired
+    /// with the union of selected rows from all overlapping ranges, expressed
+    /// as a `Range<u32>` that is **0-based relative to the hunk's start row**.
+    fn diff_hunks_with_selected_rows(
+        &self,
+        ranges: &[Range<Anchor>],
+        snapshot: &MultiBufferSnapshot,
+    ) -> Vec<(MultiBufferDiffHunk, Range<u32>)> {
+        let mut result: Vec<(MultiBufferDiffHunk, Range<u32>)> = Vec::new();
+
+        for range in ranges {
+            let range_point = range.to_point(snapshot);
+            let sel_start = range_point.start.row;
+            let sel_end = range_point.end.row + 1;
+
+            let mut peek_end = range_point.end;
+            if range_point.end.row < snapshot.max_row().0 {
+                peek_end = Point::new(range_point.end.row + 1, 0);
+            }
+
+            for hunk in snapshot.diff_hunks_in_range(range_point.start..peek_end) {
+                let hunk_start = hunk.row_range.start.0;
+                let hunk_end = hunk.row_range.end.0;
+
+                let intersect_start = sel_start.max(hunk_start);
+                let intersect_end = sel_end.min(hunk_end);
+
+                if intersect_start >= intersect_end {
+                    continue;
+                }
+
+                let rel_start = intersect_start - hunk_start;
+                let rel_end = intersect_end - hunk_start;
+
+                // if let Some(existing) = result
+                //     .iter_mut()
+                //     .find(|(h, _)| h.buffer_id == hunk.buffer_id && h.row_range == hunk.row_range)
+                // {
+                //     dbg!(&existing.1);
+                //     existing.1.start = existing.1.start.min(rel_start);
+                //     existing.1.end = existing.1.end.max(rel_end);
+                // } else {
+                dbg!(&rel_start, &rel_end);
+                result.push((hunk, rel_start..rel_end));
+                // }
+            }
+        }
+
+        result
+    }
+
     pub fn toggle_staged_selected_diff_hunks(
         &mut self,
         _: &::git::ToggleStaged,
@@ -21563,8 +21653,8 @@ impl Editor {
             .iter()
             .map(|s| s.range())
             .collect();
-        let stage = self.has_stageable_diff_hunks_in_ranges(&ranges, &snapshot);
-        self.stage_or_unstage_diff_hunks(stage, ranges, cx);
+        let stage = self.has_stageable_lines_in_ranges(&ranges, &snapshot);
+        self.stage_or_unstage_selected_lines(stage, ranges, cx);
     }
 
     pub fn set_render_diff_hunk_controls(
@@ -21618,6 +21708,74 @@ impl Editor {
                     .chunk_by(|hunk| hunk.buffer_id);
                 for (buffer_id, hunks) in &chunk_by {
                     this.do_stage_or_unstage(stage, buffer_id, hunks, cx);
+                }
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn stage_or_unstage_selected_lines(
+        &mut self,
+        stage: bool,
+        ranges: Vec<Range<Anchor>>,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let hunks_with_rows: Vec<(MultiBufferDiffHunk, Range<u32>)> =
+            self.diff_hunks_with_selected_rows(&ranges, &snapshot);
+        if self.delegate_stage_and_restore {
+            panic!();
+        }
+
+        let task = self.save_buffers_for_ranges_if_needed(&ranges, cx);
+
+        cx.spawn(async move |this, cx| {
+            task.await?;
+            this.update(cx, |this, cx| {
+                dbg!(hunks_with_rows.len());
+                let chunk_by = hunks_with_rows.iter().chunk_by(|(hunk, _)| hunk.buffer_id);
+                for (buffer_id, group) in &chunk_by {
+                    let Some(project) = this.project() else {
+                        continue;
+                    };
+                    let Some(buffer_entity) = project.read(cx).buffer_for_id(buffer_id, cx) else {
+                        continue;
+                    };
+                    let Some(diff) = this.buffer.read(cx).diff_for(buffer_id) else {
+                        continue;
+                    };
+                    let buffer_snapshot = buffer_entity.read(cx).snapshot();
+                    let file_exists = buffer_snapshot
+                        .file()
+                        .is_some_and(|f| f.disk_state().exists());
+
+                    let diff_hunks: Vec<_> = group
+                        .map(|(hunk, selected_rows)| {
+                            (
+                                buffer_diff::DiffHunk {
+                                    buffer_range: hunk.buffer_range.clone(),
+                                    base_word_diffs: Vec::default(),
+                                    buffer_word_diffs: Vec::default(),
+                                    diff_base_byte_range: hunk.diff_base_byte_range.start.0
+                                        ..hunk.diff_base_byte_range.end.0,
+                                    secondary_status: hunk.status.secondary,
+                                    staged_lines: hunk.staged_lines.clone(),
+                                    range: Point::zero()..Point::zero(),
+                                },
+                                selected_rows.clone(),
+                            )
+                        })
+                        .collect();
+                    dbg!(&diff_hunks);
+                    diff.update(cx, |diff, cx| {
+                        diff.stage_or_unstage_lines(
+                            stage,
+                            &diff_hunks,
+                            &buffer_snapshot,
+                            file_exists,
+                            cx,
+                        );
+                    });
                 }
             })
         })

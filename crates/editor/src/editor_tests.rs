@@ -25735,6 +25735,190 @@ async fn test_partially_staged_hunk(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_stage_selected_lines_basic(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_head_text(indoc! { "
+        one
+        two
+        three
+        four
+        five
+        "
+    });
+    cx.set_index_text(indoc! { "
+        one
+        two
+        three
+        four
+        five
+        "
+    });
+    // All three middle lines are modified in one hunk. Cursor is on the middle line.
+    cx.set_state(indoc! { "
+        one
+        TWO
+        ˇTHREE
+        FOUR
+        five
+    "});
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_staged_selected_lines(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+    // Only "THREE" (the line under the cursor) should appear in the index.
+    // "TWO" and "FOUR" remain at their HEAD versions.
+    cx.assert_index_text(Some(indoc! { "
+        one
+        two
+        THREE
+        four
+        five
+    "}));
+}
+
+#[gpui::test]
+async fn test_unstage_selected_lines(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_head_text(indoc! { "
+        one
+        two
+        three
+        four
+        five
+        "
+    });
+    // "THREE" is already staged in the index; the other two modified lines are not.
+    cx.set_index_text(indoc! { "
+        one
+        two
+        THREE
+        four
+        five
+        "
+    });
+    cx.set_state(indoc! { "
+        one
+        TWO
+        ˇTHREE
+        FOUR
+        five
+    "});
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_staged_selected_lines(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+    // All selected lines are already staged → the action should unstage them,
+    // reverting the index back to HEAD for "THREE".
+    cx.assert_index_text(Some(indoc! { "
+        one
+        two
+        three
+        four
+        five
+    "}));
+}
+
+#[gpui::test]
+async fn test_stage_selected_lines_toggle_direction(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_head_text(indoc! { "
+        one
+        two
+        three
+        "
+    });
+    cx.set_index_text(indoc! { "
+        one
+        two
+        three
+        "
+    });
+    cx.set_state(indoc! { "
+        one
+        ˇTWO
+        THREE
+    "});
+    cx.run_until_parked();
+
+    // First call: cursor is on an unstaged line → stage it.
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_staged_selected_lines(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+    cx.assert_index_text(Some(indoc! { "
+        one
+        TWO
+        three
+    "}));
+
+    // Second call: cursor is on the same line which is now staged → unstage it.
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_staged_selected_lines(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+    cx.assert_index_text(Some(indoc! { "
+        one
+        two
+        three
+    "}));
+}
+
+#[gpui::test]
+async fn test_stage_selected_lines_extend_partial(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_head_text(indoc! { "
+        one
+        two
+        three
+        four
+        five
+        "
+    });
+    // "TWO" is already staged.
+    cx.set_index_text(indoc! { "
+        one
+        TWO
+        three
+        four
+        five
+        "
+    });
+    // Buffer has all three lines changed. Cursor is on "FOUR" (the third changed line).
+    cx.set_state(indoc! { "
+        one
+        TWO
+        THREE
+        ˇFOUR
+        five
+    "});
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_staged_selected_lines(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+    // "TWO" was already staged and must remain staged.
+    // "FOUR" is newly staged by this action.
+    // "THREE" is still at HEAD ("three").
+    cx.assert_index_text(Some(indoc! { "
+        one
+        TWO
+        three
+        FOUR
+        five
+    "}));
+}
+
+#[gpui::test]
 fn test_crease_insertion_and_rendering(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
