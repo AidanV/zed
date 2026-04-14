@@ -21572,15 +21572,12 @@ impl Editor {
         false
     }
 
-    /// For each diff hunk that intersects `ranges`, returns the hunk paired
-    /// with the union of selected rows from all overlapping ranges, expressed
-    /// as a `Range<u32>` that is **0-based relative to the hunk's start row**.
     fn diff_hunks_with_selected_rows(
         &self,
         ranges: &[Range<Anchor>],
         snapshot: &MultiBufferSnapshot,
-    ) -> Vec<(MultiBufferDiffHunk, Range<u32>)> {
-        let mut result: Vec<(MultiBufferDiffHunk, Range<u32>)> = Vec::new();
+    ) -> HashMap<MultiBufferDiffHunk, Vec<u32>> {
+        let mut result: HashMap<MultiBufferDiffHunk, Vec<u32>> = HashMap::default();
 
         for range in ranges {
             let range_point = range.to_point(snapshot);
@@ -21603,20 +21600,13 @@ impl Editor {
                     continue;
                 }
 
-                let rel_start = intersect_start - hunk_start;
-                let rel_end = intersect_end - hunk_start;
+                let relative_start = intersect_start - hunk_start;
+                let relative_end = intersect_end - hunk_start;
 
-                // if let Some(existing) = result
-                //     .iter_mut()
-                //     .find(|(h, _)| h.buffer_id == hunk.buffer_id && h.row_range == hunk.row_range)
-                // {
-                //     dbg!(&existing.1);
-                //     existing.1.start = existing.1.start.min(rel_start);
-                //     existing.1.end = existing.1.end.max(rel_end);
-                // } else {
-                dbg!(&rel_start, &rel_end);
-                result.push((hunk, rel_start..rel_end));
-                // }
+                result
+                    .entry(hunk)
+                    .or_default()
+                    .extend_from_slice(&(relative_start..relative_end).collect::<Vec<_>>()[..]);
             }
         }
 
@@ -21721,18 +21711,36 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let hunks_with_rows: Vec<(MultiBufferDiffHunk, Range<u32>)> =
+        let hunks_with_rows: HashMap<MultiBufferDiffHunk, Vec<u32>> =
             self.diff_hunks_with_selected_rows(&ranges, &snapshot);
-        if self.delegate_stage_and_restore {
-            panic!();
+        if hunks_with_rows.is_empty() {
+            return;
         }
+        if self.delegate_stage_and_restore {
+            cx.emit(EditorEvent::StageOrUnstageSelectedLinesRequested {
+                stage,
+                hunks_with_rows,
+            });
+            return;
+        }
+        self.stage_or_unstage_selected_lines_for_hunks(stage, hunks_with_rows, cx);
+    }
 
+    pub(crate) fn stage_or_unstage_selected_lines_for_hunks(
+        &mut self,
+        stage: bool,
+        hunks_with_rows: HashMap<MultiBufferDiffHunk, Vec<u32>>,
+        cx: &mut Context<Self>,
+    ) {
+        let ranges: Vec<Range<Anchor>> = hunks_with_rows
+            .iter()
+            .map(|(hunk, _)| hunk.multi_buffer_range.clone())
+            .collect();
         let task = self.save_buffers_for_ranges_if_needed(&ranges, cx);
 
         cx.spawn(async move |this, cx| {
             task.await?;
             this.update(cx, |this, cx| {
-                dbg!(hunks_with_rows.len());
                 let chunk_by = hunks_with_rows.iter().chunk_by(|(hunk, _)| hunk.buffer_id);
                 for (buffer_id, group) in &chunk_by {
                     let Some(project) = this.project() else {
@@ -21766,7 +21774,6 @@ impl Editor {
                             )
                         })
                         .collect();
-                    dbg!(&diff_hunks);
                     diff.update(cx, |diff, cx| {
                         diff.stage_or_unstage_lines(
                             stage,
@@ -29143,6 +29150,10 @@ pub enum EditorEvent {
     StageOrUnstageRequested {
         stage: bool,
         hunks: Vec<MultiBufferDiffHunk>,
+    },
+    StageOrUnstageSelectedLinesRequested {
+        stage: bool,
+        hunks_with_rows: HashMap<MultiBufferDiffHunk, Vec<u32>>,
     },
     OpenExcerptsRequested {
         selections_by_buffer: HashMap<BufferId, (Vec<Range<BufferOffset>>, Option<u32>)>,

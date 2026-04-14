@@ -178,6 +178,34 @@ fn translate_lhs_hunks_to_rhs(
     translated
 }
 
+fn translate_lhs_hunks_with_rows_to_rhs(
+    lhs_hunks_with_rows: &[(MultiBufferDiffHunk, Range<u32>)],
+    splittable: &SplittableEditor,
+    cx: &App,
+) -> Vec<(MultiBufferDiffHunk, Range<u32>)> {
+    let rhs_display_map = splittable.rhs_editor.read(cx).display_map.read(cx);
+    let Some(companion) = rhs_display_map.companion() else {
+        return vec![];
+    };
+    let companion = companion.read(cx);
+    let rhs_snapshot = splittable.rhs_multibuffer.read(cx).snapshot(cx);
+    let rhs_hunks: Vec<MultiBufferDiffHunk> = rhs_snapshot.diff_hunks().collect();
+
+    let mut translated = Vec::new();
+    for (lhs_hunk, selected_rows) in lhs_hunks_with_rows {
+        let Some(rhs_buffer_id) = companion.lhs_to_rhs_buffer(lhs_hunk.buffer_id) else {
+            continue;
+        };
+        if let Some(rhs_hunk) = rhs_hunks.iter().find(|rhs_hunk| {
+            rhs_hunk.buffer_id == rhs_buffer_id
+                && rhs_hunk.diff_base_byte_range == lhs_hunk.diff_base_byte_range
+        }) {
+            translated.push((rhs_hunk.clone(), selected_rows.clone()));
+        }
+    }
+    translated
+}
+
 fn patches_for_range<F>(
     source_snapshot: &MultiBufferSnapshot,
     target_snapshot: &MultiBufferSnapshot,
@@ -652,6 +680,25 @@ impl SplittableEditor {
                                 }
                             });
                         }
+                    }
+                }
+                EditorEvent::StageOrUnstageSelectedLinesRequested {
+                    stage,
+                    hunks_with_rows,
+                } => {
+                    if this.lhs.is_some() {
+                        // let translated =
+                        //     translate_lhs_hunks_with_rows_to_rhs(hunks_with_rows, this, cx);
+                        // if !translated.is_empty() {
+                        //     let stage = *stage;
+                        //     this.rhs_editor.update(cx, |editor, cx| {
+                        //         editor.stage_or_unstage_selected_lines_for_hunks(
+                        //             stage,
+                        //             translated,
+                        //             cx,
+                        //         );
+                        //     });
+                        // }
                     }
                 }
                 EditorEvent::RestoreRequested { hunks } => {

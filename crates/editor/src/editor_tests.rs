@@ -25780,6 +25780,92 @@ async fn test_stage_selected_lines_basic(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_stage_selected_lines_complex(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_head_text(indoc! { "
+        one
+        five
+        "
+    });
+    cx.set_index_text(indoc! { "
+        one
+        five
+        "
+    });
+    // All three middle lines are modified in one hunk. Cursor is on the middle line.
+    cx.set_state(indoc! { "
+        one
+        ˇTWO
+        THREE
+        ˇFOUR
+        five
+    "});
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_staged_selected_lines(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+    // Only "THREE" (the line under the cursor) should appear in the index.
+    // "TWO" and "FOUR" remain at their HEAD versions.
+    cx.assert_index_text(Some(indoc! { "
+        one
+        TWO
+        FOUR
+        five
+    "}));
+}
+
+#[gpui::test]
+async fn test_stage_selected_lines_ordered_index(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_head_text(indoc! { "
+        one
+        five
+        "
+    });
+    cx.set_index_text(indoc! { "
+        one
+        five
+        "
+    });
+    // All three middle lines are modified in one hunk. Cursor is on the middle line.
+    cx.set_state(indoc! { "
+        one
+        TWO
+        THREE
+        ˇTWO
+        five
+    "});
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_staged_selected_lines(&Default::default(), window, cx);
+    });
+    cx.set_state(indoc! { "
+        one
+        TWO
+        ˇTHREE
+        TWO
+        five
+    "});
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_staged_selected_lines(&Default::default(), window, cx);
+    });
+    // Only "THREE" (the line under the cursor) should appear in the index.
+    // "TWO" and "FOUR" remain at their HEAD versions.
+    cx.assert_index_text(Some(indoc! { "
+        one
+        THREE
+        TWO
+        five
+    "}));
+}
+
+#[gpui::test]
 async fn test_unstage_selected_lines(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

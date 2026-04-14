@@ -126,7 +126,7 @@ pub enum Event {
 }
 
 /// A diff hunk, representing a range of consequent lines in a multibuffer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MultiBufferDiffHunk {
     /// The row range in the multibuffer where this diff hunk appears.
     pub row_range: Range<MultiBufferRow>,
