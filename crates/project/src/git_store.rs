@@ -3640,6 +3640,7 @@ impl BufferGitState {
             if let Some(unstaged_diff) = &unstaged_diff {
                 new_unstaged_diff = Some(
                     cx.update(|cx| {
+                        dbg!("unstaged diff");
                         unstaged_diff.read(cx).update_diff(
                             buffer.clone(),
                             index,
@@ -3650,7 +3651,6 @@ impl BufferGitState {
                     })
                     .await,
                 );
-                dbg!("we have a new unstaged diff");
             }
 
             // Dropping BufferDiff can be expensive, so yield back to the event loop

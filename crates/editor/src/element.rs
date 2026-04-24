@@ -6295,18 +6295,20 @@ impl EditorElement {
         window.paint_layer(layout.gutter_hitbox.bounds, |window| {
             for (hunk, hitbox) in &layout.display_hunks {
                 let hunk_to_paint = match hunk {
-                    DisplayDiffHunk::Folded { .. } => {
+                    DisplayDiffHunk::Folded { display_row } => {
                         let hunk_bounds = Self::diff_hunk_bounds(
                             &layout.position_map.snapshot,
                             line_height,
                             layout.gutter_hitbox.bounds,
                             hunk,
                         );
+                        let display_row_range = (*display_row)..(*display_row);
                         Some((
                             hunk_bounds,
                             cx.theme().colors().version_control_modified,
                             Corners::all(px(0.)),
                             DiffHunkStatus::modified_none(),
+                            display_row_range,
                             None,
                         ))
                     }
@@ -6344,6 +6346,7 @@ impl EditorElement {
                                 color,
                                 Corners::all(1. * line_height),
                                 *status,
+                                display_row_range.clone(),
                                 staged_lines.clone(),
                             ),
                             _ => (
@@ -6351,14 +6354,21 @@ impl EditorElement {
                                 color,
                                 Corners::all(px(0.)),
                                 *status,
+                                display_row_range.clone(),
                                 staged_lines.clone(),
                             ),
                         }
                     }),
                 };
 
-                if let Some((hunk_bounds, background_color, corner_radii, status, staged_lines)) =
-                    hunk_to_paint
+                if let Some((
+                    hunk_bounds,
+                    background_color,
+                    corner_radii,
+                    status,
+                    display_row_range,
+                    staged_lines,
+                )) = hunk_to_paint
                 {
                     // Flatten the background color with the editor color to prevent
                     // elements below transparent hunks from showing through
@@ -6375,21 +6385,21 @@ impl EditorElement {
                         .blend(background_color.opacity(0.3));
 
                     if let Some(staged_lines) = staged_lines {
-                        let total_lines = staged_lines.len();
+                        // dbg!(&staged_lines);
+                        let total_lines = display_row_range.len();
                         let height = hunk_bounds.size.height;
                         let width = hunk_bounds.size.width;
 
                         let mut curr_origin = hunk_bounds.origin;
 
-                        for (new_height, staged) in
-                            staged_lines
-                                .iter()
-                                .dedup_with_count()
-                                .map(|(count, staged)| {
-                                    let pixel_height: Pixels =
-                                        height * count / (total_lines as f32);
-                                    (pixel_height, staged)
-                                })
+                        for (new_height, staged) in staged_lines
+                            .iter()
+                            .tail(total_lines)
+                            .dedup_with_count()
+                            .map(|(count, staged)| {
+                                let pixel_height: Pixels = height * count / (total_lines as f32);
+                                (pixel_height, staged)
+                            })
                         {
                             let new_hunk_bounds = Bounds {
                                 origin: curr_origin,
