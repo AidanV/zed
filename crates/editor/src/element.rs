@@ -5797,12 +5797,14 @@ impl EditorElement {
                         sticky_top.min(max_y)
                     };
 
-                    // TODO: investigate line by line here
+                    let cursor_in_hunk = newest_cursor_row
+                        .is_some_and(|row| display_row_range.contains(&row));
                     let mut element = render_diff_hunk_controls(
                         display_row_range.start.0,
                         status,
                         multi_buffer_range.clone(),
                         *is_created_file,
+                        cursor_in_hunk,
                         line_height,
                         &editor,
                         window,
@@ -6384,7 +6386,9 @@ impl EditorElement {
                         .editor_background
                         .blend(background_color.opacity(0.3));
 
-                    if let Some(staged_lines) = staged_lines {
+                    if let Some(staged_lines) =
+                        staged_lines.filter(|_| !display_row_range.is_empty())
+                    {
                         let total_lines = display_row_range.len();
                         let height = hunk_bounds.size.height;
                         let width = hunk_bounds.size.width;

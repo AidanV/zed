@@ -218,8 +218,8 @@ use theme::{
 use theme_settings::{ThemeSettings, observe_buffer_font_size_adjustment};
 use ui::{
     Avatar, ButtonSize, ButtonStyle, ContextMenu, Disclosure, IconButton, IconButtonShape,
-    IconName, IconSize, Indicator, Key, Tooltip, h_flex, prelude::*, scrollbars::ScrollbarAutoHide,
-    utils::WithRemSize,
+    IconName, IconSize, Indicator, Key, PopoverMenu, Tooltip, h_flex, prelude::*,
+    scrollbars::ScrollbarAutoHide, utils::WithRemSize,
 };
 use ui_input::ErasedEditor;
 use util::{RangeExt, ResultExt, TryFutureExt, maybe, post_inc};
@@ -274,6 +274,7 @@ pub type RenderDiffHunkControlsFn = Arc<
         u32,
         &DiffHunkStatus,
         Range<Anchor>,
+        bool,
         bool,
         Pixels,
         &Entity<Editor>,
@@ -21581,7 +21582,8 @@ impl Editor {
         snapshot: &MultiBufferSnapshot,
     ) -> Vec<(MultiBufferDiffHunk, (Vec<u32>, Vec<u32>))> {
         let mut result: Vec<(MultiBufferDiffHunk, (Vec<u32>, Vec<u32>))> = Vec::new();
-        let mut index: HashMap<(BufferId, MultiBufferRow), usize> = HashMap::default();
+        let mut index: HashMap<(BufferId, usize, usize, Point, Point), usize> =
+            HashMap::default();
 
         for range in ranges {
             let range_point = range.to_point(snapshot);
@@ -21640,7 +21642,13 @@ impl Editor {
                     (buffer_section_range, ghost_section_range)
                 };
 
-                let key = (hunk.buffer_id, hunk.row_range.start);
+                let key = (
+                    hunk.buffer_id,
+                    hunk.diff_base_byte_range.start.0,
+                    hunk.diff_base_byte_range.end.0,
+                    hunk.buffer_range_point.start,
+                    hunk.buffer_range_point.end,
+                );
                 let idx = match index.get(&key) {
                     Some(&idx) => idx,
                     None => {
@@ -30401,11 +30409,39 @@ fn render_diff_hunk_controls(
     status: &DiffHunkStatus,
     hunk_range: Range<Anchor>,
     is_created_file: bool,
+    cursor_in_hunk: bool,
     line_height: Pixels,
     editor: &Entity<Editor>,
     _window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
+    let stage = status.has_secondary_hunk();
+    let (label, tooltip_label, id_prefix) = if stage {
+        ("Stage", "Stage Hunk", "stage")
+    } else {
+        ("Unstage", "Unstage Hunk", "unstage")
+    };
+    let alpha = if status.is_pending() { 0.66 } else { 1.0 };
+    let make_click_handler = || {
+        let editor = editor.clone();
+        let hunk_range = hunk_range.clone();
+        move |_event: &ClickEvent, _window: &mut Window, cx: &mut App| {
+            editor.update(cx, |editor, cx| {
+                editor.stage_or_unstage_diff_hunks(
+                    stage,
+                    vec![hunk_range.start..hunk_range.start],
+                    cx,
+                );
+            });
+        }
+    };
+    let make_tooltip = || {
+        let focus_handle = editor.focus_handle(cx);
+        move |_window: &mut Window, cx: &mut App| {
+            Tooltip::for_action_in(tooltip_label, &::git::ToggleStaged, &focus_handle, cx)
+        }
+    };
+
     h_flex()
         .h(line_height)
         .mr_1()
@@ -30420,58 +30456,79 @@ fn render_diff_hunk_controls(
         .gap_1()
         .block_mouse_except_scroll()
         .shadow_md()
-        .child(if status.has_secondary_hunk() {
-            Button::new(("stage", row as u64), "Stage")
-                .alpha(if status.is_pending() { 0.66 } else { 1.0 })
-                .tooltip({
-                    let focus_handle = editor.focus_handle(cx);
-                    move |_window, cx| {
-                        Tooltip::for_action_in(
-                            "Stage Hunk",
-                            &::git::ToggleStaged,
-                            &focus_handle,
-                            cx,
-                        )
-                    }
-                })
-                .on_click({
-                    let editor = editor.clone();
-                    move |_event, _window, cx| {
-                        editor.update(cx, |editor, cx| {
-                            editor.stage_or_unstage_diff_hunks(
-                                true,
-                                vec![hunk_range.start..hunk_range.start],
-                                cx,
-                            );
-                        });
-                    }
-                })
-        } else {
-            Button::new(("unstage", row as u64), "Unstage")
-                .alpha(if status.is_pending() { 0.66 } else { 1.0 })
-                .tooltip({
-                    let focus_handle = editor.focus_handle(cx);
-                    move |_window, cx| {
-                        Tooltip::for_action_in(
-                            "Unstage Hunk",
-                            &::git::ToggleStaged,
-                            &focus_handle,
-                            cx,
-                        )
-                    }
-                })
-                .on_click({
-                    let editor = editor.clone();
-                    move |_event, _window, cx| {
-                        editor.update(cx, |editor, cx| {
-                            editor.stage_or_unstage_diff_hunks(
-                                false,
-                                vec![hunk_range.start..hunk_range.start],
-                                cx,
-                            );
-                        });
-                    }
-                })
+        .child({
+            let stage_button = Button::new((id_prefix, row as u64), label)
+                .alpha(alpha)
+                .tooltip(make_tooltip())
+                .on_click(make_click_handler());
+            if cursor_in_hunk {
+                let menu_focus_handle = editor.focus_handle(cx);
+                h_flex()
+                    .child(stage_button)
+                    .child(
+                        div()
+                            .h(relative(0.6))
+                            .w_px()
+                            .bg(cx.theme().colors().border),
+                    )
+                    .child(
+                        PopoverMenu::new(("hunk-menu", row as u64))
+                            .trigger(
+                                IconButton::new(
+                                    ("hunk-menu-trigger", row as u64),
+                                    IconName::ChevronDown,
+                                )
+                                .shape(IconButtonShape::Square)
+                                .icon_size(IconSize::XSmall),
+                            )
+                            .menu({
+                                let editor = editor.clone();
+                                move |window, cx| {
+                                    let focus_handle = menu_focus_handle.clone();
+                                    let action_label = editor.read_with(cx, |editor, cx| {
+                                        let snapshot = editor.buffer.read(cx).snapshot(cx);
+                                        let ranges: Vec<_> = editor
+                                            .selections
+                                            .disjoint_anchors()
+                                            .iter()
+                                            .map(|s| s.range())
+                                            .collect();
+                                        let mut rows = HashSet::default();
+                                        for range in &ranges {
+                                            let start = range.start.to_point(&snapshot);
+                                            let end = range.end.to_point(&snapshot);
+                                            let last_row =
+                                                if end.column == 0 && end.row > start.row {
+                                                    end.row - 1
+                                                } else {
+                                                    end.row
+                                                };
+                                            for row in start.row..=last_row {
+                                                rows.insert(row);
+                                            }
+                                        }
+                                        let noun = if rows.len() == 1 { "Line" } else { "Lines" };
+                                        if editor.has_stageable_lines_in_ranges(&ranges, &snapshot)
+                                        {
+                                            format!("Stage Selected {noun}")
+                                        } else {
+                                            format!("Unstage Selected {noun}")
+                                        }
+                                    });
+                                    Some(ContextMenu::build(window, cx, |menu, _, _| {
+                                        menu.context(focus_handle).action(
+                                            action_label,
+                                            Box::new(::git::ToggleStagedSelectedLines),
+                                        )
+                                    }))
+                                }
+                            })
+                            .anchor(gpui::Anchor::TopRight),
+                    )
+                    .into_any_element()
+            } else {
+                stage_button.into_any_element()
+            }
         })
         .child(
             Button::new(("restore", row as u64), "Restore")
