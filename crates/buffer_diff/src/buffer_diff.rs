@@ -3,7 +3,7 @@ use git2::{DiffLineType as GitDiffLineType, DiffOptions as GitOptions, Patch as 
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task};
 use language::{
     Capability, Diff, DiffOptions, Language, LanguageName, LanguageRegistry,
-    language_settings::LanguageSettings, word_diff_ranges,
+    language_settings::LanguageSettings, line_diff, word_diff_ranges,
 };
 use rope::Rope;
 use std::{
@@ -1060,9 +1060,9 @@ impl BufferDiffInner<Entity<language::Buffer>> {
             {
                 Some((a, d)) => {
                     if a.iter().all(|l| *l) && d.iter().all(|l| *l) {
-                        DiffHunkSecondaryStatus::SecondaryHunkAdditionPending
-                    } else if a.iter().all(|l| !*l) && d.iter().all(|l| !*l) {
                         DiffHunkSecondaryStatus::SecondaryHunkRemovalPending
+                    } else if a.iter().all(|l| !*l) && d.iter().all(|l| !*l) {
+                        DiffHunkSecondaryStatus::SecondaryHunkAdditionPending
                     } else {
                         DiffHunkSecondaryStatus::OverlapsWithSecondaryHunk
                     }
@@ -1192,24 +1192,21 @@ impl BufferDiffInner<Entity<language::Buffer>> {
                     continue;
                 }
             };
-            // head_text.slice(diff_base_byte_range.clone())
             let old_text = head_text
                 .chunks_in_range(diff_base_byte_range.clone())
                 .collect::<String>();
             let mut replacement_text = if let Some(staged_lines) = staged_deletion_lines {
-                // dbg!("here", &staged_lines, &old_text);
-                let replacement_text = old_text
+                let kept: Vec<_> = old_text
                     .split("\n")
                     .zip(staged_lines)
                     .filter_map(|(buffer_line, staged_line)| {
                         (!staged_line).then(|| buffer_line.to_string())
                     })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if replacement_text.is_empty() {
-                    replacement_text
+                    .collect();
+                if kept.is_empty() {
+                    String::new()
                 } else {
-                    replacement_text + "\n"
+                    kept.join("\n") + "\n"
                 }
             } else {
                 old_text
@@ -1218,19 +1215,17 @@ impl BufferDiffInner<Entity<language::Buffer>> {
                 .text_for_range(buffer_offset_range)
                 .collect::<String>();
             let new_text = if let Some(staged_lines) = staged_addition_lines {
-                // dbg!("here", &staged_lines, &new_text);
-                let replacement_text = new_text
+                let kept: Vec<_> = new_text
                     .split("\n")
                     .zip(staged_lines)
                     .filter_map(|(buffer_line, staged_line)| {
                         staged_line.then(|| buffer_line.to_string())
                     })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if replacement_text.is_empty() {
-                    replacement_text
+                    .collect();
+                if kept.is_empty() {
+                    String::new()
                 } else {
-                    replacement_text + "\n"
+                    kept.join("\n") + "\n"
                 }
             } else {
                 new_text
@@ -1324,6 +1319,8 @@ impl BufferDiffInner<language::BufferSnapshot> {
             secondary_cursor = Some(cursor);
         }
 
+        let mut head_to_index_edits: Option<Vec<(Range<u32>, Range<u32>)>> = None;
+
         let max_point = buffer.max_point();
         let mut summaries = buffer.summaries_for_anchors_with_payload::<Point, _, _>(anchor_iter);
         iter::from_fn(move || {
@@ -1405,122 +1402,75 @@ impl BufferDiffInner<language::BufferSnapshot> {
                         }
                         // dbg!(&secondary_hunk, &secondary_status);
                     }
-                    (staged_addition_lines, staged_deletion_lines) = (secondary_status
-                        == DiffHunkSecondaryStatus::OverlapsWithSecondaryHunk)
-                        .then_some({
-                            // dbg!(&secondary_hunk);
-                            // dbg!(&start_base_row, &end_base_row, &start_point, &end_point);
+                    if secondary_status == DiffHunkSecondaryStatus::OverlapsWithSecondaryHunk {
+                        let added_rows = end_point.row.saturating_sub(start_point.row) as usize;
+                        let removed_rows =
+                            end_base_row.saturating_sub(start_base_row) as usize;
 
-                            let added_rows = end_point.row.saturating_sub(start_point.row) as usize;
-                            let removed_rows = end_base_row.saturating_sub(start_base_row) as usize;
-                            dbg!(&added_rows, &removed_rows);
-                            let mut staged_addition_lines: Vec<bool> =
-                                vec![true; added_rows as usize];
-
-                            let mut staged_deletion_lines: Vec<bool> = vec![true; removed_rows];
-
-                            while let Some(secondary_hunk) = secondary_cursor.item() {
-                                let mut secondary_addition_range =
-                                    secondary_hunk.buffer_range.to_point(buffer);
-                                if secondary_addition_range.end.column > 0 {
-                                    secondary_addition_range.end.row += 1;
-                                    secondary_addition_range.end.column = 0;
-                                }
-                                let secondary_deletion_range =
-                                    secondary_hunk.diff_base_point_range.clone();
-                                // if secondary_deletion_range.end.column > 0 {
-                                //     secondary_deletion_range.end.row += 1;
-                                //     secondary_deletion_range.end.column = 0;
-                                // }
-                                let new_staged_addition_lines: Vec<bool> = (start_point.row
-                                    ..end_point.row)
-                                    .into_iter()
-                                    .map(|row| {
-                                        row < secondary_addition_range.start.row
-                                            || secondary_addition_range.end.row <= row
-                                    })
-                                    .collect();
-
-                                let new_staged_deletion_lines: Vec<bool> = (start_base_row
-                                    ..end_base_row)
-                                    .into_iter()
-                                    .map(|row| {
-                                        row < secondary_deletion_range.start.row
-                                            || secondary_deletion_range.end.row <= row
-                                    })
-                                    .collect();
-
-                                if new_staged_addition_lines.iter().all(|staged| *staged)
-                                    && new_staged_deletion_lines.iter().all(|staged| *staged)
-                                {
-                                    break;
-                                }
-                                staged_addition_lines = staged_addition_lines
-                                    .iter()
-                                    .zip(new_staged_addition_lines)
-                                    .map(|(l, r)| *l && r)
-                                    .collect();
-                                staged_deletion_lines = staged_deletion_lines
-                                    .iter()
-                                    .zip(new_staged_deletion_lines)
-                                    .map(|(l, r)| *l && r)
-                                    .collect();
-                                dbg!(&staged_addition_lines, &staged_deletion_lines);
-                                secondary_cursor.next();
+                        // For additions: a buffer row is "staged" iff it is not
+                        // contained in any secondary (unstaged) hunk's buffer range —
+                        // i.e. that row already matches the index.
+                        let mut new_staged_addition_lines = vec![true; added_rows];
+                        while let Some(secondary_hunk) = secondary_cursor.item() {
+                            let mut secondary_addition_range =
+                                secondary_hunk.buffer_range.to_point(buffer);
+                            if secondary_addition_range.end.column > 0 {
+                                secondary_addition_range.end.row += 1;
+                                secondary_addition_range.end.column = 0;
                             }
-                            // dbg!(
-                            //     "after",
-                            //     start_base_row,
-                            //     &staged_deletion_lines,
-                            //     &secondary_deletion_range,
-                            //     &secondary_hunk,
-                            // );
-                            (staged_addition_lines, staged_deletion_lines)
-                        })
-                        .unzip();
-                    // staged_deletion_lines = (secondary_status
-                    //     == DiffHunkSecondaryStatus::OverlapsWithSecondaryHunk)
-                    //     .then_some({
-                    //         let mut staged_deletion_lines: Vec<bool> = (start_base_row..end_base_row)
-                    //             .into_iter()
-                    //             .map(|_| true)
-                    //             .collect();
-                    //         while let Some(secondary_hunk) = secondary_cursor.item() {
-                    //             dbg!(
-                    //                 "figuring out staged_deletion_lines...",
-                    //                 &start_base_row,
-                    //                 &end_base_row,
-                    //                 &start_point,
-                    //                 &end_point,
-                    //                 &secondary_hunk
-                    //             );
-                    //             let mut secondary_deletion_range =
-                    //                 secondary_hunk.diff_base_point_range.clone();
-                    //             if secondary_deletion_range.end.column > 0 {
-                    //                 secondary_deletion_range.end.row += 1;
-                    //                 secondary_deletion_range.end.column = 0;
-                    //             }
-                    //             let new_staged_deletion_lines: Vec<bool> = (start_point.row..end_point.row)
-                    //                 .into_iter()
-                    //                 .map(|row| {
-                    //                     row < secondary_deletion_range.start.row
-                    //                         || secondary_deletion_range.end.row <= row
-                    //                 })
-                    //                 .collect();
+                            if secondary_addition_range.start.row >= end_point.row {
+                                break;
+                            }
+                            let overlap_start =
+                                secondary_addition_range.start.row.max(start_point.row);
+                            let overlap_end =
+                                secondary_addition_range.end.row.min(end_point.row);
+                            for row in overlap_start..overlap_end {
+                                let idx = (row - start_point.row) as usize;
+                                if let Some(slot) = new_staged_addition_lines.get_mut(idx) {
+                                    *slot = false;
+                                }
+                            }
+                            // If this secondary hunk extends past the primary hunk's
+                            // end, leave the cursor on it so a later primary hunk
+                            // can still observe the overlap.
+                            if secondary_addition_range.end.row > end_point.row {
+                                break;
+                            }
+                            secondary_cursor.next();
+                        }
 
-                    //             // If there are no unstanged lines then break
-                    //             if !new_staged_deletion_lines.iter().any(|staged| !staged) {
-                    //                 break;
-                    //             }
-                    //             staged_deletion_lines = staged_deletion_lines
-                    //                 .iter()
-                    //                 .zip(new_staged_deletion_lines)
-                    //                 .map(|(l, r)| *l && r)
-                    //                 .collect();
-                    //             secondary_cursor.next();
-                    //         }
-                    //         staged_deletion_lines
-                    //     });
+                        let mut new_staged_deletion_lines = vec![false; removed_rows];
+                        if let Some(secondary) = secondary {
+                            let edits = head_to_index_edits.get_or_insert_with(|| {
+                                let head_text = if self.base_text_exists {
+                                    self.base_text.text()
+                                } else {
+                                    String::new()
+                                };
+                                let index_text = if secondary.base_text_exists {
+                                    secondary.base_text.text()
+                                } else {
+                                    String::new()
+                                };
+                                line_diff(&head_text, &index_text)
+                            });
+                            for (head_rows, _) in edits.iter() {
+                                let overlap_start = head_rows.start.max(start_base_row);
+                                let overlap_end = head_rows.end.min(end_base_row);
+                                for row in overlap_start..overlap_end {
+                                    let idx = (row - start_base_row) as usize;
+                                    if let Some(slot) = new_staged_deletion_lines.get_mut(idx)
+                                    {
+                                        *slot = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        staged_addition_lines = Some(new_staged_addition_lines);
+                        staged_deletion_lines = Some(new_staged_deletion_lines);
+                    }
                 }
 
                 return Some(DiffHunk {

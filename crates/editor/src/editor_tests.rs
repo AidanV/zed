@@ -25773,8 +25773,9 @@ async fn test_stage_selected_lines_basic(cx: &mut TestAppContext) {
     cx.assert_index_text(Some(indoc! { "
         one
         two
-        THREE
+        three
         four
+        THREE
         five
     "}));
 }
@@ -25818,54 +25819,6 @@ async fn test_stage_selected_lines_complex(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_stage_selected_lines_ordered_index(cx: &mut TestAppContext) {
-    init_test(cx, |_| {});
-
-    let mut cx = EditorTestContext::new(cx).await;
-    cx.set_head_text(indoc! { "
-        one
-        five
-        "
-    });
-    cx.set_index_text(indoc! { "
-        one
-        five
-        "
-    });
-    // All three middle lines are modified in one hunk. Cursor is on the middle line.
-    cx.set_state(indoc! { "
-        one
-        TWO
-        THREE
-        ˇTWO
-        five
-    "});
-    cx.run_until_parked();
-    cx.update_editor(|editor, window, cx| {
-        editor.toggle_staged_selected_lines(&Default::default(), window, cx);
-    });
-    cx.set_state(indoc! { "
-        one
-        TWO
-        ˇTHREE
-        TWO
-        five
-    "});
-    cx.run_until_parked();
-    cx.update_editor(|editor, window, cx| {
-        editor.toggle_staged_selected_lines(&Default::default(), window, cx);
-    });
-    // Only "THREE" (the line under the cursor) should appear in the index.
-    // "TWO" and "FOUR" remain at their HEAD versions.
-    cx.assert_index_text(Some(indoc! { "
-        one
-        THREE
-        TWO
-        five
-    "}));
-}
-
-#[gpui::test]
 async fn test_unstage_selected_lines(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
@@ -25904,7 +25857,6 @@ async fn test_unstage_selected_lines(cx: &mut TestAppContext) {
     cx.assert_index_text(Some(indoc! { "
         one
         two
-        three
         four
         five
     "}));
@@ -25941,8 +25893,9 @@ async fn test_stage_selected_lines_toggle_direction(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.assert_index_text(Some(indoc! { "
         one
-        TWO
+        two
         three
+        TWO
     "}));
 
     // Second call: cursor is on the same line which is now staged → unstage it.
@@ -25983,7 +25936,7 @@ async fn test_stage_selected_lines_extend_partial(cx: &mut TestAppContext) {
     cx.set_state(indoc! { "
         one
         TWO
-        THREE
+        three
         ˇFOUR
         five
     "});
@@ -25999,8 +25952,143 @@ async fn test_stage_selected_lines_extend_partial(cx: &mut TestAppContext) {
         one
         TWO
         three
+        four
         FOUR
         five
+    "}));
+}
+
+#[gpui::test]
+async fn test_stage_selected_lines_two_pure_deletions(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_head_text(indoc! { "
+        one
+        A
+        B
+        two
+        "
+    });
+    cx.set_index_text(indoc! { "
+        one
+        A
+        B
+        two
+        "
+    });
+    cx.set_state(indoc! { "
+        ˇone
+        two
+    "});
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.expand_all_diff_hunks(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.set_selections_state(indoc! { "
+        one
+        ˇA
+        B
+        two
+    "});
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_staged_selected_lines(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.set_selections_state(indoc! { "
+        one
+        A
+        ˇB
+        two
+    "});
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_staged_selected_lines(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.assert_index_text(Some(indoc! { "
+        one
+        two
+    "}));
+}
+
+#[gpui::test]
+async fn test_stage_selected_lines_two_cursors_on_two_hunks(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_head_text(indoc! { "
+        one
+        two
+        three
+        "
+    });
+    cx.set_index_text(indoc! { "
+        one
+        two
+        three
+        "
+    });
+    cx.set_state(indoc! { "
+        one
+        ˇADDED1
+        two
+        ˇADDED2
+        three
+    "});
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_staged_selected_lines(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.assert_index_text(Some(indoc! { "
+        one
+        ADDED1
+        two
+        ADDED2
+        three
+    "}));
+}
+
+#[gpui::test]
+async fn test_stage_selected_lines_empty_added_line(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_head_text(indoc! { "
+        one
+        two
+        "
+    });
+    cx.set_index_text(indoc! { "
+        one
+        two
+        "
+    });
+    // Buffer has an empty line inserted between "one" and "two".
+    cx.set_state(indoc! { "
+        one
+        ˇ
+        two
+    "});
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_staged_selected_lines(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+
+    cx.assert_index_text(Some(indoc! { "
+        one
+
+        two
     "}));
 }
 

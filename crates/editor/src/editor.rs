@@ -21547,11 +21547,18 @@ impl Editor {
                 DiffHunkSecondaryStatus::HasSecondaryHunk => return true,
                 DiffHunkSecondaryStatus::NoSecondaryHunk => continue,
                 DiffHunkSecondaryStatus::OverlapsWithSecondaryHunk => {
-                    let staged_lines = match &hunk.staged_addition_lines {
-                        Some(lines) => lines,
-                        None => return true,
+                    let (staged_addition_lines, staged_deletion_lines) = match (
+                        &hunk.staged_addition_lines,
+                        &hunk.staged_deletion_lines,
+                    ) {
+                        (Some(a), Some(d)) => (a, d),
+                        _ => return true,
                     };
                     let hunk_start = hunk.row_range.start.0;
+                    let visible_deletion_lines = (hunk.row_range.end.0 - hunk.row_range.start.0)
+                        .saturating_sub(
+                            hunk.buffer_range_point.end.row - hunk.buffer_range_point.start.row,
+                        );
                     for range in ranges {
                         let range_point = range.to_point(snapshot);
                         let sel_start = range_point.start.row;
@@ -21560,7 +21567,14 @@ impl Editor {
                         let intersect_end = sel_end.min(hunk.row_range.end.0);
                         for row in intersect_start..intersect_end {
                             let idx = (row - hunk_start) as usize;
-                            if staged_lines.get(idx).copied() == Some(false) {
+                            let staged = if idx < visible_deletion_lines as usize {
+                                staged_deletion_lines.get(idx).copied()
+                            } else {
+                                staged_addition_lines
+                                    .get(idx - visible_deletion_lines as usize)
+                                    .copied()
+                            };
+                            if staged == Some(false) {
                                 return true;
                             }
                         }
