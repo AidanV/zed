@@ -1019,30 +1019,38 @@ impl BufferDiffInner<Entity<language::Buffer>> {
                 continue;
             }
 
-            if staged_addition_lines.is_none() {
-                staged_addition_lines = Some(vec![
-                    !stage;
-                    (buffer_range.end.to_point(buffer).row
-                        - buffer_range.start.to_point(buffer).row)
-                        as usize
-                ]);
-            }
+            let addition_lines = staged_addition_lines.get_or_insert_with(|| {
+                let row_count = buffer_range
+                    .end
+                    .to_point(buffer)
+                    .row
+                    .saturating_sub(buffer_range.start.to_point(buffer).row);
+                vec![!stage; row_count as usize]
+            });
             for i in addition_rows {
-                staged_addition_lines.as_mut().unwrap()[i as usize] = stage;
+                if let Some(line) = addition_lines.get_mut(i as usize) {
+                    *line = stage;
+                } else {
+                    log::debug!("addition line index out of bounds: {}", i);
+                }
             }
-            if staged_deletion_lines.is_none() {
+            let deletion_lines = staged_deletion_lines.get_or_insert_with(|| {
                 let lines = head_text
                     .slice(diff_base_byte_range.clone())
                     .summary()
                     .lines
                     .row as usize;
-                staged_deletion_lines = Some(vec![!stage; lines]);
-            }
+                vec![!stage; lines]
+            });
             for i in deletion_rows {
-                staged_deletion_lines.as_mut().unwrap()[i as usize] = stage;
+                if let Some(line) = deletion_lines.get_mut(i as usize) {
+                    *line = stage;
+                } else {
+                    log::debug!("deletion line index out of bounds: {}", i);
+                }
             }
 
-            assert!(staged_addition_lines.is_some() == staged_deletion_lines.is_some());
+            debug_assert!(staged_addition_lines.is_some() == staged_deletion_lines.is_some());
             let show_stage = match staged_addition_lines
                 .as_ref()
                 .zip(staged_deletion_lines.as_ref())
@@ -1390,12 +1398,8 @@ impl BufferDiffInner<language::BufferSnapshot> {
                     }
                     if secondary_status == DiffHunkSecondaryStatus::OverlapsWithSecondaryHunk {
                         let added_rows = end_point.row.saturating_sub(start_point.row) as usize;
-                        let removed_rows =
-                            end_base_row.saturating_sub(start_base_row) as usize;
+                        let removed_rows = end_base_row.saturating_sub(start_base_row) as usize;
 
-                        // For additions: a buffer row is "staged" iff it is not
-                        // contained in any secondary (unstaged) hunk's buffer range —
-                        // i.e. that row already matches the index.
                         let mut new_staged_addition_lines = vec![true; added_rows];
                         while let Some(secondary_hunk) = secondary_cursor.item() {
                             let mut secondary_addition_range =
@@ -1409,17 +1413,13 @@ impl BufferDiffInner<language::BufferSnapshot> {
                             }
                             let overlap_start =
                                 secondary_addition_range.start.row.max(start_point.row);
-                            let overlap_end =
-                                secondary_addition_range.end.row.min(end_point.row);
+                            let overlap_end = secondary_addition_range.end.row.min(end_point.row);
                             for row in overlap_start..overlap_end {
                                 let idx = (row - start_point.row) as usize;
-                                if let Some(slot) = new_staged_addition_lines.get_mut(idx) {
-                                    *slot = false;
+                                if let Some(line) = new_staged_addition_lines.get_mut(idx) {
+                                    *line = false;
                                 }
                             }
-                            // If this secondary hunk extends past the primary hunk's
-                            // end, leave the cursor on it so a later primary hunk
-                            // can still observe the overlap.
                             if secondary_addition_range.end.row > end_point.row {
                                 break;
                             }
@@ -1446,9 +1446,8 @@ impl BufferDiffInner<language::BufferSnapshot> {
                                 let overlap_end = head_rows.end.min(end_base_row);
                                 for row in overlap_start..overlap_end {
                                     let idx = (row - start_base_row) as usize;
-                                    if let Some(slot) = new_staged_deletion_lines.get_mut(idx)
-                                    {
-                                        *slot = true;
+                                    if let Some(line) = new_staged_deletion_lines.get_mut(idx) {
+                                        *line = true;
                                     }
                                 }
                             }
@@ -2062,10 +2061,6 @@ impl BufferDiff {
         new_index_text
     }
 
-    /// Stages or unstages only specific lines within each hunk. `hunks_with_rows`
-    /// pairs each hunk with a range of rows (0-based, relative to the hunk's
-    /// start) that should be affected. Rows outside that range keep their
-    /// current staging state.
     pub fn stage_or_unstage_lines(
         &mut self,
         stage: bool,

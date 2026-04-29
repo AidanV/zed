@@ -25755,7 +25755,6 @@ async fn test_stage_selected_lines_basic(cx: &mut TestAppContext) {
         five
         "
     });
-    // All three middle lines are modified in one hunk. Cursor is on the middle line.
     cx.set_state(indoc! { "
         one
         TWO
@@ -25768,8 +25767,6 @@ async fn test_stage_selected_lines_basic(cx: &mut TestAppContext) {
         editor.toggle_staged_selected_lines(&Default::default(), window, cx);
     });
     cx.run_until_parked();
-    // Only "THREE" (the line under the cursor) should appear in the index.
-    // "TWO" and "FOUR" remain at their HEAD versions.
     cx.assert_index_text(Some(indoc! { "
         one
         two
@@ -25795,7 +25792,6 @@ async fn test_stage_selected_lines_complex(cx: &mut TestAppContext) {
         five
         "
     });
-    // All three middle lines are modified in one hunk. Cursor is on the middle line.
     cx.set_state(indoc! { "
         one
         ˇTWO
@@ -25808,8 +25804,6 @@ async fn test_stage_selected_lines_complex(cx: &mut TestAppContext) {
         editor.toggle_staged_selected_lines(&Default::default(), window, cx);
     });
     cx.run_until_parked();
-    // Only "THREE" (the line under the cursor) should appear in the index.
-    // "TWO" and "FOUR" remain at their HEAD versions.
     cx.assert_index_text(Some(indoc! { "
         one
         TWO
@@ -25831,7 +25825,6 @@ async fn test_unstage_selected_lines(cx: &mut TestAppContext) {
         five
         "
     });
-    // "THREE" is already staged in the index; the other two modified lines are not.
     cx.set_index_text(indoc! { "
         one
         two
@@ -25852,8 +25845,6 @@ async fn test_unstage_selected_lines(cx: &mut TestAppContext) {
         editor.toggle_staged_selected_lines(&Default::default(), window, cx);
     });
     cx.run_until_parked();
-    // All selected lines are already staged → the action should unstage them,
-    // reverting the index back to HEAD for "THREE".
     cx.assert_index_text(Some(indoc! { "
         one
         two
@@ -25886,7 +25877,6 @@ async fn test_stage_selected_lines_toggle_direction(cx: &mut TestAppContext) {
     "});
     cx.run_until_parked();
 
-    // First call: cursor is on an unstaged line → stage it.
     cx.update_editor(|editor, window, cx| {
         editor.toggle_staged_selected_lines(&Default::default(), window, cx);
     });
@@ -25898,7 +25888,6 @@ async fn test_stage_selected_lines_toggle_direction(cx: &mut TestAppContext) {
         TWO
     "}));
 
-    // Second call: cursor is on the same line which is now staged → unstage it.
     cx.update_editor(|editor, window, cx| {
         editor.toggle_staged_selected_lines(&Default::default(), window, cx);
     });
@@ -25923,7 +25912,6 @@ async fn test_stage_selected_lines_extend_partial(cx: &mut TestAppContext) {
         five
         "
     });
-    // "TWO" is already staged.
     cx.set_index_text(indoc! { "
         one
         TWO
@@ -25932,7 +25920,6 @@ async fn test_stage_selected_lines_extend_partial(cx: &mut TestAppContext) {
         five
         "
     });
-    // Buffer has all three lines changed. Cursor is on "FOUR" (the third changed line).
     cx.set_state(indoc! { "
         one
         TWO
@@ -25945,9 +25932,6 @@ async fn test_stage_selected_lines_extend_partial(cx: &mut TestAppContext) {
         editor.toggle_staged_selected_lines(&Default::default(), window, cx);
     });
     cx.run_until_parked();
-    // "TWO" was already staged and must remain staged.
-    // "FOUR" is newly staged by this action.
-    // "THREE" is still at HEAD ("three").
     cx.assert_index_text(Some(indoc! { "
         one
         TWO
@@ -26072,7 +26056,6 @@ async fn test_stage_selected_lines_empty_added_line(cx: &mut TestAppContext) {
         two
         "
     });
-    // Buffer has an empty line inserted between "one" and "two".
     cx.set_state(indoc! { "
         one
         ˇ
