@@ -194,7 +194,6 @@
     "context": "Editor && !agent_diff",
     "bindings": {
       "ctrl-k ctrl-r": "git::Restore",
-      "ctrl-k ctrl-shift-r": "git::RestoreSelectedLines",
       "ctrl-alt-y": "git::ToggleStaged",
       "ctrl-alt-shift-y": "git::ToggleStagedSelectedLines",
       "alt-y": "git::StageAndNext",

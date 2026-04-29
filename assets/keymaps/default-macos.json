@@ -231,7 +231,6 @@
     "use_key_equivalents": true,
     "bindings": {
       "cmd-alt-z": "git::Restore",
-      "cmd-alt-shift-z": "git::RestoreSelectedLines",
       "cmd-alt-y": "git::ToggleStaged",
       "cmd-alt-shift-y": "git::ToggleStagedSelectedLines",
       "cmd-y": "git::StageAndNext",

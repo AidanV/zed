@@ -89,7 +89,7 @@ pub use split_editor_view::SplitEditorView;
 pub use text::Bias;
 
 use ::git::{
-    Restore, RestoreSelectedLines, blame::BlameEntry, commit::ParsedCommitMessage,
+    Restore, blame::BlameEntry, commit::ParsedCommitMessage,
     status::FileStatus,
 };
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, BuildError};
@@ -12186,22 +12186,6 @@ impl Editor {
             window,
             cx,
         );
-    }
-
-    pub fn git_restore_selected_lines(
-        &mut self,
-        _: &RestoreSelectedLines,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.hide_mouse_cursor(HideMouseCursorOrigin::TypingAction, cx);
-        let selections = self
-            .selections
-            .all(&self.display_snapshot(cx))
-            .into_iter()
-            .map(|s| s.range())
-            .collect();
-        self.restore_hunks_in_ranges(selections, window, cx);
     }
 
     pub fn restore_hunks_in_ranges(

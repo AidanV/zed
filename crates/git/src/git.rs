@@ -46,8 +46,6 @@ actions!(
         /// Restores the selected hunks to their original state and moves to the
         /// next one.
         RestoreAndNext,
-        /// TODO
-        RestoreSelectedLines,
         // per-file
         /// Shows git blame information for the current file.
         #[action(deprecated_aliases = ["editor::ToggleGitBlame"])]
