@@ -179,28 +179,28 @@ fn translate_lhs_hunks_to_rhs(
 }
 
 fn translate_lhs_hunks_with_rows_to_rhs(
-    lhs_hunks_with_rows: &[(MultiBufferDiffHunk, Range<u32>)],
+    lhs_hunks_with_rows: &[(MultiBufferDiffHunk, (Vec<u32>, Vec<u32>))],
     splittable: &SplittableEditor,
     cx: &App,
-) -> Vec<(MultiBufferDiffHunk, Range<u32>)> {
-    let rhs_display_map = splittable.rhs_editor.read(cx).display_map.read(cx);
-    let Some(companion) = rhs_display_map.companion() else {
-        return vec![];
+) -> Vec<(MultiBufferDiffHunk, (Vec<u32>, Vec<u32>))> {
+    let Some(lhs) = &splittable.lhs else {
+        return Vec::new();
     };
-    let companion = companion.read(cx);
+    let lhs_snapshot = lhs.multibuffer.read(cx).snapshot(cx);
     let rhs_snapshot = splittable.rhs_multibuffer.read(cx).snapshot(cx);
     let rhs_hunks: Vec<MultiBufferDiffHunk> = rhs_snapshot.diff_hunks().collect();
 
-    let mut translated = Vec::new();
-    for (lhs_hunk, selected_rows) in lhs_hunks_with_rows {
-        let Some(rhs_buffer_id) = companion.lhs_to_rhs_buffer(lhs_hunk.buffer_id) else {
+    let mut translated: Vec<(MultiBufferDiffHunk, (Vec<u32>, Vec<u32>))> = Vec::new();
+    for (lhs_hunk, rows) in lhs_hunks_with_rows {
+        let Some(diff) = lhs_snapshot.diff_for_buffer_id(lhs_hunk.buffer_id) else {
             continue;
         };
+        let rhs_buffer_id = diff.buffer_id();
         if let Some(rhs_hunk) = rhs_hunks.iter().find(|rhs_hunk| {
             rhs_hunk.buffer_id == rhs_buffer_id
                 && rhs_hunk.diff_base_byte_range == lhs_hunk.diff_base_byte_range
         }) {
-            translated.push((rhs_hunk.clone(), selected_rows.clone()));
+            translated.push((rhs_hunk.clone(), rows.clone()));
         }
     }
     translated
@@ -687,18 +687,18 @@ impl SplittableEditor {
                     hunks_with_rows,
                 } => {
                     if this.lhs.is_some() {
-                        // let translated =
-                        //     translate_lhs_hunks_with_rows_to_rhs(hunks_with_rows, this, cx);
-                        // if !translated.is_empty() {
-                        //     let stage = *stage;
-                        //     this.rhs_editor.update(cx, |editor, cx| {
-                        //         editor.stage_or_unstage_selected_lines_for_hunks(
-                        //             stage,
-                        //             translated,
-                        //             cx,
-                        //         );
-                        //     });
-                        // }
+                        let translated =
+                            translate_lhs_hunks_with_rows_to_rhs(hunks_with_rows, this, cx);
+                        if !translated.is_empty() {
+                            let stage = *stage;
+                            this.rhs_editor.update(cx, |editor, cx| {
+                                editor.stage_or_unstage_selected_lines_for_hunks(
+                                    stage,
+                                    translated,
+                                    cx,
+                                );
+                            });
+                        }
                     }
                 }
                 EditorEvent::RestoreRequested { hunks } => {

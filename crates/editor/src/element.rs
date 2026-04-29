@@ -6385,16 +6385,19 @@ impl EditorElement {
                         .blend(background_color.opacity(0.3));
 
                     if let Some(staged_lines) = staged_lines {
-                        // dbg!(&staged_lines);
                         let total_lines = display_row_range.len();
                         let height = hunk_bounds.size.height;
                         let width = hunk_bounds.size.width;
 
                         let mut curr_origin = hunk_bounds.origin;
 
-                        for (new_height, staged) in staged_lines
-                            .iter()
-                            .tail(total_lines)
+                        let staged_iter = if split_side == Some(SplitSide::Left) {
+                            itertools::Either::Left(staged_lines.iter().take(total_lines))
+                        } else {
+                            itertools::Either::Right(staged_lines.iter().tail(total_lines))
+                        };
+
+                        for (new_height, staged) in staged_iter
                             .dedup_with_count()
                             .map(|(count, staged)| {
                                 let pixel_height: Pixels = height * count / (total_lines as f32);

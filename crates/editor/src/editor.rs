@@ -21533,10 +21533,6 @@ impl Editor {
         hunks.any(|hunk| hunk.status().has_secondary_hunk())
     }
 
-    /// Returns `true` if any buffer row that is both covered by `ranges` and
-    /// part of a diff hunk is not yet staged, meaning the action should stage.
-    /// Returns `false` when all such rows are already staged, meaning the
-    /// action should unstage.
     pub fn has_stageable_lines_in_ranges(
         &self,
         ranges: &[Range<Anchor>],
@@ -21554,6 +21550,15 @@ impl Editor {
                         (Some(a), Some(d)) => (a, d),
                         _ => return true,
                     };
+                    let inverted = snapshot
+                        .diff_for_buffer_id(hunk.buffer_id)
+                        .is_some_and(|diff| diff.buffer_id() != hunk.buffer_id);
+                    let (ghost_section_lines, buffer_section_lines): (&Vec<bool>, &Vec<bool>) =
+                        if inverted {
+                            (staged_addition_lines, staged_deletion_lines)
+                        } else {
+                            (staged_deletion_lines, staged_addition_lines)
+                        };
                     let hunk_start = hunk.row_range.start.0;
                     let visible_deletion_lines = (hunk.row_range.end.0 - hunk.row_range.start.0)
                         .saturating_sub(
@@ -21568,9 +21573,9 @@ impl Editor {
                         for row in intersect_start..intersect_end {
                             let idx = (row - hunk_start) as usize;
                             let staged = if idx < visible_deletion_lines as usize {
-                                staged_deletion_lines.get(idx).copied()
+                                ghost_section_lines.get(idx).copied()
                             } else {
-                                staged_addition_lines
+                                buffer_section_lines
                                     .get(idx - visible_deletion_lines as usize)
                                     .copied()
                             };
@@ -21590,8 +21595,9 @@ impl Editor {
         &self,
         ranges: &[Range<Anchor>],
         snapshot: &MultiBufferSnapshot,
-    ) -> HashMap<MultiBufferDiffHunk, (Vec<u32>, Vec<u32>)> {
-        let mut result: HashMap<MultiBufferDiffHunk, (Vec<u32>, Vec<u32>)> = HashMap::default();
+    ) -> Vec<(MultiBufferDiffHunk, (Vec<u32>, Vec<u32>))> {
+        let mut result: Vec<(MultiBufferDiffHunk, (Vec<u32>, Vec<u32>))> = Vec::new();
+        let mut index: HashMap<(BufferId, MultiBufferRow), usize> = HashMap::default();
 
         for range in ranges {
             let range_point = range.to_point(snapshot);
@@ -21604,18 +21610,16 @@ impl Editor {
             }
 
             for hunk in snapshot.diff_hunks_in_range(range_point.start..peek_end) {
-                dbg!(&hunk);
                 let hunk_start = hunk.row_range.start.0;
                 let hunk_end = hunk.row_range.end.0;
 
                 let visible_deletion_lines = (hunk.row_range.end.0 - hunk.row_range.start.0)
                     - (hunk.buffer_range_point.end.row - hunk.buffer_range_point.start.row);
-                dbg!(&visible_deletion_lines);
 
                 let intersect_start = sel_start.max(hunk_start);
                 let intersect_end = sel_end.min(hunk_start + visible_deletion_lines);
-                // if the deletions are visible
-                let deletion_range =
+
+                let ghost_section_range =
                     if visible_deletion_lines > 0 && intersect_start < intersect_end {
                         let relative_start = intersect_start - hunk_start;
                         let relative_end = intersect_end - hunk_start;
@@ -21625,31 +21629,46 @@ impl Editor {
                         0..0
                     };
 
-                let hunk_start = hunk_start + visible_deletion_lines;
+                let buffer_section_start = hunk_start + visible_deletion_lines;
 
-                let intersect_start = sel_start.max(hunk_start);
+                let intersect_start = sel_start.max(buffer_section_start);
                 let intersect_end = sel_end.min(hunk_end);
 
-                let addition_range = if intersect_start < intersect_end {
-                    let relative_start = intersect_start - hunk_start;
-                    let relative_end = intersect_end - hunk_start;
+                let buffer_section_range = if intersect_start < intersect_end {
+                    let relative_start = intersect_start - buffer_section_start;
+                    let relative_end = intersect_end - buffer_section_start;
 
                     relative_start..relative_end
                 } else {
                     0..0
                 };
 
-                dbg!(&addition_range, &deletion_range);
-
-                if addition_range.is_empty() && deletion_range.is_empty() {
+                if buffer_section_range.is_empty() && ghost_section_range.is_empty() {
                     continue;
                 }
-                let ranges = result
-                    .entry(hunk)
-                    .or_insert((Vec::default(), Vec::default()));
-                ranges.0.extend(addition_range.into_iter());
-                ranges.1.extend(deletion_range.into_iter());
-                dbg!(&ranges);
+
+                let inverted = snapshot
+                    .diff_for_buffer_id(hunk.buffer_id)
+                    .is_some_and(|diff| diff.buffer_id() != hunk.buffer_id);
+                let (addition_range, deletion_range) = if inverted {
+                    (ghost_section_range, buffer_section_range)
+                } else {
+                    (buffer_section_range, ghost_section_range)
+                };
+
+                let key = (hunk.buffer_id, hunk.row_range.start);
+                let idx = match index.get(&key) {
+                    Some(&idx) => idx,
+                    None => {
+                        let idx = result.len();
+                        index.insert(key, idx);
+                        result.push((hunk, (Vec::default(), Vec::default())));
+                        idx
+                    }
+                };
+                let (addition_rows, deletion_rows) = &mut result[idx].1;
+                addition_rows.extend(addition_range);
+                deletion_rows.extend(deletion_range);
             }
         }
 
@@ -21753,11 +21772,8 @@ impl Editor {
         ranges: Vec<Range<Anchor>>,
         cx: &mut Context<Self>,
     ) {
-        dbg!(&ranges);
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let hunks_with_rows: HashMap<MultiBufferDiffHunk, (Vec<u32>, Vec<u32>)> =
-            self.diff_hunks_with_selected_rows(&ranges, &snapshot);
-        dbg!(&hunks_with_rows);
+        let hunks_with_rows = self.diff_hunks_with_selected_rows(&ranges, &snapshot);
         if hunks_with_rows.is_empty() {
             return;
         }
@@ -21774,9 +21790,11 @@ impl Editor {
     pub(crate) fn stage_or_unstage_selected_lines_for_hunks(
         &mut self,
         stage: bool,
-        hunks_with_rows: HashMap<MultiBufferDiffHunk, (Vec<u32>, Vec<u32>)>,
+        mut hunks_with_rows: Vec<(MultiBufferDiffHunk, (Vec<u32>, Vec<u32>))>,
         cx: &mut Context<Self>,
     ) {
+        hunks_with_rows.sort_by_key(|(hunk, _)| hunk.buffer_id);
+
         let ranges: Vec<Range<Anchor>> = hunks_with_rows
             .iter()
             .map(|(hunk, _)| hunk.multi_buffer_range.clone())
@@ -21802,7 +21820,7 @@ impl Editor {
                         .file()
                         .is_some_and(|f| f.disk_state().exists());
 
-                    let diff_hunks: Vec<_> = group
+                    let mut diff_hunks: Vec<_> = group
                         .map(|(hunk, (selected_addition_rows, selected_deletion_rows))| {
                             (
                                 buffer_diff::DiffHunk {
@@ -21821,6 +21839,9 @@ impl Editor {
                             )
                         })
                         .collect();
+                    diff_hunks.sort_by(|(a, _, _), (b, _, _)| {
+                        a.buffer_range.start.cmp(&b.buffer_range.start, &buffer_snapshot)
+                    });
                     diff.update(cx, |diff, cx| {
                         diff.stage_or_unstage_lines(
                             stage,
@@ -29209,7 +29230,7 @@ pub enum EditorEvent {
     },
     StageOrUnstageSelectedLinesRequested {
         stage: bool,
-        hunks_with_rows: HashMap<MultiBufferDiffHunk, (Vec<u32>, Vec<u32>)>,
+        hunks_with_rows: Vec<(MultiBufferDiffHunk, (Vec<u32>, Vec<u32>))>,
     },
     OpenExcerptsRequested {
         selections_by_buffer: HashMap<BufferId, (Vec<Range<BufferOffset>>, Option<u32>)>,
