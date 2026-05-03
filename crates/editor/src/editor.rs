@@ -5270,7 +5270,7 @@ impl Editor {
                     )
                 }
             }
-            let auto_expanded = !bracket_inserted && this.try_auto_expand_snippet(window, cx);
+            let auto_expanded = this.try_auto_expand_snippet(bracket_inserted, window, cx);
             if !auto_expanded {
                 this.trigger_completion_on_input(&text, trigger_in_words, window, cx);
             }
@@ -11052,8 +11052,15 @@ impl Editor {
     /// If an auto-expanding snippet's trigger matches the text immediately
     /// before the newest cursor, expand it in place and return `true`.
     /// Called from `handle_input` after every text insertion.
+    /// Tries to fire an auto-expanding snippet whose trigger ends at the
+    /// cursor. When `consume_autoclose` is `true`, the immediately-preceding
+    /// edit auto-paired a bracket — for any cursor sitting at the start of
+    /// such a pair, the auto-inserted closing bracket is folded into the
+    /// snippet's replacement range so the snippet body cleanly overwrites
+    /// `lr(`/`lr{`/`lr[` instead of leaving a stray `)`/`}`/`]` behind.
     fn try_auto_expand_snippet(
         &mut self,
+        consume_autoclose: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -11062,110 +11069,164 @@ impl Editor {
         };
 
         let multibuffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        let display_snapshot = self.display_snapshot(cx);
 
-        let cursor_anchor = self.selections.newest_anchor().head();
-        let head_offset = cursor_anchor.to_offset(&multibuffer_snapshot);
-        let tail_offset = self
-            .selections
-            .newest_anchor()
-            .tail()
-            .to_offset(&multibuffer_snapshot);
-        if head_offset != tail_offset {
-            return false;
-        }
-        let cursor: usize = head_offset.0;
-
-        let Some((buffer_anchor, _)) =
-            multibuffer_snapshot.anchor_to_buffer_anchor(cursor_anchor)
-        else {
-            return false;
-        };
-        let Some(buffer_entity) = self.buffer.read(cx).buffer(buffer_anchor.buffer_id) else {
-            return false;
-        };
-
-        const MAX_PREFIX_LEN: usize = 128;
-        let window_start = cursor.saturating_sub(MAX_PREFIX_LEN);
-        let window_start = multibuffer_snapshot
-            .clip_offset(MultiBufferOffset(window_start), Bias::Left)
-            .0;
-        let window_text: String = multibuffer_snapshot
-            .text_for_range(MultiBufferOffset(window_start)..MultiBufferOffset(cursor))
-            .collect();
-        if window_text.is_empty() {
-            return false;
-        }
-
-        let auto_snippets: Vec<_> = {
-            let store = project.read(cx).snippets().read(cx);
-            buffer_entity
-                .read(cx)
-                .languages_at(buffer_anchor)
-                .iter()
-                .flat_map(|language| store.snippets_for(Some(language.lsp_id()), cx))
-                .filter(|snippet| snippet.auto)
-                .collect()
-        };
-        if auto_snippets.is_empty() {
-            return false;
-        }
-
-        // Collect the kinds of every tree-sitter node enclosing the cursor so
-        // we can evaluate each snippet's `active` predicate.
-        let ancestor_kinds: std::collections::BTreeSet<&str> = {
-            let mut kinds = std::collections::BTreeSet::new();
-            let mut node = multibuffer_snapshot
-                .syntax_ancestor(MultiBufferOffset(cursor)..MultiBufferOffset(cursor))
-                .map(|(node, _)| node);
-            while let Some(n) = node {
-                kinds.insert(n.kind());
-                node = n.parent();
+        // Collect the offsets of every cursor (empty selection). If any
+        // selection is non-empty, abort — auto-expand only fires for plain
+        // cursors, matching the single-cursor behavior.
+        let mut cursors: Vec<usize> = Vec::new();
+        for selection in self.selections.all::<MultiBufferOffset>(&display_snapshot) {
+            if selection.start != selection.end {
+                return false;
             }
-            kinds
-        };
+            cursors.push(selection.head().0);
+        }
+        if cursors.is_empty() {
+            return false;
+        }
 
-        let matched = auto_snippets.iter().find_map(|snippet| {
-            if !snippet.is_active(&ancestor_kinds) {
-                return None;
+        // For each cursor, attempt to find a matching auto-snippet expansion
+        // and compute its (body, consumed-prefix-length) pair. All cursors
+        // must agree on the same body and consumed length; otherwise we'd
+        // need to insert different snippets at different positions, which
+        // can't share a single tabstop stack.
+        let mut expansions: Vec<(usize, usize, String)> = Vec::with_capacity(cursors.len());
+        for &cursor in &cursors {
+            let cursor_anchor = multibuffer_snapshot.anchor_before(MultiBufferOffset(cursor));
+            let Some((buffer_anchor, _)) =
+                multibuffer_snapshot.anchor_to_buffer_anchor(cursor_anchor)
+            else {
+                return false;
+            };
+            let Some(buffer_entity) = self.buffer.read(cx).buffer(buffer_anchor.buffer_id) else {
+                return false;
+            };
+
+            const MAX_PREFIX_LEN: usize = 128;
+            let window_start = cursor.saturating_sub(MAX_PREFIX_LEN);
+            let window_start = multibuffer_snapshot
+                .clip_offset(MultiBufferOffset(window_start), Bias::Left)
+                .0;
+            let window_text: String = multibuffer_snapshot
+                .text_for_range(MultiBufferOffset(window_start)..MultiBufferOffset(cursor))
+                .collect();
+            if window_text.is_empty() {
+                return false;
             }
-            if let Some(regex) = &snippet.regex {
-                let m = regex
-                    .find_iter(&window_text)
-                    .find(|m| m.end() == window_text.len())?;
-                let captures = regex.captures(&window_text[m.start()..])?;
-                let cap_strs: Vec<&str> = (0..captures.len())
-                    .map(|i| captures.get(i).map(|c| c.as_str()).unwrap_or(""))
-                    .collect();
-                let consumed = window_text.len() - m.start();
-                let body = snippet.evaluate(&cap_strs).log_err()?;
-                Some((body, consumed))
-            } else {
-                snippet
-                    .prefix
+
+            let auto_snippets: Vec<_> = {
+                let store = project.read(cx).snippets().read(cx);
+                buffer_entity
+                    .read(cx)
+                    .languages_at(buffer_anchor)
                     .iter()
-                    .find_map(|prefix| match_auto_prefix(&window_text, prefix))
-                    .and_then(|consumed| {
-                        snippet
-                            .evaluate(&[])
-                            .log_err()
-                            .map(|body| (body, consumed))
-                    })
+                    .flat_map(|language| store.snippets_for(Some(language.lsp_id()), cx))
+                    .filter(|snippet| snippet.auto)
+                    .collect()
+            };
+            if auto_snippets.is_empty() {
+                return false;
             }
-        });
 
-        let Some((body, consumed)) = matched else {
+            // Collect the kinds of every tree-sitter node enclosing the cursor so
+            // we can evaluate each snippet's `active` predicate.
+            let ancestor_kinds: std::collections::BTreeSet<&str> = {
+                let mut kinds = std::collections::BTreeSet::new();
+                let mut node = multibuffer_snapshot
+                    .syntax_ancestor(MultiBufferOffset(cursor)..MultiBufferOffset(cursor))
+                    .map(|(node, _)| node);
+                while let Some(n) = node {
+                    kinds.insert(n.kind());
+                    node = n.parent();
+                }
+                kinds
+            };
+
+            let matched = auto_snippets.iter().find_map(|snippet| {
+                if !snippet.is_active(&ancestor_kinds) {
+                    return None;
+                }
+                if let Some(regex) = &snippet.regex {
+                    let m = regex
+                        .find_iter(&window_text)
+                        .find(|m| m.end() == window_text.len())?;
+                    let captures = regex.captures(&window_text[m.start()..])?;
+                    let cap_strs: Vec<&str> = (0..captures.len())
+                        .map(|i| captures.get(i).map(|c| c.as_str()).unwrap_or(""))
+                        .collect();
+                    let consumed = window_text.len() - m.start();
+                    let body = snippet.evaluate(&cap_strs).log_err()?;
+                    Some((body, consumed))
+                } else {
+                    snippet
+                        .prefix
+                        .iter()
+                        .find_map(|prefix| match_auto_prefix(&window_text, prefix))
+                        .and_then(|consumed| {
+                            snippet
+                                .evaluate(&[])
+                                .log_err()
+                                .map(|body| (body, consumed))
+                        })
+                }
+            });
+
+            let Some((body, consumed)) = matched else {
+                return false;
+            };
+            expansions.push((cursor, consumed, body));
+        }
+
+        let (_, consumed, body) = &expansions[0];
+        let consumed = *consumed;
+        if !expansions
+            .iter()
+            .all(|(_, c, b)| *c == consumed && b == body)
+        {
             return false;
-        };
+        }
 
-        drop(multibuffer_snapshot);
-
-        let parsed = match snippet::Snippet::parse(&body) {
+        let parsed = match snippet::Snippet::parse(body) {
             Ok(s) => s,
             Err(_) => return false,
         };
 
-        let start = MultiBufferOffset(cursor.saturating_sub(consumed));
-        self.insert_snippet(&[start..MultiBufferOffset(cursor)], parsed, window, cx)
+        // If the input that triggered this call also auto-paired a bracket,
+        // the cursor sits between the just-typed open bracket and an
+        // auto-inserted closing bracket. Without this, expanding the snippet
+        // would leave that closing bracket stranded after the snippet body.
+        // For each cursor, look up an autoclose region whose start anchor
+        // resolves to the cursor offset; the closing bracket is `pair.end`
+        // and lives in `[cursor, cursor + pair.end.len())`.
+        let autoclose_lengths: Vec<usize> = expansions
+            .iter()
+            .map(|(cursor, _, _)| {
+                if !consume_autoclose {
+                    return 0;
+                }
+                self.autoclose_regions
+                    .iter()
+                    .find_map(|region| {
+                        (region.range.start.to_offset(&multibuffer_snapshot)
+                            == MultiBufferOffset(*cursor))
+                        .then(|| region.pair.end.len())
+                    })
+                    .unwrap_or(0)
+            })
+            .collect();
+
+        drop(multibuffer_snapshot);
+
+        let ranges: Vec<_> = expansions
+            .iter()
+            .zip(autoclose_lengths.iter())
+            .map(|((cursor, _, _), trailing)| {
+                MultiBufferOffset(cursor.saturating_sub(consumed))
+                    ..MultiBufferOffset(*cursor + *trailing)
+            })
+            .collect();
+
+        self.insert_snippet(&ranges, parsed, window, cx)
             .log_err()
             .is_some()
     }

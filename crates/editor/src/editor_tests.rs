@@ -14048,6 +14048,114 @@ async fn test_auto_expand_not_in_node_filter(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_auto_expand_with_multiple_cursors(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_editor(|editor, _, cx| {
+        editor.project().unwrap().update(cx, |project, cx| {
+            project.snippets().update(cx, |snippets, _cx| {
+                snippets.add_snippet_for_test(
+                    None,
+                    PathBuf::from("test_snippets.json"),
+                    vec![Arc::new(project::snippet_provider::Snippet {
+                        prefix: vec!["ff".to_string()],
+                        body: "\\frac{$1}{$2}$0".to_string(),
+                        description: None,
+                        name: "fraction".to_string(),
+                        auto: true,
+                        regex: None,
+                        active: None,
+                    })],
+                );
+            });
+        })
+    });
+
+    cx.set_state("ˇ\nˇ\nˇ");
+    cx.simulate_input("ff");
+    // The trigger expands at every cursor, and the first tabstop becomes a
+    // selection at every expansion site.
+    cx.assert_editor_state("\\frac{ˇ}{}\n\\frac{ˇ}{}\n\\frac{ˇ}{}");
+
+    // Tabbing through the snippet should advance every cursor in lockstep.
+    cx.update_editor(|editor, window, cx| {
+        editor.move_to_next_snippet_tabstop(window, cx);
+    });
+    cx.assert_editor_state("\\frac{}{ˇ}\n\\frac{}{ˇ}\n\\frac{}{ˇ}");
+}
+
+#[gpui::test]
+async fn test_auto_expand_does_not_fire_when_one_cursor_does_not_match(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_editor(|editor, _, cx| {
+        editor.project().unwrap().update(cx, |project, cx| {
+            project.snippets().update(cx, |snippets, _cx| {
+                snippets.add_snippet_for_test(
+                    None,
+                    PathBuf::from("test_snippets.json"),
+                    vec![Arc::new(project::snippet_provider::Snippet {
+                        prefix: vec!["ff".to_string()],
+                        body: "\\frac{$1}{$2}$0".to_string(),
+                        description: None,
+                        name: "fraction".to_string(),
+                        auto: true,
+                        regex: None,
+                        active: None,
+                    })],
+                );
+            });
+        })
+    });
+
+    // The second cursor is in the middle of a word, so the prefix `ff`
+    // doesn't auto-expand there. To keep all cursors consistent, no cursor
+    // expands.
+    cx.set_state("ˇ\nxˇ");
+    cx.simulate_input("ff");
+    cx.assert_editor_state("ffˇ\nxffˇ");
+}
+
+#[gpui::test]
+async fn test_auto_expand_consumes_autoclosed_bracket(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(rust_lang()), cx));
+    cx.update_editor(|editor, _, cx| {
+        editor.project().unwrap().update(cx, |project, cx| {
+            project.snippets().update(cx, |snippets, _cx| {
+                snippets.add_snippet_for_test(
+                    None,
+                    PathBuf::from("test_snippets.json"),
+                    vec![Arc::new(project::snippet_provider::Snippet {
+                        prefix: vec![],
+                        body: r#"`\left( $1 \right) $0`"#.to_string(),
+                        description: None,
+                        name: "left-right-paren".to_string(),
+                        auto: true,
+                        regex: Some(std::sync::Arc::new(regex::Regex::new(r"lr\(").unwrap())),
+                        active: None,
+                    })],
+                );
+            });
+        })
+    });
+
+    // Typing `(` after `lr` triggers Rust's bracket-autoclose, inserting `)`
+    // and leaving the cursor between the brackets. The regex `lr\(` must
+    // still fire, and the snippet expansion must consume the auto-inserted
+    // `)` instead of leaving it behind.
+    cx.set_state("ˇ");
+    cx.simulate_input("lr(");
+    cx.assert_editor_state(r"\left( ˇ \right) ");
+}
+
+#[gpui::test]
 async fn test_non_auto_snippet_does_not_auto_expand(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

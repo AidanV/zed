@@ -44,31 +44,73 @@ pub fn file_to_snippets(
     file_contents: VsSnippetsFile,
     source: &Path,
 ) -> impl Iterator<Item = Result<Arc<Snippet>>> {
+    file_to_snippets_with_context(file_contents, HashMap::default(), HashMap::default(), source)
+}
+
+/// Like [`file_to_snippets`], but allows the caller to supply named regex
+/// fragments that snippet `regex` patterns can splice in via the
+/// `{{name}}` placeholder. Aliases are expanded once, at load time, so a
+/// misspelled name fails the snippet rather than firing silently.
+pub fn file_to_snippets_with_aliases(
+    file_contents: VsSnippetsFile,
+    aliases: HashMap<String, String>,
+    source: &Path,
+) -> impl Iterator<Item = Result<Arc<Snippet>>> {
+    file_to_snippets_with_context(file_contents, aliases, HashMap::default(), source)
+}
+
+/// Like [`file_to_snippets_with_aliases`], but additionally accepts a
+/// `defaults` map. Each entry is consulted when a snippet omits the matching
+/// field. Currently the supported keys are `auto`, `active`, and
+/// `description`; `prefix`/`regex`/`body` are intentionally excluded — those
+/// must stay per-snippet because defaulting them would silently change which
+/// snippet fires.
+pub fn file_to_snippets_with_context(
+    file_contents: VsSnippetsFile,
+    aliases: HashMap<String, String>,
+    defaults: HashMap<String, String>,
+    source: &Path,
+) -> impl Iterator<Item = Result<Arc<Snippet>>> {
+    let aliases = Arc::new(aliases);
+    let default_auto = defaults
+        .get("auto")
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let default_active = defaults.get("active").cloned();
+    let default_description = defaults.get("description").cloned();
     file_contents
         .snippets
         .into_iter()
         .map(move |(name, snippet)| {
-            let snippet_name = name.clone();
-            let prefixes = snippet
-                .prefix
-                .map_or_else(move || vec![snippet_name], |prefixes| prefixes.into());
             let description = snippet
                 .description
-                .map(|description| description.to_string());
+                .map(|description| description.to_string())
+                .or_else(|| default_description.clone());
             let body = snippet.body.to_string();
-            let auto = snippet.auto.unwrap_or(false);
+            let auto = snippet.auto.unwrap_or(default_auto);
             let regex = snippet
                 .regex
                 .map(|pattern| {
-                    Regex::new(&pattern)
+                    let expanded = expand_aliases(&pattern, &aliases)?;
+                    Regex::new(&expanded)
                         .map(Arc::new)
-                        .with_context(|| format!("invalid regex `{pattern}`"))
+                        .with_context(|| format!("invalid regex `{expanded}`"))
                 })
                 .transpose()
                 .with_context(|| format!("Invalid snippet '{name}' in {source:?}"))?;
-            let active = snippet
-                .active
-                .as_deref()
+            // A regex-only snippet has no meaningful textual prefix: it fires
+            // on regex match, and its body typically reads `captures[..]`,
+            // which would panic the body evaluator if invoked from the
+            // prefix-driven completion list with empty captures. So we leave
+            // its prefix list empty rather than defaulting to the snippet name.
+            let snippet_name = name.clone();
+            let prefixes = match snippet.prefix {
+                Some(prefixes) => prefixes.into(),
+                None if regex.is_some() => Vec::new(),
+                None => vec![snippet_name],
+            };
+            let active_src = snippet.active.as_deref().or(default_active.as_deref());
+            let active = active_src
                 .map(|src| {
                     script::ActivePredicate::compile(src)
                         .map(Arc::new)
@@ -100,6 +142,100 @@ pub fn file_to_snippets(
                 active,
             }))
         })
+}
+
+/// Pulls a top-level `aliases` block out of a CONL snippet file. See
+/// [`extract_conl_block`] for the parse rules. `serde_conl` does not support
+/// `#[serde(flatten)]`, so we cannot model `aliases` as a peer-of-snippets
+/// field on the deserialized struct; this string-level pre-pass is the
+/// workaround.
+pub(crate) fn extract_conl_aliases(source: &str) -> (String, HashMap<String, String>) {
+    extract_conl_block(source, "aliases")
+}
+
+/// Pulls a top-level `defaults` block out of a CONL snippet file. Each entry
+/// supplies a default value for the matching field on every snippet that
+/// omits it. See [`extract_conl_block`] for the parse rules.
+pub(crate) fn extract_conl_defaults(source: &str) -> (String, HashMap<String, String>) {
+    extract_conl_block(source, "defaults")
+}
+
+/// Pulls a top-level CONL block named `header` out of `source`, returning the
+/// remaining source with the block removed plus the parsed `name = value`
+/// entries underneath it. The block is matched at the start of a line (no
+/// leading whitespace) and terminated by the first non-indented, non-blank
+/// line that follows.
+fn extract_conl_block(source: &str, header: &str) -> (String, HashMap<String, String>) {
+    let mut entries = HashMap::default();
+    let mut output = String::with_capacity(source.len());
+    let mut lines = source.lines().peekable();
+    let mut found = false;
+    while let Some(line) = lines.next() {
+        if !found && line.trim_end() == header && !line.starts_with(char::is_whitespace) {
+            found = true;
+            while let Some(next) = lines.peek() {
+                if next.trim().is_empty() {
+                    lines.next();
+                    continue;
+                }
+                if !next.starts_with(char::is_whitespace) {
+                    break;
+                }
+                let entry = lines.next().unwrap().trim();
+                if let Some((name, value)) = entry.split_once('=') {
+                    entries.insert(name.trim().to_string(), value.trim().to_string());
+                }
+            }
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    (output, entries)
+}
+
+/// Substitutes `{{name}}` placeholders in a regex pattern with the
+/// corresponding alias body. Aliases may reference other aliases; expansion
+/// repeats until the pattern is stable or hits a depth limit (cycle guard).
+/// Errors out on an unknown name, unclosed placeholder, or apparent cycle
+/// so misspellings and infinite loops don't silently produce a broken regex.
+fn expand_aliases(pattern: &str, aliases: &HashMap<String, String>) -> Result<String> {
+    const MAX_DEPTH: usize = 32;
+    let mut current = pattern.to_string();
+    for _ in 0..MAX_DEPTH {
+        let (next, did_expand) = expand_aliases_once(&current, aliases, pattern)?;
+        if !did_expand {
+            return Ok(next);
+        }
+        current = next;
+    }
+    anyhow::bail!("alias expansion exceeded depth limit (cycle?) in regex `{pattern}`");
+}
+
+fn expand_aliases_once(
+    input: &str,
+    aliases: &HashMap<String, String>,
+    original: &str,
+) -> Result<(String, bool)> {
+    let mut result = String::with_capacity(input.len());
+    let mut rest = input;
+    let mut did_expand = false;
+    while let Some(open) = rest.find("{{") {
+        result.push_str(&rest[..open]);
+        let after_open = &rest[open + 2..];
+        let close = after_open
+            .find("}}")
+            .with_context(|| format!("unclosed `{{{{` placeholder in regex `{original}`"))?;
+        let name = &after_open[..close];
+        let value = aliases
+            .get(name)
+            .with_context(|| format!("unknown alias `{name}` in regex `{original}`"))?;
+        result.push_str(value);
+        rest = &after_open[close + 2..];
+        did_expand = true;
+    }
+    result.push_str(rest);
+    Ok((result, did_expand))
 }
 
 // Snippet with all of the metadata
@@ -186,20 +322,37 @@ async fn process_updates(
                 let Some(file_contents) = contents else {
                     return;
                 };
-                let parsed = match format {
-                    SnippetFileFormat::Json => {
-                        serde_json_lenient::from_str::<VsSnippetsFile>(&file_contents).ok()
+                let (parsed, aliases, defaults) = match format {
+                    SnippetFileFormat::Json => (
+                        serde_json_lenient::from_str::<VsSnippetsFile>(&file_contents).ok(),
+                        HashMap::default(),
+                        HashMap::default(),
+                    ),
+                    SnippetFileFormat::Conl => {
+                        let (rest, defaults) = extract_conl_defaults(&file_contents);
+                        let (rest, aliases) = extract_conl_aliases(&rest);
+                        // `serde_conl` does not support `#[serde(flatten)]`,
+                        // so we deserialize the bare `HashMap` shape and wrap
+                        // it. Going through `VsSnippetsFile` directly silently
+                        // drops every snippet in the file.
+                        (
+                            serde_conl::from_str::<HashMap<String, format::VsCodeSnippet>>(&rest)
+                                .ok()
+                                .map(|snippets| VsSnippetsFile { snippets }),
+                            aliases,
+                            defaults,
+                        )
                     }
-                    SnippetFileFormat::Conl => serde_conl::from_str::<
-                        HashMap<String, format::VsCodeSnippet>,
-                    >(&file_contents)
-                    .ok()
-                    .map(|snippets| VsSnippetsFile { snippets }),
                 };
                 let Some(parsed) = parsed else {
                     return;
                 };
-                let snippets = file_to_snippets(parsed, entry_path.as_path());
+                let snippets = file_to_snippets_with_context(
+                    parsed,
+                    aliases,
+                    defaults,
+                    entry_path.as_path(),
+                );
                 *snippets_of_kind.entry(entry_path).or_default() =
                     snippets.filter_map(Result::log_err).collect();
             } else {
@@ -512,6 +665,232 @@ Matrix
         assert!(matrix.contains("$4 & $5 & $6"), "got: {matrix}");
         assert!(matrix.contains(r"\begin{pmatrix}"));
         assert!(matrix.contains(r"\end{pmatrix}"));
+    }
+
+    #[test]
+    fn test_aliases_expand_in_regex() {
+        let conl = r#"aliases
+  greek = alpha|beta|gamma
+  letter = [A-Za-z]
+
+Letter subscript digit
+  regex = (\\(?:{{greek}})|\b{{letter}})(\d)
+  body = """rhai
+    captures[1] + "_{" + captures[2] + "}"
+"#;
+        let (without_aliases, aliases) = extract_conl_aliases(conl);
+        assert_eq!(aliases.get("greek").map(String::as_str), Some("alpha|beta|gamma"));
+        assert_eq!(aliases.get("letter").map(String::as_str), Some("[A-Za-z]"));
+        let parsed: HashMap<String, format::VsCodeSnippet> =
+            serde_conl::from_str(&without_aliases).unwrap();
+        let file = VsSnippetsFile { snippets: parsed };
+        let snippets: Vec<_> = file_to_snippets_with_aliases(
+            file,
+            aliases,
+            std::path::Path::new("t.conl"),
+        )
+        .filter_map(Result::ok)
+        .collect();
+        assert_eq!(snippets.len(), 1);
+        let regex = snippets[0].regex.as_ref().unwrap();
+        assert!(regex.is_match(r"\alpha3"));
+        assert!(regex.is_match("x3"));
+        // No word boundary before `t` in `pmat3`, so the bare-letter branch
+        // shouldn't match — confirms the alias splice preserved the `\b`.
+        let m = regex.find("pmat3");
+        assert!(m.is_none(), "got match: {m:?}");
+    }
+
+    #[test]
+    fn test_nested_alias_references_expand() {
+        let mut aliases = HashMap::default();
+        aliases.insert("greek".into(), "alpha|beta".into());
+        aliases.insert("either".into(), r"\\(?:{{greek}})|\b[A-Za-z]".into());
+        let expanded = expand_aliases(r"({{either}})(\d)", &aliases).unwrap();
+        assert_eq!(expanded, r"(\\(?:alpha|beta)|\b[A-Za-z])(\d)");
+    }
+
+    #[test]
+    fn test_alias_cycle_is_rejected() {
+        let mut aliases = HashMap::default();
+        aliases.insert("a".into(), "x{{b}}".into());
+        aliases.insert("b".into(), "y{{a}}".into());
+        let err = expand_aliases("{{a}}", &aliases).unwrap_err();
+        assert!(format!("{err:#}").contains("depth limit"), "got: {err:#}");
+    }
+
+    #[test]
+    fn test_extract_conl_aliases_pulls_block() {
+        let input = "aliases\n  greek = a|b\n  letter = [A-Za-z]\n\nfoo\n  body = x\n";
+        let (out, aliases) = extract_conl_aliases(input);
+        assert_eq!(aliases.get("greek").map(String::as_str), Some("a|b"));
+        assert_eq!(aliases.get("letter").map(String::as_str), Some("[A-Za-z]"));
+        assert!(!out.contains("aliases"), "block should be removed:\n{out}");
+        assert!(out.contains("foo"));
+    }
+
+    #[test]
+    fn test_conl_static_body_keeps_backslash() {
+        // The static-body shortcut hinges on CONL preserving `\` literally
+        // when a body value isn't wrapped in a Rhai block. If CONL ate the
+        // backslash we'd silently emit `alpha` instead of `\alpha`.
+        let conl = "alpha\n  prefix = @a\n  body = \\alpha\n";
+        let parsed: HashMap<String, format::VsCodeSnippet> = serde_conl::from_str(conl).unwrap();
+        let file = VsSnippetsFile { snippets: parsed };
+        let snippets: Vec<_> = file_to_snippets(file, std::path::Path::new("t.conl"))
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(snippets.len(), 1);
+        let body = snippets[0].evaluate(&[]).unwrap();
+        assert_eq!(body, r"\alpha", "body should keep backslash");
+    }
+
+    #[test]
+    fn test_conl_static_body_with_braces() {
+        // Bodies like `^{2}` for the Square snippet contain `{` and `}`.
+        // Confirm CONL passes them through and the snippet parser accepts
+        // the result.
+        let conl = "Square\n  prefix = sr\n  body = ^{2}\n";
+        let parsed: HashMap<String, format::VsCodeSnippet> = serde_conl::from_str(conl).unwrap();
+        let file = VsSnippetsFile { snippets: parsed };
+        let snippets: Vec<_> = file_to_snippets(file, std::path::Path::new("t.conl"))
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0].evaluate(&[]).unwrap(), "^{2}");
+    }
+
+    #[test]
+    fn test_load_latex_snippets_file() {
+        // Smoke test against the user's file at the repo root. Skipped if
+        // the file isn't present (e.g. in CI without it).
+        let path = std::path::Path::new("../../latex_snippets.conl");
+        if !path.exists() {
+            return;
+        }
+        let contents = std::fs::read_to_string(path).unwrap();
+        let (rest, defaults) = extract_conl_defaults(&contents);
+        let (rest, aliases) = extract_conl_aliases(&rest);
+        assert!(!aliases.is_empty(), "expected aliases block");
+        assert!(!defaults.is_empty(), "expected defaults block");
+        let parsed: HashMap<String, format::VsCodeSnippet> = serde_conl::from_str(&rest)
+            .unwrap_or_else(|e| panic!("conl parse: {e:?}"));
+        let file = VsSnippetsFile { snippets: parsed };
+        let errors: Vec<_> =
+            file_to_snippets_with_context(file, aliases, defaults, path)
+                .filter_map(Result::err)
+                .collect();
+        assert!(
+            errors.is_empty(),
+            "loaded latex_snippets with errors:\n{}",
+            errors
+                .iter()
+                .map(|e| format!("{e:#}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn test_extract_conl_defaults_pulls_block() {
+        let input = "defaults\n  auto = true\n  active = math\n\nfoo\n  body = x\n";
+        let (out, defaults) = extract_conl_defaults(input);
+        assert_eq!(defaults.get("auto").map(String::as_str), Some("true"));
+        assert_eq!(defaults.get("active").map(String::as_str), Some("math"));
+        assert!(!out.contains("defaults"), "block should be removed:\n{out}");
+        assert!(out.contains("foo"));
+    }
+
+    #[test]
+    fn test_defaults_apply_when_field_omitted() {
+        let conl = r#"Defaulted
+  prefix = d
+  body = """rhai
+    "DD"
+Overridden
+  prefix = o
+  auto = false
+  body = """rhai
+    "OO"
+"#;
+        let parsed: HashMap<String, format::VsCodeSnippet> = serde_conl::from_str(conl).unwrap();
+        let file = VsSnippetsFile { snippets: parsed };
+        let mut defaults = HashMap::default();
+        defaults.insert("auto".into(), "true".into());
+        defaults.insert("active".into(), "string_literal".into());
+        defaults.insert("description".into(), "from-default".into());
+        let snippets: HashMap<String, Arc<Snippet>> = file_to_snippets_with_context(
+            file,
+            HashMap::default(),
+            defaults,
+            std::path::Path::new("t.conl"),
+        )
+        .filter_map(Result::ok)
+        .map(|s| (s.name.clone(), s))
+        .collect();
+        let defaulted = &snippets["Defaulted"];
+        assert!(defaulted.auto, "should inherit auto = true");
+        assert!(defaulted.active.is_some(), "should inherit active");
+        assert_eq!(defaulted.description.as_deref(), Some("from-default"));
+        let overridden = &snippets["Overridden"];
+        assert!(!overridden.auto, "explicit auto = false should win");
+        assert!(
+            overridden.active.is_some(),
+            "active not specified, default still applies"
+        );
+    }
+
+    #[test]
+    fn test_defaults_dont_force_prefix_or_body() {
+        // Defaults shouldn't carry `prefix`/`regex`/`body` keys — those must
+        // be per-snippet. We verify by stuffing those keys into the defaults
+        // map and confirming they have no effect.
+        let conl = r#"Plain
+  prefix = p
+  body = """rhai
+    "P"
+"#;
+        let parsed: HashMap<String, format::VsCodeSnippet> = serde_conl::from_str(conl).unwrap();
+        let file = VsSnippetsFile { snippets: parsed };
+        let mut defaults = HashMap::default();
+        defaults.insert("prefix".into(), "OOPS".into());
+        defaults.insert("body".into(), "OOPS".into());
+        defaults.insert("regex".into(), "OOPS".into());
+        let snippets: Vec<_> = file_to_snippets_with_context(
+            file,
+            HashMap::default(),
+            defaults,
+            std::path::Path::new("t.conl"),
+        )
+        .filter_map(Result::ok)
+        .collect();
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0].prefix, vec!["p".to_string()]);
+        assert!(snippets[0].regex.is_none());
+        assert!(!snippets[0].body.contains("OOPS"));
+    }
+
+    #[test]
+    fn test_unknown_alias_in_regex_is_rejected() {
+        let conl = r#"Bad
+  regex = (\\(?:{{nope}}))(\d)
+  body = """rhai
+    "x"
+"#;
+        let parsed: HashMap<String, format::VsCodeSnippet> = serde_conl::from_str(conl).unwrap();
+        let file = VsSnippetsFile { snippets: parsed };
+        let results: Vec<_> = file_to_snippets_with_aliases(
+            file,
+            HashMap::default(),
+            std::path::Path::new("t.conl"),
+        )
+        .collect();
+        assert_eq!(results.len(), 1);
+        let err = results.into_iter().next().unwrap().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown alias `nope`"),
+            "got: {err:#}"
+        );
     }
 
     #[test]

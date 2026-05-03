@@ -185,6 +185,23 @@ mod tests {
     }
 
     #[test]
+    fn rhai_map_lookup_with_fallback() {
+        // Used by greek-shortcut snippet: look up captures[1] in an object
+        // map, falling back to captures[0] when the key isn't present.
+        let body = CompiledBody::compile(
+            r#"
+            let m = #{ a: "\\alpha", b: "\\beta" };
+            let key = captures[1];
+            if key in m { m[key] } else { captures[0] }
+        "#,
+        );
+        assert_eq!(body.evaluate(&["@a", "a"]).unwrap(), r"\alpha");
+        assert_eq!(body.evaluate(&["@b", "b"]).unwrap(), r"\beta");
+        // Unknown letter: fall back to original text.
+        assert_eq!(body.evaluate(&["@z", "z"]).unwrap(), "@z");
+    }
+
+    #[test]
     fn captures_are_bound() {
         let body = CompiledBody::compile(r#"`\hat{${captures[1]}}`"#);
         let result = body.evaluate(&["xhat", "x"]).unwrap();
