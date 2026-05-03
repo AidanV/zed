@@ -14156,6 +14156,83 @@ async fn test_auto_expand_consumes_autoclosed_bracket(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_non_auto_regex_snippet_appears_in_completion_menu(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_editor(|editor, _, cx| {
+        editor.project().unwrap().update(cx, |project, cx| {
+            project.snippets().update(cx, |snippets, _cx| {
+                snippets.add_snippet_for_test(
+                    None,
+                    PathBuf::from("test_snippets.json"),
+                    vec![Arc::new(project::snippet_provider::Snippet {
+                        prefix: vec![],
+                        body: r#"`\frac{ \partial ${captures[1]} }{ \partial ${captures[2]} } `"#
+                            .to_string(),
+                        description: None,
+                        name: "Partial of x by y".to_string(),
+                        auto: false,
+                        regex: Some(std::sync::Arc::new(
+                            regex::Regex::new(r"pa([A-Za-z])([A-Za-z])").unwrap(),
+                        )),
+                        active: None,
+                    })],
+                );
+            });
+        })
+    });
+
+    cx.set_state("ˇ");
+    cx.simulate_input("paxy");
+    cx.executor().run_until_parked();
+    cx.condition(|editor, _| editor.context_menu_visible())
+        .await;
+    cx.update_editor(|editor, _, _| {
+        let menu_ref = editor.context_menu.borrow_mut();
+        let Some(CodeContextMenu::Completions(menu)) = menu_ref.as_ref() else {
+            panic!("expected completion menu to be open after typing `paxy`");
+        };
+        // Regex completions bypass fuzzy matching, so the menu's matched
+        // string is empty. Look up the underlying label text instead.
+        let entries = menu.entries.borrow();
+        let completions = menu.completions.borrow();
+        let labels: Vec<String> = entries
+            .iter()
+            .map(|mat| completions[mat.candidate_id].label.text.clone())
+            .collect();
+        assert!(
+            labels.iter().any(|l| l == "Partial of x by y"),
+            "expected `Partial of x by y` label in menu, got: {labels:?}"
+        );
+    });
+
+    // Also verify a query that doesn't fuzzy-match the snippet name still
+    // surfaces the snippet, since the regex itself defines the trigger.
+    cx.set_state("ˇ");
+    cx.simulate_input("paaa");
+    cx.executor().run_until_parked();
+    cx.condition(|editor, _| editor.context_menu_visible())
+        .await;
+    cx.update_editor(|editor, _, _| {
+        let menu_ref = editor.context_menu.borrow_mut();
+        let Some(CodeContextMenu::Completions(menu)) = menu_ref.as_ref() else {
+            panic!("expected completion menu to be open after typing `paaa`");
+        };
+        let entries = menu.entries.borrow();
+        let completions = menu.completions.borrow();
+        let labels: Vec<String> = entries
+            .iter()
+            .map(|mat| completions[mat.candidate_id].label.text.clone())
+            .collect();
+        assert!(
+            labels.iter().any(|l| l == "Partial of x by y"),
+            "regex match `paaa` should surface snippet despite not fuzzy-matching its name; got: {labels:?}"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_non_auto_snippet_does_not_auto_expand(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

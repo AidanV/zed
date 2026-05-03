@@ -1182,9 +1182,27 @@ impl CompletionsMenu {
 
             let mut results = vec![];
             for (query, match_candidates) in queries_and_candidates {
+                // Candidates with empty filter text opt out of fuzzy matching:
+                // include them unconditionally with no positions. This is how
+                // regex-triggered snippet completions surface in the menu —
+                // the regex is the trigger; the snippet's display name should
+                // not be filtered or character-bolded against what the user
+                // typed.
+                let (bypass, fuzzy): (Vec<&StringMatchCandidate>, Vec<&StringMatchCandidate>) =
+                    match_candidates
+                        .iter()
+                        .partition(|c| c.string.is_empty());
+                for candidate in bypass {
+                    results.push(StringMatch {
+                        candidate_id: candidate.id,
+                        score: 1.0,
+                        positions: Vec::new(),
+                        string: candidate.string.clone(),
+                    });
+                }
                 results.extend(
                     fuzzy::match_strings(
-                        &match_candidates,
+                        fuzzy.as_slice(),
                         &query,
                         query.chars().any(|c| c.is_uppercase()),
                         false,

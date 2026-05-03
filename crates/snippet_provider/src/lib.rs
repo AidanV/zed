@@ -871,6 +871,44 @@ Overridden
     }
 
     #[test]
+    fn test_conl_regex_snippet_with_auto_false_overrides_default() {
+        // Mirrors the user's `Partial of x by y` shape: defaults set
+        // `auto = true`, but the snippet overrides to `auto = false`. The
+        // regex must survive the load, and the resulting snippet must keep
+        // its empty prefix list (so the prefix-driven completion path is
+        // skipped) while having `auto = false` and a callable regex.
+        let conl = r#"Partial of x by y
+  regex = pa([A-Za-z])([A-Za-z])
+  auto = false
+  body = """rhai
+    "\\frac{ \\partial " + captures[1] + " }{ \\partial " + captures[2] + " } "
+"#;
+        let parsed: HashMap<String, format::VsCodeSnippet> = serde_conl::from_str(conl).unwrap();
+        let file = VsSnippetsFile { snippets: parsed };
+        let mut defaults = HashMap::default();
+        defaults.insert("auto".into(), "true".into());
+        let snippets: Vec<_> = file_to_snippets_with_context(
+            file,
+            HashMap::default(),
+            defaults,
+            std::path::Path::new("t.conl"),
+        )
+        .filter_map(Result::ok)
+        .collect();
+        assert_eq!(snippets.len(), 1);
+        assert!(!snippets[0].auto, "auto = false override should stick");
+        assert!(snippets[0].prefix.is_empty(), "regex-only snippet has no prefix");
+        let regex = snippets[0].regex.as_ref().expect("regex should parse");
+        assert!(regex.is_match("paxy"));
+        let captures = regex.captures("paxy").unwrap();
+        let cap_strs: Vec<&str> = (0..captures.len())
+            .map(|i| captures.get(i).map(|c| c.as_str()).unwrap_or(""))
+            .collect();
+        let body = snippets[0].evaluate(&cap_strs).unwrap();
+        assert_eq!(body, r"\frac{ \partial x }{ \partial y } ");
+    }
+
+    #[test]
     fn test_unknown_alias_in_regex_is_rejected() {
         let conl = r#"Bad
   regex = (\\(?:{{nope}}))(\d)

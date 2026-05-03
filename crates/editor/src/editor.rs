@@ -5271,7 +5271,14 @@ impl Editor {
                 }
             }
             let auto_expanded = this.try_auto_expand_snippet(bracket_inserted, window, cx);
-            if !auto_expanded {
+            if auto_expanded {
+                // The buffer was just rewritten by snippet expansion; any
+                // open completion menu is now stale (e.g. the user typed
+                // `sum`, the snippet replaced it with `\sum`, but the menu
+                // would still be filtering against `sum`). Hide it so the
+                // expansion isn't shadowed by leftover completions.
+                this.hide_context_menu(window, cx);
+            } else {
                 this.trigger_completion_on_input(&text, trigger_in_words, window, cx);
             }
             refresh_linked_ranges(this, window, cx);
@@ -6308,7 +6315,28 @@ impl Editor {
                         let snapshot = self.buffer.read(cx).read(cx);
                         menu.initial_position.to_offset(&snapshot) == position.to_offset(&snapshot)
                     };
-                    if position_matches {
+                    // Regex-based snippets break the "completions are stable as
+                    // the query grows" invariant: the same snippet may fail to
+                    // match `pa` but match `paxy`, so the candidate set grows
+                    // as the user types. Skip the cached-completions fast path
+                    // when any in-scope snippet has a regex.
+                    let scope_has_regex_snippet = self
+                        .project()
+                        .as_ref()
+                        .map(|project| {
+                            let project = project.read(cx);
+                            let snippet_store = project.snippets().read(cx);
+                            buffer.read(cx).languages_at(buffer_position).iter().any(
+                                |language| {
+                                    snippet_store
+                                        .snippets_for(Some(language.lsp_id()), cx)
+                                        .iter()
+                                        .any(|snippet| snippet.regex.is_some())
+                                },
+                            )
+                        })
+                        .unwrap_or(false);
+                    if position_matches && !scope_has_regex_snippet {
                         return;
                     }
                 }
@@ -28305,18 +28333,46 @@ fn has_strong_snippet_prefix_match(
         return false;
     }
 
-    let query = query.to_lowercase();
+    let query_lower = query.to_lowercase();
     let is_word_char = |character| classifier.is_word(character);
     let languages = buffer.read(cx).languages_at(buffer_anchor);
     let snippet_store = project.snippets().read(cx);
+
+    // Window of buffer text ending at the cursor — used to decide whether
+    // any regex-only snippet's pattern matches the just-typed text.
+    // `MAX_PREFIX_LEN` mirrors the auto-expand path so a regex anchored
+    // farther back still has a chance to match.
+    const MAX_PREFIX_LEN: usize = 128;
+    let buffer_snapshot = buffer.read(cx).snapshot();
+    let cursor_offset = buffer_anchor.to_offset(&buffer_snapshot);
+    let window_start = cursor_offset.saturating_sub(MAX_PREFIX_LEN);
+    let window_text: String = buffer_snapshot
+        .text_for_range(window_start..cursor_offset)
+        .collect();
 
     languages.iter().any(|language| {
         snippet_store
             .snippets_for(Some(language.lsp_id()), cx)
             .iter()
-            .flat_map(|snippet| snippet.prefix.iter())
-            .flat_map(|prefix| snippet_candidate_suffixes(prefix, &is_word_char))
-            .any(|candidate| candidate.to_lowercase().starts_with(&query))
+            .any(|snippet| {
+                let prefix_match = snippet
+                    .prefix
+                    .iter()
+                    .flat_map(|prefix| snippet_candidate_suffixes(prefix, &is_word_char))
+                    .any(|candidate| candidate.to_lowercase().starts_with(&query_lower));
+                if prefix_match {
+                    return true;
+                }
+                snippet
+                    .regex
+                    .as_ref()
+                    .and_then(|regex| {
+                        regex
+                            .find_iter(&window_text)
+                            .find(|m| m.end() == window_text.len())
+                    })
+                    .is_some()
+            })
     })
 }
 
@@ -28634,10 +28690,16 @@ fn snippet_completions(
                         }),
                         lsp_defaults: None,
                     },
+                    // Empty `filter_range` opts this completion out of the
+                    // menu's fuzzy filter — see `do_async_filtering`. The
+                    // regex matched the buffer text already; filtering its
+                    // display name against what the user typed would hide
+                    // perfectly valid matches like `paaa` whose chars don't
+                    // happen to appear in order in the snippet name.
                     label: CodeLabel {
                         text: label_text.clone(),
                         runs: Vec::new(),
-                        filter_range: 0..label_text.len(),
+                        filter_range: 0..0,
                     },
                     icon_path: None,
                     documentation: Some(CompletionDocumentation::SingleLineAndMultiLinePlainText {
