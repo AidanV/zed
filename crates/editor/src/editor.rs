@@ -5270,7 +5270,10 @@ impl Editor {
                     )
                 }
             }
-            this.trigger_completion_on_input(&text, trigger_in_words, window, cx);
+            let auto_expanded = !bracket_inserted && this.try_auto_expand_snippet(window, cx);
+            if !auto_expanded {
+                this.trigger_completion_on_input(&text, trigger_in_words, window, cx);
+            }
             refresh_linked_ranges(this, window, cx);
             this.refresh_edit_prediction(true, false, window, cx);
             jsx_tag_auto_close::handle_from(this, initial_buffer_versions, window, cx);
@@ -11046,6 +11049,127 @@ impl Editor {
         ));
     }
 
+    /// If an auto-expanding snippet's trigger matches the text immediately
+    /// before the newest cursor, expand it in place and return `true`.
+    /// Called from `handle_input` after every text insertion.
+    fn try_auto_expand_snippet(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(project) = self.project().cloned() else {
+            return false;
+        };
+
+        let multibuffer_snapshot = self.buffer.read(cx).snapshot(cx);
+
+        let cursor_anchor = self.selections.newest_anchor().head();
+        let head_offset = cursor_anchor.to_offset(&multibuffer_snapshot);
+        let tail_offset = self
+            .selections
+            .newest_anchor()
+            .tail()
+            .to_offset(&multibuffer_snapshot);
+        if head_offset != tail_offset {
+            return false;
+        }
+        let cursor: usize = head_offset.0;
+
+        let Some((buffer_anchor, _)) =
+            multibuffer_snapshot.anchor_to_buffer_anchor(cursor_anchor)
+        else {
+            return false;
+        };
+        let Some(buffer_entity) = self.buffer.read(cx).buffer(buffer_anchor.buffer_id) else {
+            return false;
+        };
+
+        const MAX_PREFIX_LEN: usize = 128;
+        let window_start = cursor.saturating_sub(MAX_PREFIX_LEN);
+        let window_start = multibuffer_snapshot
+            .clip_offset(MultiBufferOffset(window_start), Bias::Left)
+            .0;
+        let window_text: String = multibuffer_snapshot
+            .text_for_range(MultiBufferOffset(window_start)..MultiBufferOffset(cursor))
+            .collect();
+        if window_text.is_empty() {
+            return false;
+        }
+
+        let auto_snippets: Vec<_> = {
+            let store = project.read(cx).snippets().read(cx);
+            buffer_entity
+                .read(cx)
+                .languages_at(buffer_anchor)
+                .iter()
+                .flat_map(|language| store.snippets_for(Some(language.lsp_id()), cx))
+                .filter(|snippet| snippet.auto)
+                .collect()
+        };
+        if auto_snippets.is_empty() {
+            return false;
+        }
+
+        // Collect the kinds of every tree-sitter node enclosing the cursor so
+        // we can evaluate each snippet's `active` predicate.
+        let ancestor_kinds: std::collections::BTreeSet<&str> = {
+            let mut kinds = std::collections::BTreeSet::new();
+            let mut node = multibuffer_snapshot
+                .syntax_ancestor(MultiBufferOffset(cursor)..MultiBufferOffset(cursor))
+                .map(|(node, _)| node);
+            while let Some(n) = node {
+                kinds.insert(n.kind());
+                node = n.parent();
+            }
+            kinds
+        };
+
+        let matched = auto_snippets.iter().find_map(|snippet| {
+            if !snippet.is_active(&ancestor_kinds) {
+                return None;
+            }
+            if let Some(regex) = &snippet.regex {
+                let m = regex
+                    .find_iter(&window_text)
+                    .find(|m| m.end() == window_text.len())?;
+                let captures = regex.captures(&window_text[m.start()..])?;
+                let cap_strs: Vec<&str> = (0..captures.len())
+                    .map(|i| captures.get(i).map(|c| c.as_str()).unwrap_or(""))
+                    .collect();
+                let consumed = window_text.len() - m.start();
+                let body = snippet.evaluate(&cap_strs).log_err()?;
+                Some((body, consumed))
+            } else {
+                snippet
+                    .prefix
+                    .iter()
+                    .find_map(|prefix| match_auto_prefix(&window_text, prefix))
+                    .and_then(|consumed| {
+                        snippet
+                            .evaluate(&[])
+                            .log_err()
+                            .map(|body| (body, consumed))
+                    })
+            }
+        });
+
+        let Some((body, consumed)) = matched else {
+            return false;
+        };
+
+        drop(multibuffer_snapshot);
+
+        let parsed = match snippet::Snippet::parse(&body) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        let start = MultiBufferOffset(cursor.saturating_sub(consumed));
+        self.insert_snippet(&[start..MultiBufferOffset(cursor)], parsed, window, cx)
+            .log_err()
+            .is_some()
+    }
+
     pub fn insert_snippet(
         &mut self,
         insertion_ranges: &[Range<MultiBufferOffset>],
@@ -16504,7 +16628,7 @@ impl Editor {
                 .into_iter()
                 .find(|snippet| snippet.name == *name)
                 .context("snippet not found")?;
-            Snippet::parse(&snippet.body)?
+            Snippet::parse(&snippet.evaluate(&[])?)?
         } else {
             // todo(andrew): open modal to select snippet
             bail!("`name` or `snippet` is required")
@@ -28076,6 +28200,38 @@ impl CodeActionProvider for Entity<Project> {
     }
 }
 
+/// Returns the byte length of `prefix` if it appears as a suffix of
+/// `window_text` and the match constitutes a valid auto-expansion boundary.
+///
+/// `surrounding_word` can't be used here because some auto-snippet prefixes
+/// (e.g. `@a`, `:e`, `//`, `===`) start with punctuation that
+/// `CharClassifier` doesn't classify as `Word` — those characters wouldn't
+/// be included in the surrounding word, so the prefix would never match.
+///
+/// Boundary rule: when the prefix begins with a word character, the
+/// character immediately preceding it must not also be a word character.
+/// This prevents mid-identifier expansion (e.g. typing `kmk` should not
+/// expand the `mk` snippet). Prefixes starting with punctuation can fire
+/// from any context, which matches LaTeX-style triggers like `@a`.
+fn match_auto_prefix(window_text: &str, prefix: &str) -> Option<usize> {
+    if prefix.is_empty() || !window_text.ends_with(prefix) {
+        return None;
+    }
+    let first_is_word = prefix
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+    if first_is_word {
+        let preceding = &window_text[..window_text.len() - prefix.len()];
+        if let Some(prev) = preceding.chars().last()
+            && (prev.is_alphanumeric() || prev == '_')
+        {
+            return None;
+        }
+    }
+    Some(prefix.len())
+}
+
 fn has_strong_snippet_prefix_match(
     project: &Project,
     buffer: &Entity<Buffer>,
@@ -28135,11 +28291,28 @@ fn snippet_completions(
         }));
     }
 
+    // Collect the kinds of every tree-sitter node enclosing the cursor so the
+    // background task can evaluate each snippet's `active` predicate without
+    // touching the syntax tree from off-thread.
+    let ancestor_kinds: Vec<String> = {
+        let buffer_snapshot = buffer.read(cx).snapshot();
+        let offset = text::ToOffset::to_offset(&buffer_anchor, &buffer_snapshot);
+        let mut kinds = Vec::new();
+        let mut node = buffer_snapshot.syntax_ancestor(offset..offset);
+        while let Some(n) = node {
+            kinds.push(n.kind().to_string());
+            node = n.parent();
+        }
+        kinds
+    };
+
     let snapshot = buffer.read(cx).text_snapshot();
     let executor = cx.background_executor().clone();
 
     cx.background_spawn(async move {
         let is_word_char = |c| classifier.is_word(c);
+        let ancestor_kinds_set: std::collections::BTreeSet<&str> =
+            ancestor_kinds.iter().map(String::as_str).collect();
 
         let mut is_incomplete = false;
         let mut completions: Vec<Completion> = Vec::new();
@@ -28162,6 +28335,15 @@ fn snippet_completions(
         }
 
         for (_scope, snippets) in scopes.into_iter() {
+            // Apply per-snippet `active` predicate once per scope; downstream
+            // indexing operates on the filtered list.
+            let snippets: Vec<_> = snippets
+                .into_iter()
+                .filter(|snippet| snippet.is_active(&ancestor_kinds_set))
+                .collect();
+            if snippets.is_empty() {
+                continue;
+            }
             // Sort snippets by word count to match longer snippet prefixes first.
             let mut sorted_snippet_candidates = snippets
                 .iter()
@@ -28266,10 +28448,11 @@ fn snippet_completions(
                 is_incomplete = true;
             }
 
-            completions.extend(matches.iter().map(|(string_match, buffer_window_len)| {
+            completions.extend(matches.iter().filter_map(|(string_match, buffer_window_len)| {
                 let ((snippet_index, prefix_index), matching_prefix, _snippet_word_count) =
                     sorted_snippet_candidates[string_match.candidate_id];
                 let snippet = &snippets[snippet_index];
+                let body = snippet.evaluate(&[]).log_err()?;
                 let start = buffer_offset - buffer_window_len;
                 let start = snapshot.anchor_before(start);
                 let range = start..buffer_anchor;
@@ -28278,9 +28461,9 @@ fn snippet_completions(
                     start: lsp_start,
                     end: lsp_end,
                 };
-                Completion {
+                Some(Completion {
                     replace_range: range,
-                    new_text: snippet.body.clone(),
+                    new_text: body.clone(),
                     source: CompletionSource::Lsp {
                         insert_range: None,
                         server_id: LanguageServerId(usize::MAX),
@@ -28297,12 +28480,12 @@ fn snippet_completions(
                             insert_text_format: Some(InsertTextFormat::SNIPPET),
                             text_edit: Some(lsp::CompletionTextEdit::InsertAndReplace(
                                 lsp::InsertReplaceEdit {
-                                    new_text: snippet.body.clone(),
+                                    new_text: body.clone(),
                                     insert: lsp_range,
                                     replace: lsp_range,
                                 },
                             )),
-                            filter_text: Some(snippet.body.clone()),
+                            filter_text: Some(body),
                             sort_text: Some(char::MAX.to_string()),
                             ..lsp::CompletionItem::default()
                         }),
@@ -28325,8 +28508,90 @@ fn snippet_completions(
                     confirm: None,
                     match_start: Some(start),
                     snippet_deduplication_key: Some((snippet_index, prefix_index)),
-                }
+                })
             }));
+
+            for (snippet_index, snippet) in snippets.iter().enumerate() {
+                let Some(regex) = &snippet.regex else {
+                    continue;
+                };
+                let Some(m) = regex
+                    .find_iter(&max_buffer_window)
+                    .find(|m| m.end() == max_buffer_window.len())
+                else {
+                    continue;
+                };
+                let Some(captures) = regex.captures(&max_buffer_window[m.start()..]) else {
+                    continue;
+                };
+                let cap_strs: Vec<&str> = (0..captures.len())
+                    .map(|i| captures.get(i).map(|c| c.as_str()).unwrap_or(""))
+                    .collect();
+                let Some(new_text) = snippet.evaluate(&cap_strs).log_err() else {
+                    continue;
+                };
+                let consumed = max_buffer_window.len() - m.start();
+                let start = snapshot.anchor_before(buffer_offset - consumed);
+                let range = start..buffer_anchor;
+                let lsp_start = to_lsp(&start);
+                let lsp_range = lsp::Range {
+                    start: lsp_start,
+                    end: lsp_end,
+                };
+                let label_text = snippet
+                    .prefix
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| snippet.name.clone());
+                completions.push(Completion {
+                    replace_range: range,
+                    new_text: new_text.clone(),
+                    source: CompletionSource::Lsp {
+                        insert_range: None,
+                        server_id: LanguageServerId(usize::MAX),
+                        resolved: true,
+                        lsp_completion: Box::new(lsp::CompletionItem {
+                            label: label_text.clone(),
+                            kind: Some(CompletionItemKind::SNIPPET),
+                            label_details: snippet.description.as_ref().map(|description| {
+                                lsp::CompletionItemLabelDetails {
+                                    detail: Some(description.clone()),
+                                    description: None,
+                                }
+                            }),
+                            insert_text_format: Some(InsertTextFormat::SNIPPET),
+                            text_edit: Some(lsp::CompletionTextEdit::InsertAndReplace(
+                                lsp::InsertReplaceEdit {
+                                    new_text: new_text.clone(),
+                                    insert: lsp_range,
+                                    replace: lsp_range,
+                                },
+                            )),
+                            filter_text: Some(new_text.clone()),
+                            sort_text: Some(char::MAX.to_string()),
+                            ..lsp::CompletionItem::default()
+                        }),
+                        lsp_defaults: None,
+                    },
+                    label: CodeLabel {
+                        text: label_text.clone(),
+                        runs: Vec::new(),
+                        filter_range: 0..label_text.len(),
+                    },
+                    icon_path: None,
+                    documentation: Some(CompletionDocumentation::SingleLineAndMultiLinePlainText {
+                        single_line: snippet.name.clone().into(),
+                        plain_text: snippet
+                            .description
+                            .clone()
+                            .map(|description| description.into()),
+                    }),
+                    insert_text_mode: None,
+                    confirm: None,
+                    match_start: Some(start),
+                    snippet_deduplication_key: Some((snippet_index, usize::MAX)),
+                });
+            }
         }
 
         Ok(CompletionResponse {

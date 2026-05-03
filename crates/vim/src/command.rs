@@ -1951,7 +1951,7 @@ pub fn command_interceptor(
             let action = command.parse(query, &range, cx)?;
             let parsed_query = command.get_parsed_query(query.into())?;
             let display_string = ":".to_owned()
-                + &range_prefix
+                + range_prefix.as_str()
                 + command.prefix
                 + command.suffix
                 + if parsed_query.has_bang { "!" } else { "" };

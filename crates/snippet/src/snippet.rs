@@ -331,4 +331,5 @@ mod tests {
     fn tabstop_choices(snippet: &Snippet) -> Vec<&Option<Vec<String>>> {
         snippet.tabstops.iter().map(|t| &t.choices).collect()
     }
+
 }

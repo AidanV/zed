@@ -131,7 +131,7 @@ impl Vim {
                             to_insert =
                                 "\n".to_owned() + &to_insert[..to_insert.len() - "\n".len()];
                         } else {
-                            to_insert = "\n".to_owned() + &to_insert;
+                            to_insert = "\n".to_owned() + to_insert.as_str();
                         }
                     } else if line_mode && vim.mode == Mode::VisualLine {
                         to_insert.pop();

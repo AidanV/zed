@@ -806,7 +806,7 @@ impl Vim {
                         snapshot.indent_and_comment_for_line(MultiBufferRow(row), cx)
                     };
                     let end_of_line = Point::new(row, snapshot.line_len(MultiBufferRow(row)));
-                    let edit = (end_of_line..end_of_line, "\n".to_string() + &indent);
+                    let edit = (end_of_line..end_of_line, "\n".to_string() + indent.as_str());
                     if auto_indent_mode == AutoIndentMode::None {
                         plain_edits.push(edit);
                     } else {

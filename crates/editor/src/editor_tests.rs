@@ -13779,9 +13779,12 @@ async fn test_snippet_with_multi_word_prefix(cx: &mut TestAppContext) {
             project.snippets().update(cx, |snippets, _cx| {
                 let snippet = project::snippet_provider::Snippet {
                     prefix: vec!["multi word".to_string()],
-                    body: "this is many words".to_string(),
+                    body: r#""this is many words""#.to_string(),
                     description: Some("description".to_string()),
                     name: "multi-word snippet test".to_string(),
+                    auto: false,
+                    regex: None,
+                    active: None,
                 };
                 snippets.add_snippet_for_test(
                     None,
@@ -13814,6 +13817,266 @@ async fn test_snippet_with_multi_word_prefix(cx: &mut TestAppContext) {
             assert_eq!(!completions.is_empty(), should_match_snippet);
         });
     }
+}
+
+#[gpui::test]
+async fn test_auto_expand_prefix_snippet(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_editor(|editor, _, cx| {
+        editor.project().unwrap().update(cx, |project, cx| {
+            project.snippets().update(cx, |snippets, _cx| {
+                snippets.add_snippet_for_test(
+                    None,
+                    PathBuf::from("test_snippets.json"),
+                    vec![Arc::new(project::snippet_provider::Snippet {
+                        prefix: vec!["ff".to_string()],
+                        body: "\\frac{$1}{$2}$0".to_string(),
+                        description: None,
+                        name: "fraction".to_string(),
+                        auto: true,
+                        regex: None,
+                        active: None,
+                    })],
+                );
+            });
+        })
+    });
+
+    cx.set_state("ˇ");
+    cx.simulate_input("ff");
+    cx.assert_editor_state("\\frac{ˇ}{}");
+}
+
+#[gpui::test]
+async fn test_auto_expand_does_not_fire_mid_word(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_editor(|editor, _, cx| {
+        editor.project().unwrap().update(cx, |project, cx| {
+            project.snippets().update(cx, |snippets, _cx| {
+                snippets.add_snippet_for_test(
+                    None,
+                    PathBuf::from("test_snippets.json"),
+                    vec![Arc::new(project::snippet_provider::Snippet {
+                        prefix: vec!["ff".to_string()],
+                        body: r#""EXPANDED""#.to_string(),
+                        description: None,
+                        name: "fraction".to_string(),
+                        auto: true,
+                        regex: None,
+                        active: None,
+                    })],
+                );
+            });
+        })
+    });
+
+    cx.set_state("xˇ");
+    cx.simulate_input("ff");
+    cx.assert_editor_state("xffˇ");
+}
+
+#[gpui::test]
+async fn test_auto_expand_punctuation_leading_prefix(cx: &mut TestAppContext) {
+    // Regression: triggers like `@a`, `:e`, `//` start with a non-word
+    // character, so `surrounding_word` doesn't include them. The match
+    // path must fall back to a direct suffix match instead.
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_editor(|editor, _, cx| {
+        editor.project().unwrap().update(cx, |project, cx| {
+            project.snippets().update(cx, |snippets, _cx| {
+                snippets.add_snippet_for_test(
+                    None,
+                    PathBuf::from("test_snippets.json"),
+                    vec![
+                        Arc::new(project::snippet_provider::Snippet {
+                            prefix: vec!["@a".to_string()],
+                            body: "\\alpha".to_string(),
+                            description: None,
+                            name: "alpha".to_string(),
+                            auto: true,
+                            regex: None,
+                            active: None,
+                        }),
+                        Arc::new(project::snippet_provider::Snippet {
+                            prefix: vec!["//".to_string()],
+                            body: "\\frac{$1}{$2}$0".to_string(),
+                            description: None,
+                            name: "fraction-slash".to_string(),
+                            auto: true,
+                            regex: None,
+                            active: None,
+                        }),
+                    ],
+                );
+            });
+        })
+    });
+
+    cx.set_state("ˇ");
+    cx.simulate_input("@a");
+    cx.assert_editor_state("\\alphaˇ");
+
+    cx.set_state("xˇ");
+    cx.simulate_input("//");
+    cx.assert_editor_state("x\\frac{ˇ}{}");
+}
+
+#[gpui::test]
+async fn test_auto_expand_regex_snippet_with_captures(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_editor(|editor, _, cx| {
+        editor.project().unwrap().update(cx, |project, cx| {
+            project.snippets().update(cx, |snippets, _cx| {
+                snippets.add_snippet_for_test(
+                    None,
+                    PathBuf::from("test_snippets.json"),
+                    vec![Arc::new(project::snippet_provider::Snippet {
+                        prefix: vec![],
+                        body: r#"`${captures[1]}.foo(${captures[1]})$0`"#.to_string(),
+                        description: None,
+                        name: "method-call".to_string(),
+                        auto: true,
+                        regex: Some(std::sync::Arc::new(
+                            regex::Regex::new(r"(\w+)\.bar").unwrap(),
+                        )),
+                        active: None,
+                    })],
+                );
+            });
+        })
+    });
+
+    cx.set_state("ˇ");
+    cx.simulate_input("abc.bar");
+    cx.assert_editor_state("abc.foo(abc)ˇ");
+}
+
+#[gpui::test]
+async fn test_auto_expand_in_node_filter(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(rust_lang()), cx));
+    cx.update_editor(|editor, _, cx| {
+        editor.project().unwrap().update(cx, |project, cx| {
+            project.snippets().update(cx, |snippets, _cx| {
+                snippets.add_snippet_for_test(
+                    None,
+                    PathBuf::from("test_snippets.json"),
+                    vec![Arc::new(project::snippet_provider::Snippet {
+                        prefix: vec!["qq".to_string()],
+                        body: r#""world""#.to_string(),
+                        description: None,
+                        name: "string-only".to_string(),
+                        auto: true,
+                        regex: None,
+                        active: Some(Arc::new(
+                            project::snippet_provider::script::ActivePredicate::compile(
+                                "string_literal",
+                            )
+                            .unwrap(),
+                        )),
+                    })],
+                );
+            });
+        })
+    });
+
+    // Cursor inside a string literal -> snippet fires.
+    cx.set_state(r#"fn main() { "ˇ" }"#);
+    cx.run_until_parked();
+    cx.simulate_input("qq");
+    cx.assert_editor_state(r#"fn main() { "worldˇ" }"#);
+
+    // Cursor outside any string literal -> snippet does not fire.
+    cx.set_state("fn main() { ˇ }");
+    cx.run_until_parked();
+    cx.simulate_input("qq");
+    cx.assert_editor_state("fn main() { qqˇ }");
+}
+
+#[gpui::test]
+async fn test_auto_expand_not_in_node_filter(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_buffer(|buffer, cx| buffer.set_language(Some(rust_lang()), cx));
+    cx.update_editor(|editor, _, cx| {
+        editor.project().unwrap().update(cx, |project, cx| {
+            project.snippets().update(cx, |snippets, _cx| {
+                snippets.add_snippet_for_test(
+                    None,
+                    PathBuf::from("test_snippets.json"),
+                    vec![Arc::new(project::snippet_provider::Snippet {
+                        prefix: vec!["qq".to_string()],
+                        body: r#""world""#.to_string(),
+                        description: None,
+                        name: "outside-strings".to_string(),
+                        auto: true,
+                        regex: None,
+                        active: Some(Arc::new(
+                            project::snippet_provider::script::ActivePredicate::compile(
+                                "!string_literal",
+                            )
+                            .unwrap(),
+                        )),
+                    })],
+                );
+            });
+        })
+    });
+
+    // Cursor inside a string literal -> snippet does NOT fire.
+    cx.set_state(r#"fn main() { "ˇ" }"#);
+    cx.run_until_parked();
+    cx.simulate_input("qq");
+    cx.assert_editor_state(r#"fn main() { "qqˇ" }"#);
+
+    // Cursor outside any string literal -> snippet fires.
+    cx.set_state("fn main() { ˇ }");
+    cx.run_until_parked();
+    cx.simulate_input("qq");
+    cx.assert_editor_state("fn main() { worldˇ }");
+}
+
+#[gpui::test]
+async fn test_non_auto_snippet_does_not_auto_expand(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_editor(|editor, _, cx| {
+        editor.project().unwrap().update(cx, |project, cx| {
+            project.snippets().update(cx, |snippets, _cx| {
+                snippets.add_snippet_for_test(
+                    None,
+                    PathBuf::from("test_snippets.json"),
+                    vec![Arc::new(project::snippet_provider::Snippet {
+                        prefix: vec!["ff".to_string()],
+                        body: r#""EXPANDED""#.to_string(),
+                        description: None,
+                        name: "fraction".to_string(),
+                        auto: false,
+                        regex: None,
+                        active: None,
+                    })],
+                );
+            });
+        })
+    });
+
+    cx.set_state("ˇ");
+    cx.simulate_input("ff");
+    // Without auto: true, the snippet only appears in the completion menu;
+    // it must not have replaced the trigger text.
+    cx.assert_editor_state("ffˇ");
 }
 
 #[gpui::test]
@@ -31125,21 +31388,30 @@ async fn test_mixed_completions_with_multi_word_snippet(cx: &mut TestAppContext)
                                 "unlimit word count".to_string(),
                                 "unlimited unknown".to_string(),
                             ],
-                            body: "this is many words".to_string(),
+                            body: r#""this is many words""#.to_string(),
                             description: Some("description".to_string()),
                             name: "multi-word snippet test".to_string(),
+                            auto: false,
+                            regex: None,
+                            active: None,
                         }),
                         Arc::new(project::snippet_provider::Snippet {
                             prefix: vec!["unsnip".to_string(), "@few".to_string()],
-                            body: "fewer words".to_string(),
+                            body: r#""fewer words""#.to_string(),
                             description: Some("alt description".to_string()),
                             name: "other name".to_string(),
+                            auto: false,
+                            regex: None,
+                            active: None,
                         }),
                         Arc::new(project::snippet_provider::Snippet {
                             prefix: vec!["ab aa".to_string()],
-                            body: "abcd".to_string(),
+                            body: r#""abcd""#.to_string(),
                             description: None,
                             name: "alphabet".to_string(),
+                            auto: false,
+                            regex: None,
+                            active: None,
                         }),
                     ],
                 );
@@ -31837,9 +32109,12 @@ async fn test_insert_snippet(cx: &mut TestAppContext) {
             project.snippets().update(cx, |snippets, _cx| {
                 let snippet = project::snippet_provider::Snippet {
                     prefix: vec![], // no prefix needed!
-                    body: "an Unspecified".to_string(),
+                    body: r#""an Unspecified""#.to_string(),
                     description: Some("shhhh it's a secret".to_string()),
                     name: "super secret snippet".to_string(),
+                    auto: false,
+                    regex: None,
+                    active: None,
                 };
                 snippets.add_snippet_for_test(
                     None,
@@ -31849,9 +32124,12 @@ async fn test_insert_snippet(cx: &mut TestAppContext) {
 
                 let snippet = project::snippet_provider::Snippet {
                     prefix: vec![], // no prefix needed!
-                    body: " Location".to_string(),
+                    body: r#"" Location""#.to_string(),
                     description: Some("the word 'location'".to_string()),
                     name: "location word".to_string(),
+                    auto: false,
+                    regex: None,
+                    active: None,
                 };
                 snippets.add_snippet_for_test(
                     Some("Markdown".to_string()),

@@ -830,7 +830,7 @@ impl VimGlobals {
             let lower = register.to_lowercase().next().unwrap_or(register);
             if lower != register {
                 let current = self.registers.entry(lower).or_default();
-                current.text = (current.text.to_string() + &content.text).into();
+                current.text = (current.text.to_string() + content.text.as_ref()).into();
                 // not clear how to support appending to registers with multiple cursors
                 current.clipboard_selections.take();
                 let yanked = current.clone();

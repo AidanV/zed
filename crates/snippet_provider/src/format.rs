@@ -75,4 +75,28 @@ pub(crate) struct VsCodeSnippet {
 
     /// The snippet description displayed inside the completion menu.
     pub(crate) description: Option<ListOrDirect>,
+
+    /// When true, the snippet expands as soon as its trigger matches, without
+    /// requiring the user to open the completion menu and press Tab/Enter.
+    pub(crate) auto: Option<bool>,
+
+    /// A regular expression used as the snippet trigger instead of (or in
+    /// addition to) `prefix`. The match must end at the cursor. Capture groups
+    /// are exposed to the body as the `captures` array (`captures[0]` is the
+    /// entire match, `captures[1]` the first group, etc.) and can be referenced
+    /// from a Rhai body via `${captures[N]}` template interpolation.
+    pub(crate) regex: Option<String>,
+
+    /// Rhai expression evaluating to a bool that gates whether the snippet
+    /// is allowed to fire at the cursor. Tree-sitter ancestor node kinds are
+    /// injected as boolean variables (`true` if any ancestor has that kind,
+    /// `false` otherwise), so predicates read naturally:
+    ///
+    /// ```conl
+    /// active = """rhai
+    ///   inline_formula || displayed_equation
+    /// ```
+    ///
+    /// Omit to allow the snippet anywhere.
+    pub(crate) active: Option<String>,
 }
