@@ -11,7 +11,7 @@ use picker::{Picker, PickerDelegate};
 use settings::Settings;
 use std::{
     borrow::{Borrow, Cow},
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::Path,
     sync::Arc,
@@ -26,8 +26,40 @@ struct ScopeName(Cow<'static, str>);
 struct ScopeFileName(Cow<'static, str>);
 
 impl ScopeFileName {
-    fn with_extension(self) -> String {
-        format!("{}.json", self.0)
+    fn with_extension(&self, format: SnippetFormat) -> String {
+        format!("{}.{}", self.0, format.extension())
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+enum SnippetFormat {
+    Json,
+    Conl,
+}
+
+impl SnippetFormat {
+    const ALL: [Self; 2] = [Self::Conl, Self::Json];
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Conl => "conl",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Json => "Legacy VSCode JSON snippets",
+            Self::Conl => "Zed CONL snippets",
+        }
+    }
+
+    fn from_extension(extension: &str) -> Option<Self> {
+        match extension {
+            "json" => Some(Self::Json),
+            "conl" => Some(Self::Conl),
+            _ => None,
+        }
     }
 }
 
@@ -140,7 +172,7 @@ pub struct ScopeSelectorDelegate {
     candidates: Vec<StringMatchCandidate>,
     matches: Vec<StringMatch>,
     selected_index: usize,
-    existing_scopes: HashSet<ScopeName>,
+    existing_scopes: HashMap<ScopeName, HashSet<SnippetFormat>>,
 }
 
 impl ScopeSelectorDelegate {
@@ -157,18 +189,21 @@ impl ScopeSelectorDelegate {
             .map(|(candidate_id, name)| StringMatchCandidate::new(candidate_id, name.as_ref()))
             .collect::<Vec<_>>();
 
-        let mut existing_scopes = HashSet::new();
+        let mut existing_scopes: HashMap<ScopeName, HashSet<SnippetFormat>> = HashMap::new();
 
         if let Some(read_dir) = fs::read_dir(snippets_dir()).log_err() {
             for entry in read_dir {
                 if let Some(entry) = entry.log_err() {
                     let path = entry.path();
                     if let (Some(stem), Some(extension)) = (path.file_stem(), path.extension())
-                        && extension.to_os_string().to_str() == Some("json")
+                        && let Some(format) =
+                            extension.to_str().and_then(SnippetFormat::from_extension)
                         && let Ok(file_name) = stem.to_os_string().into_string()
                     {
                         existing_scopes
-                            .insert(ScopeName::from(ScopeFileName(Cow::Owned(file_name))));
+                            .entry(ScopeName::from(ScopeFileName(Cow::Owned(file_name))))
+                            .or_default()
+                            .insert(format);
                     }
                 }
             }
@@ -211,6 +246,11 @@ impl PickerDelegate for ScopeSelectorDelegate {
         if let Some(mat) = self.matches.get(self.selected_index) {
             let scope_name = self.candidates[mat.candidate_id].string.clone();
             let language = self.language_registry.language_for_name(&scope_name);
+            let existing_formats = self
+                .existing_scopes
+                .get(&ScopeName(Cow::Owned(LanguageName::new(&scope_name).lsp_id())))
+                .cloned()
+                .unwrap_or_default();
 
             if let Some(workspace) = self.workspace.upgrade() {
                 cx.spawn_in(window, async move |_, cx| {
@@ -220,21 +260,16 @@ impl PickerDelegate for ScopeSelectorDelegate {
                     });
 
                     workspace.update_in(cx, |workspace, window, cx| {
-                        workspace
-                            .with_local_workspace(window, cx, |workspace, window, cx| {
-                                workspace
-                                    .open_abs_path(
-                                        snippets_dir().join(scope_file_name.with_extension()),
-                                        OpenOptions {
-                                            visible: Some(OpenVisible::None),
-                                            ..Default::default()
-                                        },
-                                        window,
-                                        cx,
-                                    )
-                                    .detach();
-                            })
-                            .detach();
+                        let workspace_handle = workspace.weak_handle();
+                        workspace.toggle_modal(window, cx, move |window, cx| {
+                            FormatSelector::new(
+                                scope_file_name,
+                                existing_formats,
+                                workspace_handle,
+                                window,
+                                cx,
+                            )
+                        });
                     })
                 })
                 .detach_and_log_err(cx);
@@ -320,11 +355,16 @@ impl PickerDelegate for ScopeSelectorDelegate {
         let scope_name = ScopeName(Cow::Owned(
             LanguageName::new(&self.candidates[mat.candidate_id].string).lsp_id(),
         ));
-        let file_label = if self.existing_scopes.contains(&scope_name) {
-            Some(ScopeFileName::from(scope_name).with_extension())
-        } else {
-            None
-        };
+        let preferred_format = self
+            .existing_scopes
+            .get(&scope_name)
+            .and_then(|formats| {
+                SnippetFormat::ALL
+                    .into_iter()
+                    .find(|format| formats.contains(format))
+            });
+        let file_label = preferred_format
+            .map(|format| ScopeFileName::from(scope_name).with_extension(format));
 
         let language_icon = if FileFinderSettings::get_global(cx).file_icons {
             let language_name = LanguageName::new(mat.string.as_str());
@@ -354,6 +394,225 @@ impl PickerDelegate for ScopeSelectorDelegate {
                         .when_some(file_label, |item, path_label| {
                             item.child(
                                 Label::new(path_label)
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            )
+                        }),
+                ),
+        )
+    }
+}
+
+pub struct FormatSelector {
+    picker: Entity<Picker<FormatSelectorDelegate>>,
+}
+
+impl FormatSelector {
+    fn new(
+        scope_file_name: ScopeFileName,
+        existing_formats: HashSet<SnippetFormat>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let delegate = FormatSelectorDelegate::new(
+            scope_file_name,
+            existing_formats,
+            workspace,
+            cx.entity().downgrade(),
+        );
+        let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx));
+        Self { picker }
+    }
+}
+
+impl ModalView for FormatSelector {}
+
+impl EventEmitter<DismissEvent> for FormatSelector {}
+
+impl Focusable for FormatSelector {
+    fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
+        self.picker.focus_handle(cx)
+    }
+}
+
+impl Render for FormatSelector {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex().w(rems(34.)).child(self.picker.clone())
+    }
+}
+
+pub struct FormatSelectorDelegate {
+    workspace: WeakEntity<Workspace>,
+    format_selector: WeakEntity<FormatSelector>,
+    scope_file_name: ScopeFileName,
+    candidates: Vec<StringMatchCandidate>,
+    matches: Vec<StringMatch>,
+    formats: Vec<SnippetFormat>,
+    existing_formats: HashSet<SnippetFormat>,
+    selected_index: usize,
+}
+
+impl FormatSelectorDelegate {
+    fn new(
+        scope_file_name: ScopeFileName,
+        existing_formats: HashSet<SnippetFormat>,
+        workspace: WeakEntity<Workspace>,
+        format_selector: WeakEntity<FormatSelector>,
+    ) -> Self {
+        let formats: Vec<SnippetFormat> = SnippetFormat::ALL.to_vec();
+        let candidates = formats
+            .iter()
+            .enumerate()
+            .map(|(id, format)| StringMatchCandidate::new(id, format.label()))
+            .collect();
+        Self {
+            workspace,
+            format_selector,
+            scope_file_name,
+            candidates,
+            matches: Vec::new(),
+            formats,
+            existing_formats,
+            selected_index: 0,
+        }
+    }
+}
+
+impl PickerDelegate for FormatSelectorDelegate {
+    type ListItem = ListItem;
+
+    fn placeholder_text(&self, _window: &mut Window, _: &mut App) -> Arc<str> {
+        "Select snippet file format...".into()
+    }
+
+    fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
+    fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        if let Some(mat) = self.matches.get(self.selected_index)
+            && let Some(format) = self.formats.get(mat.candidate_id).copied()
+            && let Some(workspace) = self.workspace.upgrade()
+        {
+            let path = snippets_dir().join(self.scope_file_name.with_extension(format));
+            cx.spawn_in(window, async move |_, cx| {
+                workspace.update_in(cx, |workspace, window, cx| {
+                    workspace
+                        .with_local_workspace(window, cx, |workspace, window, cx| {
+                            workspace
+                                .open_abs_path(
+                                    path,
+                                    OpenOptions {
+                                        visible: Some(OpenVisible::None),
+                                        ..Default::default()
+                                    },
+                                    window,
+                                    cx,
+                                )
+                                .detach();
+                        })
+                        .detach();
+                })
+            })
+            .detach_and_log_err(cx);
+        }
+        self.dismissed(window, cx);
+    }
+
+    fn dismissed(&mut self, _: &mut Window, cx: &mut Context<Picker<Self>>) {
+        self.format_selector
+            .update(cx, |_, cx| cx.emit(DismissEvent))
+            .log_err();
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: usize,
+        _window: &mut Window,
+        _: &mut Context<Picker<Self>>,
+    ) {
+        self.selected_index = ix;
+    }
+
+    fn update_matches(
+        &mut self,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> gpui::Task<()> {
+        let background = cx.background_executor().clone();
+        let candidates = self.candidates.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let matches = if query.is_empty() {
+                candidates
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, candidate)| StringMatch {
+                        candidate_id: index,
+                        string: candidate.string,
+                        positions: Vec::new(),
+                        score: 0.0,
+                    })
+                    .collect()
+            } else {
+                match_strings(
+                    &candidates,
+                    &query,
+                    false,
+                    true,
+                    100,
+                    &Default::default(),
+                    background,
+                )
+                .await
+            };
+
+            this.update(cx, |this, cx| {
+                let delegate = &mut this.delegate;
+                delegate.matches = matches;
+                delegate.selected_index = delegate
+                    .selected_index
+                    .min(delegate.matches.len().saturating_sub(1));
+                cx.notify();
+            })
+            .log_err();
+        })
+    }
+
+    fn render_match(
+        &self,
+        ix: usize,
+        selected: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        let mat = self.matches.get(ix)?;
+        let format = self.formats.get(mat.candidate_id).copied()?;
+        let exists_label = self
+            .existing_formats
+            .contains(&format)
+            .then(|| self.scope_file_name.with_extension(format));
+
+        Some(
+            ListItem::new(ix)
+                .inset(true)
+                .spacing(ListItemSpacing::Sparse)
+                .toggle_state(selected)
+                .child(
+                    h_flex()
+                        .gap_x_2()
+                        .child(HighlightedLabel::new(
+                            mat.string.clone(),
+                            mat.positions.clone(),
+                        ))
+                        .when_some(exists_label, |item, label| {
+                            item.child(
+                                Label::new(label)
                                     .color(Color::Muted)
                                     .size(LabelSize::Small),
                             )
