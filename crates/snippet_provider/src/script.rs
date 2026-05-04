@@ -1,5 +1,6 @@
 use anyhow::{Context as _, Result, anyhow};
 use rhai::{AST, Dynamic, Engine, OptimizationLevel, Scope};
+use snippet::{LSP_VARIABLE_NAMES, SnippetVariables};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -76,7 +77,7 @@ impl CompiledBody {
         }
     }
 
-    pub fn evaluate(&self, captures: &[&str]) -> Result<String> {
+    pub fn evaluate(&self, captures: &[&str], variables: &SnippetVariables) -> Result<String> {
         match self {
             Self::Static(body) => Ok(body.clone()),
             Self::Dynamic(ast) => {
@@ -90,6 +91,15 @@ impl CompiledBody {
                     "prefix",
                     captures.first().map(|s| (*s).to_string()).unwrap_or_default(),
                 );
+                // Bind every known LSP variable name. Missing ones become
+                // empty strings so Rhai bodies can branch on
+                // `if LINE_COMMENT != ""` instead of erroring on an undefined
+                // identifier when the editor didn't supply that variable
+                // (e.g. a plain-text buffer with no comment syntax).
+                for name in LSP_VARIABLE_NAMES {
+                    let value = variables.get(name).unwrap_or("").to_string();
+                    scope.push_constant(*name, value);
+                }
 
                 TABSTOP_COUNTER.with(|c| c.set(1));
                 let result = engine()
@@ -113,7 +123,7 @@ impl CompiledBody {
 pub fn validate(source: &str) -> Result<CompiledBody> {
     let compiled = CompiledBody::compile(source);
     let expanded = compiled
-        .evaluate(&[])
+        .evaluate(&[], &SnippetVariables::default())
         .with_context(|| "evaluating body with empty captures")?;
     snippet::Snippet::parse(&expanded).with_context(|| "parsing expanded body")?;
     Ok(compiled)
@@ -170,17 +180,21 @@ impl ActivePredicate {
 mod tests {
     use super::*;
 
+    fn no_vars() -> SnippetVariables {
+        SnippetVariables::default()
+    }
+
     #[test]
     fn static_body_passes_through() {
         let body = CompiledBody::compile(r"\hat{$1}$0");
-        let result = body.evaluate(&[]).unwrap();
+        let result = body.evaluate(&[], &no_vars()).unwrap();
         assert_eq!(result, r"\hat{$1}$0");
     }
 
     #[test]
     fn rhai_string_literal_evaluates() {
         let body = CompiledBody::compile(r#""\\alpha""#);
-        let result = body.evaluate(&[]).unwrap();
+        let result = body.evaluate(&[], &no_vars()).unwrap();
         assert_eq!(result, r"\alpha");
     }
 
@@ -195,17 +209,58 @@ mod tests {
             if key in m { m[key] } else { captures[0] }
         "#,
         );
-        assert_eq!(body.evaluate(&["@a", "a"]).unwrap(), r"\alpha");
-        assert_eq!(body.evaluate(&["@b", "b"]).unwrap(), r"\beta");
+        assert_eq!(body.evaluate(&["@a", "a"], &no_vars()).unwrap(), r"\alpha");
+        assert_eq!(body.evaluate(&["@b", "b"], &no_vars()).unwrap(), r"\beta");
         // Unknown letter: fall back to original text.
-        assert_eq!(body.evaluate(&["@z", "z"]).unwrap(), "@z");
+        assert_eq!(body.evaluate(&["@z", "z"], &no_vars()).unwrap(), "@z");
     }
 
     #[test]
     fn captures_are_bound() {
         let body = CompiledBody::compile(r#"`\hat{${captures[1]}}`"#);
-        let result = body.evaluate(&["xhat", "x"]).unwrap();
+        let result = body.evaluate(&["xhat", "x"], &no_vars()).unwrap();
         assert_eq!(result, r"\hat{x}");
+    }
+
+    #[test]
+    fn variables_are_bound_to_rhai_scope() {
+        // The point of pushing variables as scope constants: Rhai bodies can
+        // reference them directly with their LSP names.
+        let body = CompiledBody::compile(r#"TM_FILENAME + " :: " + CURRENT_YEAR"#);
+        let mut vars = SnippetVariables::default();
+        vars.insert("TM_FILENAME", "main.rs");
+        vars.insert("CURRENT_YEAR", "2026");
+        let result = body.evaluate(&[], &vars).unwrap();
+        assert_eq!(result, "main.rs :: 2026");
+    }
+
+    #[test]
+    fn missing_lsp_variable_is_empty_string_not_error() {
+        // A plain-text buffer has no LINE_COMMENT, but a Rhai body must still
+        // be able to reference it and branch on its value rather than failing
+        // with "variable not defined". Empty string lets bodies write
+        // `if LINE_COMMENT != "" { ... }` as the definedness check.
+        let body = CompiledBody::compile(
+            r#"if LINE_COMMENT != "" { LINE_COMMENT + " todo" } else { "no comment syntax" }"#,
+        );
+        let result = body.evaluate(&[], &no_vars()).unwrap();
+        assert_eq!(result, "no comment syntax");
+
+        let mut vars = SnippetVariables::default();
+        vars.insert("LINE_COMMENT", "//");
+        let result = body.evaluate(&[], &vars).unwrap();
+        assert_eq!(result, "// todo");
+    }
+
+    #[test]
+    fn variables_can_be_transformed_in_rhai_with_string_methods() {
+        // Confirms that a Rhai body can do its own transformation on a
+        // variable without needing the LSP `${VAR/.../.../}` syntax.
+        let body = CompiledBody::compile(r#"TM_FILENAME.to_upper()"#);
+        let mut vars = SnippetVariables::default();
+        vars.insert("TM_FILENAME", "main.rs");
+        let result = body.evaluate(&[], &vars).unwrap();
+        assert_eq!(result, "MAIN.RS");
     }
 
     #[test]
@@ -226,7 +281,7 @@ mod tests {
         "#;
         let body = CompiledBody::compile(source);
         let result = body
-            .evaluate(&["pmat2x3", "2", "3"])
+            .evaluate(&["pmat2x3", "2", "3"], &no_vars())
             .unwrap_or_else(|e| panic!("evaluation failed: {e}"));
         assert!(
             result.contains("$1 & $2 & $3"),
@@ -243,7 +298,7 @@ mod tests {
     #[test]
     fn infinite_loop_is_halted_by_op_limit() {
         let body = CompiledBody::compile(r#"loop { 1 + 1 }"#);
-        let result = body.evaluate(&[]);
+        let result = body.evaluate(&[], &no_vars());
         assert!(result.is_err(), "expected operation limit to halt loop");
     }
 
@@ -251,7 +306,7 @@ mod tests {
     fn no_filesystem_access() {
         // `open_file` and `read_file` are not registered.
         let body = CompiledBody::compile(r#"open_file("/etc/passwd")"#);
-        let result = body.evaluate(&[]);
+        let result = body.evaluate(&[], &no_vars());
         assert!(result.is_err(), "expected filesystem call to fail");
     }
 
@@ -269,7 +324,7 @@ mod tests {
             r#"spawn("sh")"#,
         ] {
             let compiled = CompiledBody::compile(snippet);
-            match (&compiled, compiled.evaluate(&[])) {
+            match (&compiled, compiled.evaluate(&[], &no_vars())) {
                 (CompiledBody::Static(_), Ok(out)) => {
                     assert_eq!(out, snippet, "static fallback should return source verbatim");
                 }
@@ -291,7 +346,7 @@ mod tests {
             s
         "#,
         );
-        let result = body.evaluate(&[]);
+        let result = body.evaluate(&[], &no_vars());
         assert!(
             result.is_err(),
             "expected string-size limit to halt growth, got: {result:?}"
@@ -332,7 +387,7 @@ mod tests {
         assert!(pred.evaluate(&kinds).unwrap());
 
         let body = CompiledBody::compile("inline_formula");
-        let result = body.evaluate(&[]);
+        let result = body.evaluate(&[], &no_vars());
         assert!(
             matches!(&body, CompiledBody::Static(_)) || result.is_err(),
             "body referencing a node kind should not silently get a bool: {result:?}"
@@ -348,7 +403,7 @@ mod tests {
             rec(0)
         "#,
         );
-        let result = body.evaluate(&[]);
+        let result = body.evaluate(&[], &no_vars());
         assert!(
             result.is_err(),
             "expected call-depth limit to halt recursion, got: {result:?}"

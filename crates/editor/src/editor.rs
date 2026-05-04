@@ -191,7 +191,7 @@ use settings::{
     update_settings_file,
 };
 use smallvec::{SmallVec, smallvec};
-use snippet::Snippet;
+use snippet::{Snippet, SnippetVariables};
 use std::{
     any::{Any, TypeId},
     borrow::Cow,
@@ -11077,6 +11077,23 @@ impl Editor {
         ));
     }
 
+    /// Builds the standard LSP snippet variables (`TM_FILENAME`, `CURRENT_YEAR`,
+    /// …) for an expansion at this editor's active buffer / cursor. Pass
+    /// `selection_text` when expanding from an action that has a selected
+    /// region; auto-expand and prefix completion both pass an empty string.
+    fn snippet_variables(
+        &self,
+        selection_text: &str,
+        cursor_offset: Option<usize>,
+        cx: &App,
+    ) -> SnippetVariables {
+        let buffer_entity = self.buffer.read(cx).as_singleton();
+        let buffer = buffer_entity.as_ref().map(|b| b.read(cx));
+        let project_entity = self.project();
+        let project = project_entity.map(|p| p.read(cx));
+        build_snippet_variables_for(buffer, project, cursor_offset, selection_text, cx)
+    }
+
     /// If an auto-expanding snippet's trigger matches the text immediately
     /// before the newest cursor, expand it in place and return `true`.
     /// Called from `handle_input` after every text insertion.
@@ -11170,6 +11187,7 @@ impl Editor {
                 kinds
             };
 
+            let snippet_vars = self.snippet_variables("", Some(cursor), cx);
             let matched = auto_snippets.iter().find_map(|snippet| {
                 if !snippet.is_active(&ancestor_kinds) {
                     return None;
@@ -11183,7 +11201,7 @@ impl Editor {
                         .map(|i| captures.get(i).map(|c| c.as_str()).unwrap_or(""))
                         .collect();
                     let consumed = window_text.len() - m.start();
-                    let body = snippet.evaluate(&cap_strs).log_err()?;
+                    let body = snippet.evaluate(&cap_strs, &snippet_vars).log_err()?;
                     Some((body, consumed))
                 } else {
                     snippet
@@ -11192,7 +11210,7 @@ impl Editor {
                         .find_map(|prefix| match_auto_prefix(&window_text, prefix))
                         .and_then(|consumed| {
                             snippet
-                                .evaluate(&[])
+                                .evaluate(&[], &snippet_vars)
                                 .log_err()
                                 .map(|body| (body, consumed))
                         })
@@ -16703,9 +16721,24 @@ impl Editor {
             .map(|selection| selection.range())
             .collect_vec();
 
+        let primary_range = insertion_ranges.first().cloned();
+        let selection_text = if let Some(range) = &primary_range
+            && range.start != range.end
+        {
+            self.buffer
+                .read(cx)
+                .snapshot(cx)
+                .text_for_range(range.start..range.end)
+                .collect::<String>()
+        } else {
+            String::new()
+        };
+        let cursor_offset = primary_range.as_ref().map(|r| r.start.0);
+        let snippet_vars = self.snippet_variables(&selection_text, cursor_offset, cx);
+
         let snippet = if let Some(snippet_body) = &action.snippet {
             if action.language.is_none() && action.name.is_none() {
-                Snippet::parse(snippet_body)?
+                Snippet::parse(&snippet::substitute_variables(snippet_body, &snippet_vars))?
             } else {
                 bail!("`snippet` is mutually exclusive with `language` and `name`")
             }
@@ -16717,7 +16750,7 @@ impl Editor {
                 .into_iter()
                 .find(|snippet| snippet.name == *name)
                 .context("snippet not found")?;
-            Snippet::parse(&snippet.evaluate(&[])?)?
+            Snippet::parse(&snippet.evaluate(&[], &snippet_vars)?)?
         } else {
             // todo(andrew): open modal to select snippet
             bail!("`name` or `snippet` is required")
@@ -27057,7 +27090,11 @@ fn process_completion_for_edit(
         {
             snippet_source = label;
         }
-        match Snippet::parse(&snippet_source).log_err() {
+        let cursor_offset = cursor_position.to_offset(&buffer_snapshot);
+        let snippet_vars =
+            build_snippet_variables_for(Some(buffer), None, Some(cursor_offset), "", cx);
+        let substituted = snippet::substitute_variables(&snippet_source, &snippet_vars);
+        match Snippet::parse(&substituted).log_err() {
             Some(parsed_snippet) => (Some(parsed_snippet.clone()), parsed_snippet.text),
             None => (None, completion.new_text.clone()),
         }
@@ -28376,6 +28413,139 @@ fn has_strong_snippet_prefix_match(
     })
 }
 
+/// Builds LSP standard snippet variables from whatever editor/project context
+/// is available. Both [`Editor::snippet_variables`] and the standalone
+/// [`snippet_completions`] path go through this so the same value resolution
+/// is used everywhere.
+///
+/// `cursor_offset` is interpreted in the given buffer; pass `None` to skip
+/// `TM_LINE_INDEX`, `TM_LINE_NUMBER`, `TM_CURRENT_LINE`, `TM_CURRENT_WORD`,
+/// `LINE_COMMENT`, `BLOCK_COMMENT_START`, `BLOCK_COMMENT_END`. Variables that
+/// can't be resolved (e.g. clipboard isn't text, no project) are simply
+/// omitted, which matches the LSP spec — substitution treats absent variables
+/// as empty strings.
+fn build_snippet_variables_for(
+    buffer: Option<&Buffer>,
+    project: Option<&Project>,
+    cursor_offset: Option<usize>,
+    selection_text: &str,
+    cx: &App,
+) -> SnippetVariables {
+    use rand::Rng;
+    use time::OffsetDateTime;
+
+    let mut vars = SnippetVariables::default();
+
+    if let Some(buffer) = buffer {
+        if let Some(file) = buffer.file() {
+            let path = file.path();
+            if let Some(name) = path.file_name() {
+                vars.insert("TM_FILENAME", name);
+                vars.insert("TM_FILENAME_BASE", path.file_stem().unwrap_or(name));
+            }
+            if let Some(parent) = path.parent() {
+                vars.insert("TM_DIRECTORY", parent.as_unix_str());
+            }
+            vars.insert("RELATIVE_FILEPATH", path.as_unix_str());
+            vars.insert(
+                "TM_FILEPATH",
+                file.full_path(cx).to_string_lossy().into_owned(),
+            );
+        }
+
+        if let Some(offset) = cursor_offset {
+            let snapshot = buffer.snapshot();
+            let point = snapshot.offset_to_point(offset);
+            vars.insert("TM_LINE_INDEX", point.row.to_string());
+            vars.insert("TM_LINE_NUMBER", (point.row + 1).to_string());
+
+            let line_start = Point::new(point.row, 0);
+            let line_end = Point::new(point.row, snapshot.line_len(point.row));
+            let line_text: String = snapshot
+                .text_for_range(line_start..line_end)
+                .collect::<String>();
+            vars.insert("TM_CURRENT_LINE", line_text.clone());
+
+            let bytes = line_text.as_bytes();
+            let col = (point.column as usize).min(bytes.len());
+            let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+            let mut start = col;
+            while start > 0 && is_word(bytes[start - 1]) {
+                start -= 1;
+            }
+            let mut end = col;
+            while end < bytes.len() && is_word(bytes[end]) {
+                end += 1;
+            }
+            if start < end {
+                vars.insert("TM_CURRENT_WORD", &line_text[start..end]);
+            }
+
+            if let Some(scope) = snapshot.language_scope_at(offset) {
+                if let Some(prefix) = scope.line_comment_prefixes().first() {
+                    vars.insert("LINE_COMMENT", prefix.trim_end().to_string());
+                }
+                if let Some(block) = scope.block_comment() {
+                    vars.insert("BLOCK_COMMENT_START", block.start.as_ref());
+                    vars.insert("BLOCK_COMMENT_END", block.end.as_ref());
+                }
+            }
+        }
+    }
+
+    vars.insert("TM_SELECTED_TEXT", selection_text);
+
+    if let Some(item) = cx.read_from_clipboard()
+        && let Some(text) = item.text()
+    {
+        vars.insert("CLIPBOARD", text);
+    }
+
+    if let Some(project) = project
+        && let Some(first) = project.visible_worktrees(cx).next()
+    {
+        let root = first.read(cx);
+        vars.insert("WORKSPACE_NAME", root.root_name_str());
+        vars.insert(
+            "WORKSPACE_FOLDER",
+            root.abs_path().to_string_lossy().into_owned(),
+        );
+    }
+
+    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    vars.insert("CURRENT_YEAR", now.year().to_string());
+    vars.insert("CURRENT_YEAR_SHORT", format!("{:02}", now.year() % 100));
+    vars.insert("CURRENT_MONTH", format!("{:02}", u8::from(now.month())));
+    let month_name = format!("{}", now.month());
+    vars.insert("CURRENT_MONTH_NAME_SHORT", month_name[..3.min(month_name.len())].to_string());
+    vars.insert("CURRENT_MONTH_NAME", month_name);
+    vars.insert("CURRENT_DATE", format!("{:02}", now.day()));
+    let day_name = format!("{}", now.weekday());
+    vars.insert("CURRENT_DAY_NAME_SHORT", day_name[..3.min(day_name.len())].to_string());
+    vars.insert("CURRENT_DAY_NAME", day_name);
+    vars.insert("CURRENT_HOUR", format!("{:02}", now.hour()));
+    vars.insert("CURRENT_MINUTE", format!("{:02}", now.minute()));
+    vars.insert("CURRENT_SECOND", format!("{:02}", now.second()));
+    vars.insert("CURRENT_SECONDS_UNIX", now.unix_timestamp().to_string());
+    let offset_seconds = now.offset().whole_seconds();
+    let sign = if offset_seconds >= 0 { '+' } else { '-' };
+    let abs_minutes = offset_seconds.abs() / 60;
+    vars.insert(
+        "CURRENT_TIMEZONE_OFFSET",
+        format!("{sign}{:02}{:02}", abs_minutes / 60, abs_minutes % 60),
+    );
+
+    let mut rng = rand::rng();
+    vars.insert("RANDOM", format!("{:06}", rng.random_range(0..1_000_000u32)));
+    vars.insert(
+        "RANDOM_HEX",
+        format!("{:06x}", rng.random_range(0..0x100_0000u32)),
+    );
+    vars.insert("UUID", uuid::Uuid::new_v4().to_string());
+
+    vars
+}
+
 fn snippet_completions(
     project: &Project,
     buffer: &Entity<Buffer>,
@@ -28425,6 +28595,12 @@ fn snippet_completions(
 
     let snapshot = buffer.read(cx).text_snapshot();
     let executor = cx.background_executor().clone();
+    let snippet_vars = {
+        let buffer_ref = buffer.read(cx);
+        let cursor_offset =
+            text::ToOffset::to_offset(&buffer_anchor, &buffer_ref.text_snapshot());
+        build_snippet_variables_for(Some(buffer_ref), Some(project), Some(cursor_offset), "", cx)
+    };
 
     cx.background_spawn(async move {
         let is_word_char = |c| classifier.is_word(c);
@@ -28569,7 +28745,7 @@ fn snippet_completions(
                 let ((snippet_index, prefix_index), matching_prefix, _snippet_word_count) =
                     sorted_snippet_candidates[string_match.candidate_id];
                 let snippet = &snippets[snippet_index];
-                let body = snippet.evaluate(&[]).log_err()?;
+                let body = snippet.evaluate(&[], &snippet_vars).log_err()?;
                 let start = buffer_offset - buffer_window_len;
                 let start = snapshot.anchor_before(start);
                 let range = start..buffer_anchor;
@@ -28644,7 +28820,7 @@ fn snippet_completions(
                 let cap_strs: Vec<&str> = (0..captures.len())
                     .map(|i| captures.get(i).map(|c| c.as_str()).unwrap_or(""))
                     .collect();
-                let Some(new_text) = snippet.evaluate(&cap_strs).log_err() else {
+                let Some(new_text) = snippet.evaluate(&cap_strs, &snippet_vars).log_err() else {
                     continue;
                 };
                 let consumed = max_buffer_window.len() - m.start();

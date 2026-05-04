@@ -17,6 +17,7 @@ use futures::stream::StreamExt;
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Task, WeakEntity};
 use regex::Regex;
 pub use registry::*;
+use snippet::SnippetVariables;
 use util::ResultExt;
 
 pub fn init(cx: &mut App) {
@@ -123,10 +124,16 @@ pub fn file_to_snippets_with_context(
             // bad LSP-snippet output at load time. Regex snippets are expanded
             // lazily because their bodies typically depend on capture values.
             if regex.is_none() {
+                // Use a scope pre-populated with empty strings for all known
+                // LSP variable names so Rhai bodies that reference them
+                // (e.g. `TM_FILENAME + " ..."`) can validate at load time.
+                let validation_vars = SnippetVariables::lsp_defaults_empty();
                 let validation_body = script::CompiledBody::compile(&body)
-                    .evaluate(&[])
+                    .evaluate(&[], &validation_vars)
                     .with_context(|| format!("Invalid snippet '{name}' in {source:?}"))?;
-                if let Err(e) = snippet::Snippet::parse(&validation_body) {
+                let substituted =
+                    snippet::substitute_variables(&validation_body, &validation_vars);
+                if let Err(e) = snippet::Snippet::parse(&substituted) {
                     return Err(anyhow::anyhow!(
                         "Invalid snippet '{name}' in {source:?}: {e:#}"
                     ));
@@ -257,15 +264,21 @@ pub struct Snippet {
 }
 
 impl Snippet {
-    /// Evaluates the snippet body with the given regex captures bound, returning
-    /// the expanded LSP-snippet-syntax string ready to be parsed by
-    /// `snippet::Snippet::parse`.
+    /// Evaluates the snippet body with the given regex captures and standard
+    /// LSP variables bound, returning the expanded LSP-snippet-syntax string
+    /// ready to be parsed by `snippet::Snippet::parse`.
     ///
     /// Captures are accessed in scripted bodies via the `captures` array
-    /// (`captures[0]` is the full match). If the body did not parse as Rhai
-    /// (e.g. legacy text bodies), the source is returned unchanged.
-    pub fn evaluate(&self, captures: &[&str]) -> Result<String> {
-        script::CompiledBody::compile(&self.body).evaluate(captures)
+    /// (`captures[0]` is the full match). LSP standard variables are
+    /// available both as Rhai-scope constants (e.g. `TM_FILENAME`) for
+    /// scripted bodies and as `$NAME` / `${NAME}` / `${NAME:default}` /
+    /// `${NAME/regex/replacement/flags}` substitutions, applied to the body's
+    /// output via [`snippet::substitute_variables`]. If the body did not
+    /// parse as Rhai (e.g. legacy text bodies), the source is returned
+    /// unchanged before substitution.
+    pub fn evaluate(&self, captures: &[&str], variables: &SnippetVariables) -> Result<String> {
+        let raw = script::CompiledBody::compile(&self.body).evaluate(captures, variables)?;
+        Ok(snippet::substitute_variables(&raw, variables))
     }
 
     /// Returns `true` if the snippet's `active` predicate evaluates to true
@@ -652,15 +665,17 @@ Matrix
                 .collect();
         assert_eq!(snippets.len(), 3, "all three snippets should load");
 
-        let alpha = snippets["alpha"].evaluate(&[]).unwrap();
+        let alpha = snippets["alpha"].evaluate(&[], &SnippetVariables::default()).unwrap();
         assert_eq!(alpha, r"\alpha");
 
         let hat = snippets["Hat over letter"]
-            .evaluate(&["xhat", "x"])
+            .evaluate(&["xhat", "x"], &SnippetVariables::default())
             .unwrap();
         assert_eq!(hat, r"\hat{x}");
 
-        let matrix = snippets["Matrix"].evaluate(&["pmat2x3", "2", "3"]).unwrap();
+        let matrix = snippets["Matrix"]
+            .evaluate(&["pmat2x3", "2", "3"], &SnippetVariables::default())
+            .unwrap();
         assert!(matrix.contains("$1 & $2 & $3"), "got: {matrix}");
         assert!(matrix.contains("$4 & $5 & $6"), "got: {matrix}");
         assert!(matrix.contains(r"\begin{pmatrix}"));
@@ -741,7 +756,7 @@ Letter subscript digit
             .filter_map(Result::ok)
             .collect();
         assert_eq!(snippets.len(), 1);
-        let body = snippets[0].evaluate(&[]).unwrap();
+        let body = snippets[0].evaluate(&[], &SnippetVariables::default()).unwrap();
         assert_eq!(body, r"\alpha", "body should keep backslash");
     }
 
@@ -757,7 +772,52 @@ Letter subscript digit
             .filter_map(Result::ok)
             .collect();
         assert_eq!(snippets.len(), 1);
-        assert_eq!(snippets[0].evaluate(&[]).unwrap(), "^{2}");
+        assert_eq!(
+            snippets[0].evaluate(&[], &SnippetVariables::default()).unwrap(),
+            "^{2}"
+        );
+    }
+
+    #[test]
+    fn test_static_body_substitutes_lsp_variables() {
+        // Static body with `$NAME` references resolves them via the variables
+        // map before reaching the LSP snippet parser. Body starts with `%` so
+        // it doesn't accidentally compile as Rhai (where `//` would be a
+        // comment and swallow the rest).
+        let conl = "Header\n  prefix = hd\n  body = % $TM_FILENAME ($CURRENT_YEAR)\n";
+        let parsed: HashMap<String, format::VsCodeSnippet> = serde_conl::from_str(conl).unwrap();
+        let file = VsSnippetsFile { snippets: parsed };
+        let snippets: Vec<_> = file_to_snippets(file, std::path::Path::new("t.conl"))
+            .filter_map(Result::ok)
+            .collect();
+        let mut vars = SnippetVariables::default();
+        vars.insert("TM_FILENAME", "main.rs");
+        vars.insert("CURRENT_YEAR", "2026");
+        let body = snippets[0].evaluate(&[], &vars).unwrap();
+        assert_eq!(body, "% main.rs (2026)");
+    }
+
+    #[test]
+    fn test_rhai_body_uses_variables_from_scope() {
+        // Rhai body that references TM_FILENAME directly (no `$`), then
+        // emits LSP snippet text. Confirms scope binding flows end-to-end.
+        let conl = r#"Header
+  prefix = hd
+  body = """rhai
+    "% " + TM_FILENAME
+
+"#;
+        let parsed: HashMap<String, format::VsCodeSnippet> = serde_conl::from_str(conl)
+            .unwrap_or_else(|e| panic!("conl parse: {e:?}"));
+        let file = VsSnippetsFile { snippets: parsed };
+        let snippets: Vec<_> = file_to_snippets(file, std::path::Path::new("t.conl"))
+            .map(|r| r.unwrap_or_else(|e| panic!("snippet load: {e:#}")))
+            .collect();
+        assert_eq!(snippets.len(), 1, "expected one snippet");
+        let mut vars = SnippetVariables::default();
+        vars.insert("TM_FILENAME", "main.rs");
+        let body = snippets[0].evaluate(&[], &vars).unwrap();
+        assert_eq!(body, "% main.rs");
     }
 
     #[test]
@@ -904,7 +964,7 @@ Overridden
         let cap_strs: Vec<&str> = (0..captures.len())
             .map(|i| captures.get(i).map(|c| c.as_str()).unwrap_or(""))
             .collect();
-        let body = snippets[0].evaluate(&cap_strs).unwrap();
+        let body = snippets[0].evaluate(&cap_strs, &SnippetVariables::default()).unwrap();
         assert_eq!(body, r"\frac{ \partial x }{ \partial y } ");
     }
 
