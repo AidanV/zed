@@ -98,6 +98,19 @@ pub struct Snippet {
 pub struct TabStop {
     pub ranges: SmallVec<[Range<isize>; 2]>,
     pub choices: Option<Vec<String>>,
+    /// LSP `${N/regex/replacement/flags}` transforms attached to this tabstop.
+    /// Each transform owns a region of `Snippet::text` whose contents are
+    /// derived from the tabstop's current value. After [`Snippet::parse`] the
+    /// region holds the transform applied to the placeholder default.
+    pub transforms: SmallVec<[TabStopTransform; 1]>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TabStopTransform {
+    pub range: Range<isize>,
+    pub regex: String,
+    pub replacement: String,
+    pub flags: String,
 }
 
 impl Snippet {
@@ -106,6 +119,8 @@ impl Snippet {
         let mut tabstops = BTreeMap::new();
         parse_snippet(source, false, &mut text, &mut tabstops)
             .context("failed to parse snippet")?;
+
+        render_initial_transforms(&mut text, &mut tabstops);
 
         let len = text.len() as isize;
         let final_tabstop = tabstops.remove(&0);
@@ -117,6 +132,7 @@ impl Snippet {
             let end_tabstop = TabStop {
                 ranges: [len..len].into_iter().collect(),
                 choices: None,
+                transforms: Default::default(),
             };
 
             if !tabstops.last().is_some_and(|t| *t == end_tabstop) {
@@ -125,6 +141,67 @@ impl Snippet {
         }
 
         Ok(Snippet { text, tabstops })
+    }
+}
+
+/// Walk the parsed tabstops in slot order, render each transform using the
+/// placeholder text of its source tabstop, and shift later ranges/slots by the
+/// rendered length. Mutates `text` and `tabstops` in place.
+fn render_initial_transforms(text: &mut String, tabstops: &mut BTreeMap<usize, TabStop>) {
+    let mut order: Vec<(usize, usize, isize)> = Vec::new();
+    for (key, ts) in tabstops.iter() {
+        for (i, t) in ts.transforms.iter().enumerate() {
+            order.push((*key, i, t.range.start));
+        }
+    }
+    order.sort_by_key(|(_, _, start)| *start);
+
+    for (key, idx, _) in order {
+        let (regex, replacement, flags, slot_range) = {
+            let t = &tabstops[&key].transforms[idx];
+            (
+                t.regex.clone(),
+                t.replacement.clone(),
+                t.flags.clone(),
+                t.range.clone(),
+            )
+        };
+        let source_value = {
+            let ts = &tabstops[&key];
+            match ts.ranges.first() {
+                Some(r) => text[r.start as usize..r.end as usize].to_string(),
+                None => String::new(),
+            }
+        };
+        let output = apply_transform(&source_value, &regex, &replacement, &flags);
+        let slot_start = slot_range.start as usize;
+        let slot_end = slot_range.end as usize;
+        let old_len = (slot_end - slot_start) as isize;
+        let new_len = output.len() as isize;
+        let len_diff = new_len - old_len;
+        text.replace_range(slot_start..slot_end, &output);
+
+        let pivot = slot_range.start;
+        for ts in tabstops.values_mut() {
+            for r in ts.ranges.iter_mut() {
+                if r.start > pivot {
+                    r.start += len_diff;
+                }
+                if r.end > pivot {
+                    r.end += len_diff;
+                }
+            }
+            for t in ts.transforms.iter_mut() {
+                if t.range.start > pivot {
+                    t.range.start += len_diff;
+                }
+                if t.range.end > pivot {
+                    t.range.end += len_diff;
+                }
+            }
+        }
+        tabstops.get_mut(&key).unwrap().transforms[idx].range =
+            slot_range.start..slot_range.start + new_len;
     }
 }
 
@@ -183,24 +260,43 @@ fn parse_tabstop<'a>(
     let tabstop_start = text.len();
     let tabstop_index;
     let mut choices = None;
+    let mut transform: Option<TabStopTransform> = None;
 
     if source.starts_with('{') {
         let (index, rest) = parse_int(&source[1..])?;
         tabstop_index = index;
         source = rest;
 
-        if source.starts_with("|") {
+        if source.starts_with('|') {
             (source, choices) = parse_choices(&source[1..], text)?;
+        } else if source.starts_with('/') {
+            let (regex, n1) = read_transform_part(&source[1..])
+                .context("malformed regex in tabstop transform")?;
+            let after_regex = 1 + n1;
+            let (replacement, n2) = read_transform_part(&source[after_regex..])
+                .context("malformed replacement in tabstop transform")?;
+            let after_repl = after_regex + n2;
+            let (flags, n3) = read_until_close_brace(&source[after_repl..])
+                .context("missing closing brace in tabstop transform")?;
+            transform = Some(TabStopTransform {
+                range: tabstop_start as isize..tabstop_start as isize,
+                regex,
+                replacement,
+                flags,
+            });
+            source = &source[after_repl + n3..];
         }
 
-        if source.starts_with(':') {
-            source = parse_snippet(&source[1..], true, text, tabstops)?;
-        }
+        if transform.is_none() {
+            if source.starts_with(':') {
+                source = parse_snippet(&source[1..], true, text, tabstops)?;
+            }
 
-        if source.starts_with('}') {
-            source = &source[1..];
-        } else {
-            anyhow::bail!("expected a closing brace");
+            if source.starts_with('}') {
+                source = &source[1..];
+            } else {
+                anyhow::bail!("expected a closing brace");
+            }
         }
     } else {
         let (index, rest) = parse_int(source)?;
@@ -208,14 +304,19 @@ fn parse_tabstop<'a>(
         source = rest;
     }
 
-    tabstops
-        .entry(tabstop_index)
-        .or_insert_with(|| TabStop {
-            ranges: Default::default(),
-            choices,
-        })
-        .ranges
-        .push(tabstop_start as isize..text.len() as isize);
+    let entry = tabstops.entry(tabstop_index).or_insert_with(|| TabStop {
+        ranges: Default::default(),
+        choices,
+        transforms: Default::default(),
+    });
+
+    if let Some(t) = transform {
+        entry.transforms.push(t);
+    } else {
+        entry
+            .ranges
+            .push(tabstop_start as isize..text.len() as isize);
+    }
     Ok(source)
 }
 
@@ -440,7 +541,7 @@ fn read_until_close_brace(text: &str) -> Option<(String, usize)> {
     None
 }
 
-fn apply_transform(value: &str, regex_src: &str, replacement: &str, flags: &str) -> String {
+pub fn apply_transform(value: &str, regex_src: &str, replacement: &str, flags: &str) -> String {
     let mut prefix = String::new();
     let mut global = false;
     for c in flags.chars() {
@@ -483,8 +584,8 @@ fn parse_choices<'a>(
                 source = &source[1..];
 
                 if let Some(c) = source.chars().next() {
+                    current_choice.push(c);
                     if !found_default_choice {
-                        current_choice.push(c);
                         text.push(c);
                     }
                     source = &source[c.len_utf8()..];
@@ -624,6 +725,119 @@ mod tests {
             tabstop_choices(&snippet),
             &[&None, &None, &None, &None, &None]
         );
+    }
+
+    #[test]
+    fn test_snippet_with_three_choices_no_leading_empty() {
+        // Regression: `${1|string,char,int|}` should parse to a single tabstop
+        // whose placeholder is "string" and whose choice list is exactly the
+        // three values. The first choice is the default placeholder.
+        let snippet = Snippet::parse("${1|string,char,int|}").unwrap();
+        assert_eq!(snippet.text, "string");
+        assert_eq!(snippet.tabstops[0].ranges.as_slice(), &[0..6]);
+        assert_eq!(
+            snippet.tabstops[0].choices,
+            Some(vec![
+                "string".to_string(),
+                "char".to_string(),
+                "int".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_snippet_with_single_choice() {
+        // Single-element choice list. Per LSP spec the picker still appears,
+        // but the only option is selected as the placeholder text.
+        let snippet = Snippet::parse("${1|only|}").unwrap();
+        assert_eq!(snippet.text, "only");
+        assert_eq!(
+            tabstop_choices(&snippet),
+            &[&Some(vec!["only".to_string()]), &None]
+        );
+    }
+
+    #[test]
+    fn test_snippet_choice_with_escaped_separators() {
+        // Commas and pipes inside a choice must be escaped with `\`. Verify
+        // they survive parsing and end up as literal characters in the choice
+        // values.
+        let snippet = Snippet::parse(r"${1|a\,b,c\|d|}").unwrap();
+        assert_eq!(snippet.text, "a,b");
+        assert_eq!(
+            tabstop_choices(&snippet),
+            &[&Some(vec!["a,b".to_string(), "c|d".to_string()]), &None]
+        );
+    }
+
+    #[test]
+    fn test_nested_placeholders_with_transform() {
+        // Outer placeholder contains an inner one; a transform on the outer
+        // tabstop should still render correctly using the placeholder text.
+        let snippet = Snippet::parse("${1:foo ${2:bar}}-${1/(.+)/[$1]/}").unwrap();
+        assert_eq!(snippet.text, "foo bar-[foo bar]");
+        // Tabstop 1 covers "foo bar" (length 7).
+        assert_eq!(snippet.tabstops[0].ranges.as_slice(), &[0..7]);
+        assert_eq!(snippet.tabstops[0].transforms.len(), 1);
+        assert_eq!(snippet.tabstops[0].transforms[0].range, 8..17);
+        // Inner tabstop 2 covers "bar" inside the outer placeholder.
+        assert_eq!(snippet.tabstops[1].ranges.as_slice(), &[4..7]);
+    }
+
+    #[test]
+    fn test_tabstop_transform_renders_initial_value() {
+        // `${1:foo}` placeholder followed by `${1/(.+)/$1!/}` transform.
+        // After parsing, the transform region is filled with the regex applied
+        // to the placeholder text.
+        let snippet = Snippet::parse("${1:foo}-${1/(.+)/$1!/}").unwrap();
+        assert_eq!(snippet.text, "foo-foo!");
+        // Tabstop 1 has the placeholder range [0..3] and the rendered transform
+        // range [4..8] (the `foo!` region).
+        assert_eq!(snippet.tabstops[0].ranges.as_slice(), &[0..3]);
+        assert_eq!(snippet.tabstops[0].transforms.len(), 1);
+        let t = &snippet.tabstops[0].transforms[0];
+        assert_eq!(t.range, 4..8);
+        assert_eq!(t.regex, "(.+)");
+        assert_eq!(t.replacement, "$1!");
+    }
+
+    #[test]
+    fn test_tabstop_transform_with_no_placeholder_uses_empty_input() {
+        // A transform whose source tabstop has no placeholder yet (only a
+        // bare `$1` reference appears later) should render against the empty
+        // string. Per the LSP spec this leaves the region empty when the
+        // regex doesn't match.
+        let snippet = Snippet::parse("${1/(.+)/[$1]/}-$1").unwrap();
+        // The transform region is empty (regex doesn't match ""), then `-`
+        // separator, then the bare `$1` (zero-width).
+        assert_eq!(snippet.text, "-");
+        assert_eq!(snippet.tabstops[0].transforms.len(), 1);
+        assert_eq!(snippet.tabstops[0].transforms[0].range, 0..0);
+        // Bare `$1` sits after the `-`.
+        assert_eq!(snippet.tabstops[0].ranges.as_slice(), &[1..1]);
+    }
+
+    #[test]
+    fn test_tabstop_transform_global_flag() {
+        let snippet = Snippet::parse("${1:abc}-${1/[a-z]/X/g}").unwrap();
+        assert_eq!(snippet.text, "abc-XXX");
+        assert_eq!(snippet.tabstops[0].transforms[0].range, 4..7);
+    }
+
+    #[test]
+    fn test_tabstop_transform_shifts_later_tabstops() {
+        let snippet = Snippet::parse("${1:hi}-${1/(.+)/[$1]/}-${2:bye}").unwrap();
+        assert_eq!(snippet.text, "hi-[hi]-bye");
+        // Tabstop 1 placeholder is at 0..2, transform at 3..7.
+        assert_eq!(snippet.tabstops[0].ranges.as_slice(), &[0..2]);
+        assert_eq!(snippet.tabstops[0].transforms[0].range, 3..7);
+        // Tabstop 2 placeholder is at 8..11 — shifted by the transform output.
+        assert_eq!(snippet.tabstops[1].ranges.as_slice(), &[8..11]);
+    }
+
+    #[test]
+    fn test_tabstop_transform_missing_closing_brace_errors() {
+        assert!(Snippet::parse("${1/foo/bar/").is_err());
     }
 
     #[test]

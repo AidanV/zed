@@ -13647,6 +13647,139 @@ async fn test_snippet_tabstop_navigation_with_placeholders(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+async fn test_snippet_choices_via_auto_expand_show_picker(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_editor(|editor, _, cx| {
+        editor.project().unwrap().update(cx, |project, cx| {
+            project.snippets().update(cx, |snippets, _cx| {
+                snippets.add_snippet_for_test(
+                    None,
+                    PathBuf::from("test_snippets.json"),
+                    vec![Arc::new(project::snippet_provider::Snippet {
+                        prefix: vec!["ty".to_string()],
+                        body: r#""${1|string,char,int|}""#.to_string(),
+                        compiled_body: Default::default(),
+                        description: None,
+                        name: "type-choice".to_string(),
+                        auto: true,
+                        regex: None,
+                        active: None,
+                    })],
+                );
+            });
+        })
+    });
+
+    cx.set_state("ˇ");
+    cx.simulate_input("ty");
+    cx.update_editor(|editor, _, _| {
+        assert!(
+            editor.context_menu_visible(),
+            "Choice picker should be visible after auto-expanding `ty`"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_snippet_choices_three_options_show_picker(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+
+    cx.set_state("ˇ");
+    cx.update_editor(|editor, window, cx| {
+        let snippet = Snippet::parse("${1|string,char,int|}").unwrap();
+        let insertion_ranges = editor
+            .selections
+            .all(&editor.display_snapshot(cx))
+            .iter()
+            .map(|s| s.range())
+            .collect::<Vec<_>>();
+        editor
+            .insert_snippet(&insertion_ranges, snippet, window, cx)
+            .unwrap();
+        assert!(
+            editor.context_menu_visible(),
+            "Choice picker should be visible after inserting ${{1|string,char,int|}}"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_snippet_rhai_body_reacts_to_tabstop_edits(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.update_editor(|editor, _, cx| {
+        editor.project().unwrap().update(cx, |project, cx| {
+            project.snippets().update(cx, |snippets, _cx| {
+                snippets.add_snippet_for_test(
+                    None,
+                    PathBuf::from("test_snippets.json"),
+                    vec![Arc::new(project::snippet_provider::Snippet {
+                        prefix: vec!["rl".to_string()],
+                        // Rhai body that emits two regions:
+                        // - tabstop $1 (where the user types)
+                        // - the upper-cased value of $1 after a separator
+                        body: r#""${1:foo}-" + tabstop_value(1).to_upper()"#.to_string(),
+                        compiled_body: Default::default(),
+                        description: None,
+                        name: "rhai-live".to_string(),
+                        auto: true,
+                        regex: None,
+                        active: None,
+                    })],
+                );
+            });
+        })
+    });
+
+    cx.set_state("ˇ");
+    cx.simulate_input("rl");
+    cx.assert_editor_state("«fooˇ»-FOO");
+
+    cx.simulate_input("b");
+    cx.assert_editor_state("bˇ-B");
+
+    cx.simulate_input("a");
+    cx.assert_editor_state("baˇ-BA");
+
+    cx.simulate_input("r");
+    cx.assert_editor_state("barˇ-BAR");
+}
+
+#[gpui::test]
+async fn test_snippet_tabstop_transform_reacts_to_edits(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+
+    cx.set_state("ˇ");
+    cx.update_editor(|editor, window, cx| {
+        let snippet = Snippet::parse("${1:foo}-${1/(.+)/$1!/}").unwrap();
+        let insertion_ranges = editor
+            .selections
+            .all(&editor.display_snapshot(cx))
+            .iter()
+            .map(|s| s.range())
+            .collect::<Vec<_>>();
+        editor
+            .insert_snippet(&insertion_ranges, snippet, window, cx)
+            .unwrap();
+    });
+
+    cx.assert_editor_state("«fooˇ»-foo!");
+
+    cx.simulate_input("bar");
+    cx.assert_editor_state("barˇ-bar!");
+
+    cx.simulate_input("z");
+    cx.assert_editor_state("barzˇ-barz!");
+}
+
+#[gpui::test]
 async fn test_snippets(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
@@ -13780,6 +13913,7 @@ async fn test_snippet_with_multi_word_prefix(cx: &mut TestAppContext) {
                 let snippet = project::snippet_provider::Snippet {
                     prefix: vec!["multi word".to_string()],
                     body: r#""this is many words""#.to_string(),
+                    compiled_body: Default::default(),
                     description: Some("description".to_string()),
                     name: "multi-word snippet test".to_string(),
                     auto: false,
@@ -13833,6 +13967,7 @@ async fn test_auto_expand_prefix_snippet(cx: &mut TestAppContext) {
                     vec![Arc::new(project::snippet_provider::Snippet {
                         prefix: vec!["ff".to_string()],
                         body: "\\frac{$1}{$2}$0".to_string(),
+                        compiled_body: Default::default(),
                         description: None,
                         name: "fraction".to_string(),
                         auto: true,
@@ -13863,6 +13998,7 @@ async fn test_auto_expand_does_not_fire_mid_word(cx: &mut TestAppContext) {
                     vec![Arc::new(project::snippet_provider::Snippet {
                         prefix: vec!["ff".to_string()],
                         body: r#""EXPANDED""#.to_string(),
+                        compiled_body: Default::default(),
                         description: None,
                         name: "fraction".to_string(),
                         auto: true,
@@ -13897,6 +14033,7 @@ async fn test_auto_expand_punctuation_leading_prefix(cx: &mut TestAppContext) {
                         Arc::new(project::snippet_provider::Snippet {
                             prefix: vec!["@a".to_string()],
                             body: "\\alpha".to_string(),
+                            compiled_body: Default::default(),
                             description: None,
                             name: "alpha".to_string(),
                             auto: true,
@@ -13906,6 +14043,7 @@ async fn test_auto_expand_punctuation_leading_prefix(cx: &mut TestAppContext) {
                         Arc::new(project::snippet_provider::Snippet {
                             prefix: vec!["//".to_string()],
                             body: "\\frac{$1}{$2}$0".to_string(),
+                            compiled_body: Default::default(),
                             description: None,
                             name: "fraction-slash".to_string(),
                             auto: true,
@@ -13941,6 +14079,7 @@ async fn test_auto_expand_regex_snippet_with_captures(cx: &mut TestAppContext) {
                     vec![Arc::new(project::snippet_provider::Snippet {
                         prefix: vec![],
                         body: r#"`${captures[1]}.foo(${captures[1]})$0`"#.to_string(),
+                        compiled_body: Default::default(),
                         description: None,
                         name: "method-call".to_string(),
                         auto: true,
@@ -13974,6 +14113,7 @@ async fn test_auto_expand_in_node_filter(cx: &mut TestAppContext) {
                     vec![Arc::new(project::snippet_provider::Snippet {
                         prefix: vec!["qq".to_string()],
                         body: r#""world""#.to_string(),
+                        compiled_body: Default::default(),
                         description: None,
                         name: "string-only".to_string(),
                         auto: true,
@@ -14018,6 +14158,7 @@ async fn test_auto_expand_not_in_node_filter(cx: &mut TestAppContext) {
                     vec![Arc::new(project::snippet_provider::Snippet {
                         prefix: vec!["qq".to_string()],
                         body: r#""world""#.to_string(),
+                        compiled_body: Default::default(),
                         description: None,
                         name: "outside-strings".to_string(),
                         auto: true,
@@ -14061,6 +14202,7 @@ async fn test_auto_expand_with_multiple_cursors(cx: &mut TestAppContext) {
                     vec![Arc::new(project::snippet_provider::Snippet {
                         prefix: vec!["ff".to_string()],
                         body: "\\frac{$1}{$2}$0".to_string(),
+                        compiled_body: Default::default(),
                         description: None,
                         name: "fraction".to_string(),
                         auto: true,
@@ -14101,6 +14243,7 @@ async fn test_auto_expand_does_not_fire_when_one_cursor_does_not_match(
                     vec![Arc::new(project::snippet_provider::Snippet {
                         prefix: vec!["ff".to_string()],
                         body: "\\frac{$1}{$2}$0".to_string(),
+                        compiled_body: Default::default(),
                         description: None,
                         name: "fraction".to_string(),
                         auto: true,
@@ -14135,6 +14278,7 @@ async fn test_auto_expand_consumes_autoclosed_bracket(cx: &mut TestAppContext) {
                     vec![Arc::new(project::snippet_provider::Snippet {
                         prefix: vec![],
                         body: r#"`\left( $1 \right) $0`"#.to_string(),
+                        compiled_body: Default::default(),
                         description: None,
                         name: "left-right-paren".to_string(),
                         auto: true,
@@ -14170,6 +14314,7 @@ async fn test_non_auto_regex_snippet_appears_in_completion_menu(cx: &mut TestApp
                         prefix: vec![],
                         body: r#"`\frac{ \partial ${captures[1]} }{ \partial ${captures[2]} } `"#
                             .to_string(),
+                        compiled_body: Default::default(),
                         description: None,
                         name: "Partial of x by y".to_string(),
                         auto: false,
@@ -14246,6 +14391,7 @@ async fn test_non_auto_snippet_does_not_auto_expand(cx: &mut TestAppContext) {
                     vec![Arc::new(project::snippet_provider::Snippet {
                         prefix: vec!["ff".to_string()],
                         body: r#""EXPANDED""#.to_string(),
+                        compiled_body: Default::default(),
                         description: None,
                         name: "fraction".to_string(),
                         auto: false,
@@ -31574,6 +31720,7 @@ async fn test_mixed_completions_with_multi_word_snippet(cx: &mut TestAppContext)
                                 "unlimited unknown".to_string(),
                             ],
                             body: r#""this is many words""#.to_string(),
+                            compiled_body: Default::default(),
                             description: Some("description".to_string()),
                             name: "multi-word snippet test".to_string(),
                             auto: false,
@@ -31583,6 +31730,7 @@ async fn test_mixed_completions_with_multi_word_snippet(cx: &mut TestAppContext)
                         Arc::new(project::snippet_provider::Snippet {
                             prefix: vec!["unsnip".to_string(), "@few".to_string()],
                             body: r#""fewer words""#.to_string(),
+                            compiled_body: Default::default(),
                             description: Some("alt description".to_string()),
                             name: "other name".to_string(),
                             auto: false,
@@ -31592,6 +31740,7 @@ async fn test_mixed_completions_with_multi_word_snippet(cx: &mut TestAppContext)
                         Arc::new(project::snippet_provider::Snippet {
                             prefix: vec!["ab aa".to_string()],
                             body: r#""abcd""#.to_string(),
+                            compiled_body: Default::default(),
                             description: None,
                             name: "alphabet".to_string(),
                             auto: false,
@@ -32295,6 +32444,7 @@ async fn test_insert_snippet(cx: &mut TestAppContext) {
                 let snippet = project::snippet_provider::Snippet {
                     prefix: vec![], // no prefix needed!
                     body: r#""an Unspecified""#.to_string(),
+                    compiled_body: Default::default(),
                     description: Some("shhhh it's a secret".to_string()),
                     name: "super secret snippet".to_string(),
                     auto: false,
@@ -32310,6 +32460,7 @@ async fn test_insert_snippet(cx: &mut TestAppContext) {
                 let snippet = project::snippet_provider::Snippet {
                     prefix: vec![], // no prefix needed!
                     body: r#"" Location""#.to_string(),
+                    compiled_body: Default::default(),
                     description: Some("the word 'location'".to_string()),
                     name: "location word".to_string(),
                     auto: false,

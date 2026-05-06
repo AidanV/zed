@@ -5,7 +5,7 @@ pub mod script;
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -123,13 +123,14 @@ pub fn file_to_snippets_with_context(
             // evaluate it (with empty captures) and parse the result, catching
             // bad LSP-snippet output at load time. Regex snippets are expanded
             // lazily because their bodies typically depend on capture values.
+            let compiled = Arc::new(script::CompiledBody::compile(&body));
             if regex.is_none() {
                 // Use a scope pre-populated with empty strings for all known
                 // LSP variable names so Rhai bodies that reference them
                 // (e.g. `TM_FILENAME + " ..."`) can validate at load time.
                 let validation_vars = SnippetVariables::lsp_defaults_empty();
-                let validation_body = script::CompiledBody::compile(&body)
-                    .evaluate(&[], &validation_vars)
+                let validation_body = compiled
+                    .evaluate(&[], &validation_vars, &BTreeMap::new())
                     .with_context(|| format!("Invalid snippet '{name}' in {source:?}"))?;
                 let substituted =
                     snippet::substitute_variables(&validation_body, &validation_vars);
@@ -139,8 +140,11 @@ pub fn file_to_snippets_with_context(
                     ));
                 }
             }
+            let compiled_body = OnceLock::new();
+            let _ = compiled_body.set(compiled);
             Ok(Arc::new(Snippet {
                 body,
+                compiled_body,
                 prefix: prefixes,
                 description,
                 name,
@@ -253,6 +257,13 @@ pub struct Snippet {
     /// (e.g. completion-menu filter text). Use [`Snippet::evaluate`] to obtain
     /// the expanded body string with capture interpolation applied.
     pub body: String,
+    /// Cached compiled form of `body`. Populated at load time by
+    /// [`file_to_snippets_with_context`]; in tests it is left empty and
+    /// initialized on first [`Snippet::evaluate`] call. Either way, repeated
+    /// `evaluate` calls — including the editor's reactive re-evaluation on
+    /// every keystroke inside an active tabstop — don't pay the Rhai compile
+    /// cost more than once.
+    pub compiled_body: OnceLock<Arc<script::CompiledBody>>,
     pub description: Option<String>,
     pub name: String,
     pub auto: bool,
@@ -276,8 +287,21 @@ impl Snippet {
     /// output via [`snippet::substitute_variables`]. If the body did not
     /// parse as Rhai (e.g. legacy text bodies), the source is returned
     /// unchanged before substitution.
-    pub fn evaluate(&self, captures: &[&str], variables: &SnippetVariables) -> Result<String> {
-        let raw = script::CompiledBody::compile(&self.body).evaluate(captures, variables)?;
+    ///
+    /// `current_tabstops` exposes the user's typed text inside each active
+    /// tabstop to the body via the Rhai `tabstop(n)` accessor. Pass an empty
+    /// map for the initial expansion; the editor passes a populated map on
+    /// each reactive re-evaluation.
+    pub fn evaluate(
+        &self,
+        captures: &[&str],
+        variables: &SnippetVariables,
+        current_tabstops: &BTreeMap<usize, String>,
+    ) -> Result<String> {
+        let compiled = self
+            .compiled_body
+            .get_or_init(|| Arc::new(script::CompiledBody::compile(&self.body)));
+        let raw = compiled.evaluate(captures, variables, current_tabstops)?;
         Ok(snippet::substitute_variables(&raw, variables))
     }
 
@@ -647,7 +671,7 @@ Matrix
     let s = "\\begin{pmatrix}\n";
     for i in 0..r {
       for j in 0..c {
-        s += tabstop();
+        s += next_tabstop();
         if j < c - 1 { s += " & "; }
       }
       if i < r - 1 { s += " \\\\"; }
@@ -665,16 +689,16 @@ Matrix
                 .collect();
         assert_eq!(snippets.len(), 3, "all three snippets should load");
 
-        let alpha = snippets["alpha"].evaluate(&[], &SnippetVariables::default()).unwrap();
+        let alpha = snippets["alpha"].evaluate(&[], &SnippetVariables::default(), &BTreeMap::new()).unwrap();
         assert_eq!(alpha, r"\alpha");
 
         let hat = snippets["Hat over letter"]
-            .evaluate(&["xhat", "x"], &SnippetVariables::default())
+            .evaluate(&["xhat", "x"], &SnippetVariables::default(), &BTreeMap::new())
             .unwrap();
         assert_eq!(hat, r"\hat{x}");
 
         let matrix = snippets["Matrix"]
-            .evaluate(&["pmat2x3", "2", "3"], &SnippetVariables::default())
+            .evaluate(&["pmat2x3", "2", "3"], &SnippetVariables::default(), &BTreeMap::new())
             .unwrap();
         assert!(matrix.contains("$1 & $2 & $3"), "got: {matrix}");
         assert!(matrix.contains("$4 & $5 & $6"), "got: {matrix}");
@@ -756,7 +780,7 @@ Letter subscript digit
             .filter_map(Result::ok)
             .collect();
         assert_eq!(snippets.len(), 1);
-        let body = snippets[0].evaluate(&[], &SnippetVariables::default()).unwrap();
+        let body = snippets[0].evaluate(&[], &SnippetVariables::default(), &BTreeMap::new()).unwrap();
         assert_eq!(body, r"\alpha", "body should keep backslash");
     }
 
@@ -773,7 +797,7 @@ Letter subscript digit
             .collect();
         assert_eq!(snippets.len(), 1);
         assert_eq!(
-            snippets[0].evaluate(&[], &SnippetVariables::default()).unwrap(),
+            snippets[0].evaluate(&[], &SnippetVariables::default(), &BTreeMap::new()).unwrap(),
             "^{2}"
         );
     }
@@ -793,7 +817,7 @@ Letter subscript digit
         let mut vars = SnippetVariables::default();
         vars.insert("TM_FILENAME", "main.rs");
         vars.insert("CURRENT_YEAR", "2026");
-        let body = snippets[0].evaluate(&[], &vars).unwrap();
+        let body = snippets[0].evaluate(&[], &vars, &BTreeMap::new()).unwrap();
         assert_eq!(body, "% main.rs (2026)");
     }
 
@@ -816,7 +840,7 @@ Letter subscript digit
         assert_eq!(snippets.len(), 1, "expected one snippet");
         let mut vars = SnippetVariables::default();
         vars.insert("TM_FILENAME", "main.rs");
-        let body = snippets[0].evaluate(&[], &vars).unwrap();
+        let body = snippets[0].evaluate(&[], &vars, &BTreeMap::new()).unwrap();
         assert_eq!(body, "% main.rs");
     }
 
@@ -964,7 +988,9 @@ Overridden
         let cap_strs: Vec<&str> = (0..captures.len())
             .map(|i| captures.get(i).map(|c| c.as_str()).unwrap_or(""))
             .collect();
-        let body = snippets[0].evaluate(&cap_strs, &SnippetVariables::default()).unwrap();
+        let body = snippets[0]
+            .evaluate(&cap_strs, &SnippetVariables::default(), &BTreeMap::new())
+            .unwrap();
         assert_eq!(body, r"\frac{ \partial x }{ \partial y } ");
     }
 

@@ -1175,6 +1175,15 @@ pub struct Editor {
     deferred_selection_effects_state: Option<DeferredSelectionEffectsState>,
     autoclose_regions: Vec<AutocloseRegion>,
     snippet_stack: InvalidationStack<SnippetState>,
+    /// Set by callers immediately before they invoke `insert_snippet` when the
+    /// snippet's body should re-evaluate on every tabstop edit. `insert_snippet`
+    /// drains it into the new `SnippetState`.
+    pending_reactive_snippet: Option<PendingReactiveContext>,
+    /// Set while `refresh_snippet_transforms` is applying its own buffer edits;
+    /// the resulting `Edited` event re-enters that handler, and without this
+    /// guard a non-converging re-eval (e.g. structural mismatch logged on
+    /// every iteration) could spin.
+    refreshing_snippet_transforms: bool,
     select_syntax_node_history: SelectSyntaxNodeHistory,
     ime_transaction: Option<TransactionId>,
     pub diagnostics_max_severity: DiagnosticSeverity,
@@ -1754,9 +1763,46 @@ struct AutocloseRegion {
 #[derive(Debug)]
 struct SnippetState {
     ranges: Vec<Vec<Range<Anchor>>>,
+    /// Per-tabstop list of LSP `${N/regex/replacement/flags}` transforms whose
+    /// rendered output lives in the buffer at fixed anchor ranges. Re-applied
+    /// whenever the source tabstop's text changes so the transform stays in
+    /// sync with what the user has typed.
+    transforms: Vec<Vec<TabstopTransformRuntime>>,
     active_index: usize,
     choices: Vec<Option<Vec<String>>>,
+    /// When `Some`, the snippet body is re-evaluated on every tabstop edit so
+    /// scripted bodies that read `tabstop_value(n)` reflect what the user has
+    /// typed.
+    reactive: Option<ReactiveSnippet>,
 }
+
+#[derive(Clone, Debug)]
+struct TabstopTransformRuntime {
+    ranges: Vec<Range<Anchor>>,
+    regex: String,
+    replacement: String,
+    flags: String,
+}
+
+#[derive(Clone, Debug)]
+struct ReactiveSnippet {
+    compiled_body: Arc<project::snippet_provider::script::CompiledBody>,
+    captures: Vec<String>,
+    variables: snippet::SnippetVariables,
+    /// Buffer offset where this snippet's text begins. Anchored `Bias::Left`
+    /// so insertions before the snippet shift it forward. Reactive re-eval is
+    /// only enabled for single-site insertions; for multi-cursor expansions,
+    /// `between_segments` is empty and re-eval is skipped.
+    snippet_start: Anchor,
+}
+
+#[derive(Clone)]
+struct PendingReactiveContext {
+    compiled_body: Arc<project::snippet_provider::script::CompiledBody>,
+    captures: Vec<String>,
+    variables: snippet::SnippetVariables,
+}
+
 
 #[doc(hidden)]
 pub struct RenameState {
@@ -2454,6 +2500,8 @@ impl Editor {
             deferred_selection_effects_state: None,
             autoclose_regions: Vec::new(),
             snippet_stack: InvalidationStack::default(),
+            pending_reactive_snippet: None,
+            refreshing_snippet_transforms: false,
             select_syntax_node_history: SelectSyntaxNodeHistory::default(),
             ime_transaction: None,
             active_diagnostics: ActiveDiagnostic::None,
@@ -5271,14 +5319,7 @@ impl Editor {
                 }
             }
             let auto_expanded = this.try_auto_expand_snippet(bracket_inserted, window, cx);
-            if auto_expanded {
-                // The buffer was just rewritten by snippet expansion; any
-                // open completion menu is now stale (e.g. the user typed
-                // `sum`, the snippet replaced it with `\sum`, but the menu
-                // would still be filtering against `sum`). Hide it so the
-                // expansion isn't shadowed by leftover completions.
-                this.hide_context_menu(window, cx);
-            } else {
+            if !auto_expanded {
                 this.trigger_completion_on_input(&text, trigger_in_words, window, cx);
             }
             refresh_linked_ranges(this, window, cx);
@@ -6253,7 +6294,14 @@ impl Editor {
 
         // Hide the current completions menu when query is empty. Without this, cached
         // completions from before the trigger char may be reused (#32774).
-        if query.is_none() && menu_is_open {
+        // Snippet choice pickers are exempt — they're populated from the
+        // snippet body's `${1|...|}` list, not from the buffer text, so an
+        // empty query is the normal state when the cursor first lands on the
+        // tabstop placeholder.
+        if query.is_none()
+            && menu_is_open
+            && completions_source != Some(CompletionsMenuSource::SnippetChoices)
+        {
             self.hide_context_menu(window, cx);
         }
 
@@ -11135,7 +11183,14 @@ impl Editor {
         // must agree on the same body and consumed length; otherwise we'd
         // need to insert different snippets at different positions, which
         // can't share a single tabstop stack.
-        let mut expansions: Vec<(usize, usize, String)> = Vec::with_capacity(cursors.len());
+        let mut expansions: Vec<(
+            usize,
+            usize,
+            String,
+            Arc<project::snippet_provider::Snippet>,
+            Vec<String>,
+            snippet::SnippetVariables,
+        )> = Vec::with_capacity(cursors.len());
         for &cursor in &cursors {
             let cursor_anchor = multibuffer_snapshot.anchor_before(MultiBufferOffset(cursor));
             let Some((buffer_anchor, _)) =
@@ -11200,9 +11255,13 @@ impl Editor {
                     let cap_strs: Vec<&str> = (0..captures.len())
                         .map(|i| captures.get(i).map(|c| c.as_str()).unwrap_or(""))
                         .collect();
+                    let captures_owned: Vec<String> =
+                        cap_strs.iter().map(|s| s.to_string()).collect();
                     let consumed = window_text.len() - m.start();
-                    let body = snippet.evaluate(&cap_strs, &snippet_vars).log_err()?;
-                    Some((body, consumed))
+                    let body = snippet
+                        .evaluate(&cap_strs, &snippet_vars, &BTreeMap::new())
+                        .log_err()?;
+                    Some((body, consumed, snippet.clone(), captures_owned))
                 } else {
                     snippet
                         .prefix
@@ -11210,29 +11269,40 @@ impl Editor {
                         .find_map(|prefix| match_auto_prefix(&window_text, prefix))
                         .and_then(|consumed| {
                             snippet
-                                .evaluate(&[], &snippet_vars)
+                                .evaluate(&[], &snippet_vars, &BTreeMap::new())
                                 .log_err()
-                                .map(|body| (body, consumed))
+                                .map(|body| (body, consumed, snippet.clone(), Vec::new()))
                         })
                 }
             });
 
-            let Some((body, consumed)) = matched else {
+            let Some((body, consumed, matched_snippet, captures)) = matched else {
                 return false;
             };
-            expansions.push((cursor, consumed, body));
+            expansions.push((
+                cursor,
+                consumed,
+                body,
+                matched_snippet,
+                captures,
+                snippet_vars,
+            ));
         }
 
-        let (_, consumed, body) = &expansions[0];
+        let (_, consumed, body, matched_snippet, captures, snippet_vars) = &expansions[0];
         let consumed = *consumed;
+        let body = body.clone();
+        let matched_snippet = matched_snippet.clone();
+        let captures = captures.clone();
+        let snippet_vars = snippet_vars.clone();
         if !expansions
             .iter()
-            .all(|(_, c, b)| *c == consumed && b == body)
+            .all(|(_, c, b, _, _, _)| *c == consumed && b == &body)
         {
             return false;
         }
 
-        let parsed = match snippet::Snippet::parse(body) {
+        let parsed = match snippet::Snippet::parse(&body) {
             Ok(s) => s,
             Err(_) => return false,
         };
@@ -11246,7 +11316,7 @@ impl Editor {
         // and lives in `[cursor, cursor + pair.end.len())`.
         let autoclose_lengths: Vec<usize> = expansions
             .iter()
-            .map(|(cursor, _, _)| {
+            .map(|(cursor, _, _, _, _, _)| {
                 if !consume_autoclose {
                     return 0;
                 }
@@ -11266,11 +11336,35 @@ impl Editor {
         let ranges: Vec<_> = expansions
             .iter()
             .zip(autoclose_lengths.iter())
-            .map(|((cursor, _, _), trailing)| {
+            .map(|((cursor, _, _, _, _, _), trailing)| {
                 MultiBufferOffset(cursor.saturating_sub(consumed))
                     ..MultiBufferOffset(*cursor + *trailing)
             })
             .collect();
+
+        // The expansion will rewrite the prefix the user just typed, so any
+        // open completion menu is filtering against text that's about to
+        // disappear. Drop it before expansion so the menu that
+        // `insert_snippet` may open for a choice tabstop (e.g.
+        // `${1|a,b,c|}`) is not blanket-dismissed by `handle_input`'s
+        // post-expansion cleanup.
+        self.hide_context_menu(window, cx);
+
+        // Hand off the reactive context so `insert_snippet` can attach it to
+        // the SnippetState it pushes; the buffer-edit handler then re-evaluates
+        // the body on every tabstop edit.
+        self.pending_reactive_snippet = Some(PendingReactiveContext {
+            compiled_body: matched_snippet
+                .compiled_body
+                .get_or_init(|| {
+                    Arc::new(project::snippet_provider::script::CompiledBody::compile(
+                        &matched_snippet.body,
+                    ))
+                })
+                .clone(),
+            captures,
+            variables: snippet_vars,
+        });
 
         self.insert_snippet(&ranges, parsed, window, cx)
             .log_err()
@@ -11288,9 +11382,12 @@ impl Editor {
             is_end_tabstop: bool,
             ranges: Vec<Range<T>>,
             choices: Option<Vec<String>>,
+            transforms: Vec<TabstopTransformRuntime>,
         }
 
-        let tabstops = self.buffer.update(cx, |buffer, cx| {
+        let snippet_start_offset = insertion_ranges.first().map(|r| r.start);
+
+        let (tabstops, snippet_start_anchor) = self.buffer.update(cx, |buffer, cx| {
             let snippet_text: Arc<str> = snippet.text.clone().into();
             let edits = insertion_ranges
                 .iter()
@@ -11303,7 +11400,25 @@ impl Editor {
 
             let snapshot = &*buffer.read(cx);
             let snippet = &snippet;
-            snippet
+            let map_range_to_anchors =
+                |snippet_range: &Range<isize>| -> Vec<Range<Anchor>> {
+                    let mut delta = 0_isize;
+                    insertion_ranges
+                        .iter()
+                        .map(|insertion_range| {
+                            let insertion_start = insertion_range.start + delta;
+                            delta += snippet.text.len() as isize
+                                - (insertion_range.end - insertion_range.start) as isize;
+                            let start =
+                                (insertion_start + snippet_range.start).min(snapshot.len());
+                            let end =
+                                (insertion_start + snippet_range.end).min(snapshot.len());
+                            snapshot.anchor_before(start)..snapshot.anchor_after(end)
+                        })
+                        .collect()
+                };
+
+            let tabstops = snippet
                 .tabstops
                 .iter()
                 .map(|tabstop| {
@@ -11313,29 +11428,34 @@ impl Editor {
                     let mut tabstop_ranges = tabstop
                         .ranges
                         .iter()
-                        .flat_map(|tabstop_range| {
-                            let mut delta = 0_isize;
-                            insertion_ranges.iter().map(move |insertion_range| {
-                                let insertion_start = insertion_range.start + delta;
-                                delta += snippet.text.len() as isize
-                                    - (insertion_range.end - insertion_range.start) as isize;
-
-                                let start =
-                                    (insertion_start + tabstop_range.start).min(snapshot.len());
-                                let end = (insertion_start + tabstop_range.end).min(snapshot.len());
-                                snapshot.anchor_before(start)..snapshot.anchor_after(end)
-                            })
-                        })
+                        .flat_map(|tabstop_range| map_range_to_anchors(tabstop_range))
                         .collect::<Vec<_>>();
                     tabstop_ranges.sort_unstable_by(|a, b| a.start.cmp(&b.start, snapshot));
+
+                    let transforms = tabstop
+                        .transforms
+                        .iter()
+                        .map(|t| TabstopTransformRuntime {
+                            ranges: map_range_to_anchors(&t.range),
+                            regex: t.regex.clone(),
+                            replacement: t.replacement.clone(),
+                            flags: t.flags.clone(),
+                        })
+                        .collect::<Vec<_>>();
 
                     Tabstop {
                         is_end_tabstop,
                         ranges: tabstop_ranges,
                         choices: tabstop.choices.clone(),
+                        transforms,
                     }
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+
+            let snippet_start_anchor =
+                snippet_start_offset.map(|offset| snapshot.anchor_before(offset));
+
+            (tabstops, snippet_start_anchor)
         });
         if let Some(tabstop) = tabstops.first() {
             self.change_selections(Default::default(), window, cx, |s| {
@@ -11357,17 +11477,37 @@ impl Editor {
                     .iter()
                     .map(|tabstop| tabstop.choices.clone())
                     .collect();
+                let transforms = tabstops
+                    .iter()
+                    .map(|tabstop| tabstop.transforms.clone())
+                    .collect();
 
                 let ranges = tabstops
                     .into_iter()
                     .map(|tabstop| tabstop.ranges)
                     .collect::<Vec<_>>();
 
+                let reactive = self
+                    .pending_reactive_snippet
+                    .take()
+                    .zip(snippet_start_anchor)
+                    .filter(|_| insertion_ranges.len() == 1)
+                    .map(|(ctx, snippet_start)| ReactiveSnippet {
+                        compiled_body: ctx.compiled_body,
+                        captures: ctx.captures,
+                        variables: ctx.variables,
+                        snippet_start,
+                    });
+
                 self.snippet_stack.push(SnippetState {
                     active_index: 0,
                     ranges,
+                    transforms,
                     choices,
+                    reactive,
                 });
+            } else {
+                self.pending_reactive_snippet = None;
             }
 
             // Check whether the just-entered snippet ends with an auto-closable bracket.
@@ -11430,6 +11570,286 @@ impl Editor {
             }
         }
         Ok(())
+    }
+
+    /// Refreshes runtime-owned snippet text after a buffer edit:
+    /// 1. Re-evaluates the Rhai body (if reactive) with the user's current
+    ///    tabstop values and rewrites every "between" segment whose text has
+    ///    changed.
+    /// 2. Re-applies LSP `${N/regex/replacement/flags}` transforms.
+    ///
+    /// Both passes are idempotent: a write that matches the buffer is skipped,
+    /// which prevents the re-entrant `Edited` event they queue from looping.
+    fn refresh_snippet_transforms(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.snippet_stack.is_empty() || self.refreshing_snippet_transforms {
+            return;
+        }
+        self.refreshing_snippet_transforms = true;
+
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+
+        // Plan reactive rebuilds. For each reactive snippet on the stack:
+        //   1. Read the user's current text in each tabstop placeholder.
+        //   2. Re-evaluate the Rhai body with those values.
+        //   3. Parse the result. If it has the same number of tabstops as the
+        //      original, build the new buffer text by walking the parsed
+        //      structure and substituting the user's text for each placeholder.
+        //   4. Replace the snippet's full span with the new text and re-anchor
+        //      every tabstop range to the position dictated by the new
+        //      structure. This sidesteps the anchor-bias collisions you'd hit
+        //      trying to surgically rewrite individual segments.
+        struct ReactiveRebuild {
+            state_idx: usize,
+            start: usize,
+            end: usize,
+            rebuilt: String,
+            new_offsets_and_lengths: Vec<(usize, usize)>,
+        }
+
+        let mut planned_rebuilds: Vec<ReactiveRebuild> = Vec::new();
+        for (state_idx, state) in self.snippet_stack.iter().enumerate() {
+            let Some(reactive) = &state.reactive else {
+                continue;
+            };
+            let snippet_start: MultiBufferOffset =
+                reactive.snippet_start.to_offset(&snapshot);
+
+            let mut current_tabstops: std::collections::BTreeMap<usize, String> =
+                std::collections::BTreeMap::new();
+            let mut user_texts: Vec<String> = Vec::with_capacity(state.ranges.len());
+            let mut snippet_end = snippet_start.0;
+            for (idx, ranges) in state.ranges.iter().enumerate() {
+                let text = ranges
+                    .first()
+                    .map(|r| snapshot.text_for_range(r.clone()).collect::<String>())
+                    .unwrap_or_default();
+                current_tabstops.insert(idx + 1, text.clone());
+                user_texts.push(text);
+                if let Some(r) = ranges.last() {
+                    let e: MultiBufferOffset = r.end.to_offset(&snapshot);
+                    snippet_end = snippet_end.max(e.0);
+                }
+            }
+
+            let new_body = match reactive.compiled_body.evaluate(
+                &reactive
+                    .captures
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<&str>>(),
+                &reactive.variables,
+                &current_tabstops,
+            ) {
+                Ok(s) => s,
+                Err(err) => {
+                    log::warn!("snippet body re-evaluation failed: {err:#}");
+                    continue;
+                }
+            };
+            let substituted =
+                snippet::substitute_variables(&new_body, &reactive.variables);
+            let parsed = match snippet::Snippet::parse(&substituted) {
+                Ok(p) => p,
+                Err(err) => {
+                    log::warn!("re-evaluated snippet body failed to parse: {err:#}");
+                    continue;
+                }
+            };
+            if parsed.tabstops.len() != state.ranges.len() {
+                continue;
+            }
+
+            // Walk the parsed text, splicing in user_texts at each tabstop's
+            // first range. Record the new buffer offset & length each tabstop
+            // ends up occupying.
+            let mut spans: Vec<(usize, isize, isize)> = Vec::new();
+            for (idx, ts) in parsed.tabstops.iter().enumerate() {
+                if let Some(r) = ts.ranges.first() {
+                    spans.push((idx, r.start, r.end));
+                }
+            }
+            spans.sort_by_key(|(_, start, _)| *start);
+
+            let mut rebuilt = String::with_capacity(parsed.text.len());
+            let mut cursor: isize = 0;
+            let mut new_offsets_and_lengths: Vec<(usize, usize)> =
+                vec![(0, 0); parsed.tabstops.len()];
+            for (idx, span_start, span_end) in &spans {
+                if *span_start > cursor {
+                    rebuilt
+                        .push_str(&parsed.text[cursor as usize..*span_start as usize]);
+                }
+                let s = snippet_start.0 + rebuilt.len();
+                let user = &user_texts[*idx];
+                rebuilt.push_str(user);
+                new_offsets_and_lengths[*idx] = (s, user.len());
+                cursor = *span_end;
+            }
+            if (cursor as usize) < parsed.text.len() {
+                rebuilt.push_str(&parsed.text[cursor as usize..]);
+            }
+
+            // Tabstops that have no `ranges` (they only appear as transforms
+            // or are otherwise placeholder-less) get their offset/length set
+            // from their first transform range, falling back to the snippet's
+            // end position with zero length.
+            for (idx, ts) in parsed.tabstops.iter().enumerate() {
+                if ts.ranges.is_empty() {
+                    let first_t = ts.transforms.first().map(|t| t.range.start as usize);
+                    let pos = first_t
+                        .map(|p| snippet_start.0 + p)
+                        .unwrap_or(snippet_start.0 + rebuilt.len());
+                    new_offsets_and_lengths[idx] = (pos, 0);
+                }
+            }
+
+            planned_rebuilds.push(ReactiveRebuild {
+                state_idx,
+                start: snippet_start.0,
+                end: snippet_end,
+                rebuilt,
+                new_offsets_and_lengths,
+            });
+        }
+
+        let mut applied = false;
+        for plan in planned_rebuilds {
+            let current_text: String = snapshot
+                .text_for_range(MultiBufferOffset(plan.start)..MultiBufferOffset(plan.end))
+                .collect();
+            if current_text == plan.rebuilt {
+                continue;
+            }
+
+            // Capture each selection head/tail as a (tabstop_idx, offset)
+            // pair so we can restore the cursor inside the same logical
+            // tabstop after the rebuild rewrites the whole snippet span.
+            let pre_state = &self.snippet_stack[plan.state_idx];
+            let display_snapshot = self.display_snapshot(cx);
+            let captured_selections: Vec<[Option<(usize, usize)>; 2]> = self
+                .selections
+                .all_anchors(&display_snapshot)
+                .iter()
+                .map(|sel| {
+                    let mut endpoints = [None, None];
+                    for (slot, anchor) in endpoints.iter_mut().zip([sel.start, sel.end]) {
+                        let off: MultiBufferOffset = anchor.to_offset(&snapshot);
+                        for (idx, ranges) in pre_state.ranges.iter().enumerate() {
+                            if let Some(r) = ranges.first() {
+                                let s: MultiBufferOffset = r.start.to_offset(&snapshot);
+                                let e: MultiBufferOffset = r.end.to_offset(&snapshot);
+                                if s.0 <= off.0 && off.0 <= e.0 {
+                                    *slot = Some((idx, off.0 - s.0));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    endpoints
+                })
+                .collect();
+
+            applied = true;
+            self.buffer.update(cx, |buffer, cx| {
+                buffer.edit(
+                    [(
+                        MultiBufferOffset(plan.start)..MultiBufferOffset(plan.end),
+                        plan.rebuilt,
+                    )],
+                    None,
+                    cx,
+                );
+            });
+            let new_snapshot = self.buffer.read(cx).snapshot(cx);
+            let state = &mut self.snippet_stack[plan.state_idx];
+            for (idx, (offset, length)) in plan.new_offsets_and_lengths.iter().enumerate() {
+                let start_anchor =
+                    new_snapshot.anchor_before(MultiBufferOffset(*offset));
+                let end_anchor =
+                    new_snapshot.anchor_after(MultiBufferOffset(*offset + *length));
+                if let Some(slot) = state.ranges.get_mut(idx) {
+                    *slot = vec![start_anchor..end_anchor];
+                }
+            }
+
+            // Restore the captured selections inside their original tabstops.
+            // Selections that weren't inside any tabstop fall back to the
+            // start of the active tabstop, which is the closest reasonable
+            // location post-rebuild.
+            let resolve = |captured: Option<(usize, usize)>| -> MultiBufferOffset {
+                if let Some((idx, off_within)) = captured
+                    && let Some((new_start, new_len)) =
+                        plan.new_offsets_and_lengths.get(idx).copied()
+                {
+                    return MultiBufferOffset(new_start + off_within.min(new_len));
+                }
+                plan.new_offsets_and_lengths
+                    .first()
+                    .map(|(s, _)| MultiBufferOffset(*s))
+                    .unwrap_or(MultiBufferOffset(plan.start))
+            };
+            let new_selection_ranges: Vec<Range<MultiBufferOffset>> = captured_selections
+                .into_iter()
+                .map(|endpoints| resolve(endpoints[0])..resolve(endpoints[1]))
+                .collect();
+            if !new_selection_ranges.is_empty() {
+                self.change_selections(Default::default(), window, cx, |s| {
+                    s.select_ranges(new_selection_ranges);
+                });
+            }
+        }
+
+        // Refresh LSP `${N/regex/replacement/flags}` transforms against the
+        // current buffer state. These regions are overwritten by the rebuild
+        // above when the body emits literal text for them, so this pass is a
+        // no-op in that case; otherwise (static-body snippets) it carries the
+        // existing transform-react behavior.
+        let final_snapshot = if applied {
+            self.buffer.read(cx).snapshot(cx)
+        } else {
+            snapshot
+        };
+        let mut transform_edits: Vec<(Range<Anchor>, String)> = Vec::new();
+        for state in self.snippet_stack.iter() {
+            for (tabstop_idx, transforms) in state.transforms.iter().enumerate() {
+                if transforms.is_empty() {
+                    continue;
+                }
+                let Some(source_range) = state.ranges[tabstop_idx].first() else {
+                    continue;
+                };
+                let source_text = final_snapshot
+                    .text_for_range(source_range.clone())
+                    .collect::<String>();
+                for transform in transforms {
+                    let output = snippet::apply_transform(
+                        &source_text,
+                        &transform.regex,
+                        &transform.replacement,
+                        &transform.flags,
+                    );
+                    for range in &transform.ranges {
+                        let current = final_snapshot
+                            .text_for_range(range.clone())
+                            .collect::<String>();
+                        if current != output {
+                            transform_edits.push((range.clone(), output.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        if !transform_edits.is_empty() {
+            self.buffer.update(cx, |buffer, cx| {
+                buffer.edit(transform_edits, None, cx);
+            });
+        }
+
+        self.refreshing_snippet_transforms = false;
     }
 
     pub fn move_to_next_snippet_tabstop(
@@ -16750,7 +17170,7 @@ impl Editor {
                 .into_iter()
                 .find(|snippet| snippet.name == *name)
                 .context("snippet not found")?;
-            Snippet::parse(&snippet.evaluate(&[], &snippet_vars)?)?
+            Snippet::parse(&snippet.evaluate(&[], &snippet_vars, &BTreeMap::new())?)?
         } else {
             // todo(andrew): open modal to select snippet
             bail!("`name` or `snippet` is required")
@@ -25318,6 +25738,7 @@ impl Editor {
                 edited_buffer,
                 is_local,
             } => {
+                self.refresh_snippet_transforms(window, cx);
                 self.scrollbar_marker_state.dirty = true;
                 self.active_indent_guides_state.dirty = true;
                 self.refresh_active_diagnostics(cx);
@@ -28745,7 +29166,9 @@ fn snippet_completions(
                 let ((snippet_index, prefix_index), matching_prefix, _snippet_word_count) =
                     sorted_snippet_candidates[string_match.candidate_id];
                 let snippet = &snippets[snippet_index];
-                let body = snippet.evaluate(&[], &snippet_vars).log_err()?;
+                let body = snippet
+                    .evaluate(&[], &snippet_vars, &BTreeMap::new())
+                    .log_err()?;
                 let start = buffer_offset - buffer_window_len;
                 let start = snapshot.anchor_before(start);
                 let range = start..buffer_anchor;
@@ -28820,7 +29243,10 @@ fn snippet_completions(
                 let cap_strs: Vec<&str> = (0..captures.len())
                     .map(|i| captures.get(i).map(|c| c.as_str()).unwrap_or(""))
                     .collect();
-                let Some(new_text) = snippet.evaluate(&cap_strs, &snippet_vars).log_err() else {
+                let Some(new_text) = snippet
+                    .evaluate(&cap_strs, &snippet_vars, &BTreeMap::new())
+                    .log_err()
+                else {
                     continue;
                 };
                 let consumed = max_buffer_window.len() - m.start();

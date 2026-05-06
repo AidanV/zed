@@ -1446,6 +1446,7 @@ async fn hidden_edit_prediction_snippet_test_context(
                 let snippet = project::snippet_provider::Snippet {
                     prefix: vec!["Theta".to_string(), "turnstile".to_string()],
                     body: r#""⊢""#.to_string(),
+                    compiled_body: Default::default(),
                     description: Some("unicode symbol".to_string()),
                     name: "unicode snippets".to_string(),
                     auto: false,

@@ -2,18 +2,24 @@ use anyhow::{Context as _, Result, anyhow};
 use rhai::{AST, Dynamic, Engine, OptimizationLevel, Scope};
 use snippet::{LSP_VARIABLE_NAMES, SnippetVariables};
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 thread_local! {
     /// Per-evaluation tabstop counter. Reset to 1 at the start of each
-    /// `evaluate` call. The `tabstop()` Rhai function reads and increments it.
+    /// `evaluate` call. The `next_tabstop()` Rhai function reads and increments it.
     static TABSTOP_COUNTER: Cell<usize> = const { Cell::new(1) };
 
     /// Set of ancestor tree-sitter node kinds active for the current
     /// `is_active` evaluation. `None` outside `is_active` so that body
     /// evaluation doesn't accidentally treat undefined identifiers as `false`.
     static ACTIVE_NODE_KINDS: RefCell<Option<BTreeSet<String>>> = const { RefCell::new(None) };
+
+    /// Live tabstop values for the current `evaluate` call. Populated when
+    /// the editor re-evaluates a snippet body in response to user edits, so
+    /// that scripted bodies can branch on what the user has typed via
+    /// `tabstop(n)`. Cleared at the end of each call.
+    static TABSTOP_VALUES: RefCell<BTreeMap<usize, String>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 fn next_tabstop() -> String {
@@ -23,6 +29,18 @@ fn next_tabstop() -> String {
         v
     });
     format!("${n}")
+}
+
+fn tabstop_value(n: i64) -> String {
+    if n < 0 {
+        return String::new();
+    }
+    TABSTOP_VALUES.with(|m| {
+        m.borrow()
+            .get(&(n as usize))
+            .cloned()
+            .unwrap_or_default()
+    })
 }
 
 /// Configures the shared Rhai engine used for snippet body evaluation.
@@ -42,7 +60,8 @@ fn engine() -> &'static Engine {
         engine.set_max_array_size(1_024);
         engine.set_max_map_size(1_024);
         engine.set_optimization_level(OptimizationLevel::Simple);
-        engine.register_fn("tabstop", next_tabstop);
+        engine.register_fn("next_tabstop", next_tabstop);
+        engine.register_fn("tabstop_value", tabstop_value);
         // `on_var` is marked deprecated only because Rhai considers it
         // "volatile". We rely on it intentionally for the active-predicate
         // lookup; if the API changes upstream this is the one place to update.
@@ -77,7 +96,12 @@ impl CompiledBody {
         }
     }
 
-    pub fn evaluate(&self, captures: &[&str], variables: &SnippetVariables) -> Result<String> {
+    pub fn evaluate(
+        &self,
+        captures: &[&str],
+        variables: &SnippetVariables,
+        current_tabstops: &BTreeMap<usize, String>,
+    ) -> Result<String> {
         match self {
             Self::Static(body) => Ok(body.clone()),
             Self::Dynamic(ast) => {
@@ -102,9 +126,12 @@ impl CompiledBody {
                 }
 
                 TABSTOP_COUNTER.with(|c| c.set(1));
+                TABSTOP_VALUES.with(|m| *m.borrow_mut() = current_tabstops.clone());
                 let result = engine()
                     .eval_ast_with_scope::<Dynamic>(&mut scope, ast)
-                    .map_err(|e| anyhow!("snippet body evaluation failed: {e}"))?;
+                    .map_err(|e| anyhow!("snippet body evaluation failed: {e}"));
+                TABSTOP_VALUES.with(|m| m.borrow_mut().clear());
+                let result = result?;
 
                 if result.is_string() {
                     result.into_string().map_err(|e| anyhow!("{e}"))
@@ -123,7 +150,7 @@ impl CompiledBody {
 pub fn validate(source: &str) -> Result<CompiledBody> {
     let compiled = CompiledBody::compile(source);
     let expanded = compiled
-        .evaluate(&[], &SnippetVariables::default())
+        .evaluate(&[], &SnippetVariables::default(), &BTreeMap::new())
         .with_context(|| "evaluating body with empty captures")?;
     snippet::Snippet::parse(&expanded).with_context(|| "parsing expanded body")?;
     Ok(compiled)
@@ -187,14 +214,14 @@ mod tests {
     #[test]
     fn static_body_passes_through() {
         let body = CompiledBody::compile(r"\hat{$1}$0");
-        let result = body.evaluate(&[], &no_vars()).unwrap();
+        let result = body.evaluate(&[], &no_vars(), &BTreeMap::new()).unwrap();
         assert_eq!(result, r"\hat{$1}$0");
     }
 
     #[test]
     fn rhai_string_literal_evaluates() {
         let body = CompiledBody::compile(r#""\\alpha""#);
-        let result = body.evaluate(&[], &no_vars()).unwrap();
+        let result = body.evaluate(&[], &no_vars(), &BTreeMap::new()).unwrap();
         assert_eq!(result, r"\alpha");
     }
 
@@ -209,16 +236,16 @@ mod tests {
             if key in m { m[key] } else { captures[0] }
         "#,
         );
-        assert_eq!(body.evaluate(&["@a", "a"], &no_vars()).unwrap(), r"\alpha");
-        assert_eq!(body.evaluate(&["@b", "b"], &no_vars()).unwrap(), r"\beta");
+        assert_eq!(body.evaluate(&["@a", "a"], &no_vars(), &BTreeMap::new()).unwrap(), r"\alpha");
+        assert_eq!(body.evaluate(&["@b", "b"], &no_vars(), &BTreeMap::new()).unwrap(), r"\beta");
         // Unknown letter: fall back to original text.
-        assert_eq!(body.evaluate(&["@z", "z"], &no_vars()).unwrap(), "@z");
+        assert_eq!(body.evaluate(&["@z", "z"], &no_vars(), &BTreeMap::new()).unwrap(), "@z");
     }
 
     #[test]
     fn captures_are_bound() {
         let body = CompiledBody::compile(r#"`\hat{${captures[1]}}`"#);
-        let result = body.evaluate(&["xhat", "x"], &no_vars()).unwrap();
+        let result = body.evaluate(&["xhat", "x"], &no_vars(), &BTreeMap::new()).unwrap();
         assert_eq!(result, r"\hat{x}");
     }
 
@@ -230,7 +257,7 @@ mod tests {
         let mut vars = SnippetVariables::default();
         vars.insert("TM_FILENAME", "main.rs");
         vars.insert("CURRENT_YEAR", "2026");
-        let result = body.evaluate(&[], &vars).unwrap();
+        let result = body.evaluate(&[], &vars, &BTreeMap::new()).unwrap();
         assert_eq!(result, "main.rs :: 2026");
     }
 
@@ -243,12 +270,12 @@ mod tests {
         let body = CompiledBody::compile(
             r#"if LINE_COMMENT != "" { LINE_COMMENT + " todo" } else { "no comment syntax" }"#,
         );
-        let result = body.evaluate(&[], &no_vars()).unwrap();
+        let result = body.evaluate(&[], &no_vars(), &BTreeMap::new()).unwrap();
         assert_eq!(result, "no comment syntax");
 
         let mut vars = SnippetVariables::default();
         vars.insert("LINE_COMMENT", "//");
-        let result = body.evaluate(&[], &vars).unwrap();
+        let result = body.evaluate(&[], &vars, &BTreeMap::new()).unwrap();
         assert_eq!(result, "// todo");
     }
 
@@ -259,8 +286,63 @@ mod tests {
         let body = CompiledBody::compile(r#"TM_FILENAME.to_upper()"#);
         let mut vars = SnippetVariables::default();
         vars.insert("TM_FILENAME", "main.rs");
-        let result = body.evaluate(&[], &vars).unwrap();
+        let result = body.evaluate(&[], &vars, &BTreeMap::new()).unwrap();
         assert_eq!(result, "MAIN.RS");
+    }
+
+    #[test]
+    fn tabstop_value_returns_current_value() {
+        let body = CompiledBody::compile(r#"tabstop_value(1).to_upper()"#);
+        let mut values = BTreeMap::new();
+        values.insert(1, "hello".to_string());
+        let result = body.evaluate(&[], &no_vars(), &values).unwrap();
+        assert_eq!(result, "HELLO");
+    }
+
+    #[test]
+    fn tabstop_value_returns_empty_when_unset() {
+        // Load-time validation passes an empty map; bodies must not error
+        // on tabstop access in that case.
+        let body = CompiledBody::compile(r#"tabstop_value(1) + "!""#);
+        let result = body.evaluate(&[], &no_vars(), &BTreeMap::new()).unwrap();
+        assert_eq!(result, "!");
+    }
+
+    #[test]
+    fn tabstop_values_do_not_leak_across_calls() {
+        let body = CompiledBody::compile(r#"tabstop_value(2)"#);
+        let mut values = BTreeMap::new();
+        values.insert(2, "first".to_string());
+        let first = body.evaluate(&[], &no_vars(), &values).unwrap();
+        assert_eq!(first, "first");
+        // Second call without values: previous values must not bleed in.
+        let second = body.evaluate(&[], &no_vars(), &BTreeMap::new()).unwrap();
+        assert_eq!(second, "");
+    }
+
+    #[test]
+    fn rhai_string_concat_with_tabstop_value() {
+        // Mirrors the editor-side reactive snippet body:
+        // `"${1:foo}-" + tabstop_value(1).to_upper()`.
+        let body = CompiledBody::compile(r#""${1:foo}-" + tabstop_value(1).to_upper()"#);
+        assert!(matches!(body, CompiledBody::Dynamic(_)),
+            "body should compile as Rhai, not fall back to Static");
+        let mut values = BTreeMap::new();
+        values.insert(1, "bar".to_string());
+        let result = body.evaluate(&[], &no_vars(), &values).unwrap();
+        assert_eq!(result, "${1:foo}-BAR");
+    }
+
+    #[test]
+    fn next_tabstop_and_tabstop_value_coexist() {
+        // `next_tabstop()` (allocates a new $N) and `tabstop_value(n)` (reads
+        // current value) must both work in the same body.
+        let body =
+            CompiledBody::compile(r#"next_tabstop() + " " + tabstop_value(1)"#);
+        let mut values = BTreeMap::new();
+        values.insert(1, "world".to_string());
+        let result = body.evaluate(&[], &no_vars(), &values).unwrap();
+        assert_eq!(result, "$1 world");
     }
 
     #[test]
@@ -271,7 +353,7 @@ mod tests {
             let s = "\\begin{pmatrix}\n";
             for i in 0..r {
                 for j in 0..c {
-                    s += tabstop();
+                    s += next_tabstop();
                     if j < c - 1 { s += " & "; }
                 }
                 if i < r - 1 { s += " \\\\"; }
@@ -281,7 +363,7 @@ mod tests {
         "#;
         let body = CompiledBody::compile(source);
         let result = body
-            .evaluate(&["pmat2x3", "2", "3"], &no_vars())
+            .evaluate(&["pmat2x3", "2", "3"], &no_vars(), &BTreeMap::new())
             .unwrap_or_else(|e| panic!("evaluation failed: {e}"));
         assert!(
             result.contains("$1 & $2 & $3"),
@@ -298,7 +380,7 @@ mod tests {
     #[test]
     fn infinite_loop_is_halted_by_op_limit() {
         let body = CompiledBody::compile(r#"loop { 1 + 1 }"#);
-        let result = body.evaluate(&[], &no_vars());
+        let result = body.evaluate(&[], &no_vars(), &BTreeMap::new());
         assert!(result.is_err(), "expected operation limit to halt loop");
     }
 
@@ -306,7 +388,7 @@ mod tests {
     fn no_filesystem_access() {
         // `open_file` and `read_file` are not registered.
         let body = CompiledBody::compile(r#"open_file("/etc/passwd")"#);
-        let result = body.evaluate(&[], &no_vars());
+        let result = body.evaluate(&[], &no_vars(), &BTreeMap::new());
         assert!(result.is_err(), "expected filesystem call to fail");
     }
 
@@ -324,7 +406,7 @@ mod tests {
             r#"spawn("sh")"#,
         ] {
             let compiled = CompiledBody::compile(snippet);
-            match (&compiled, compiled.evaluate(&[], &no_vars())) {
+            match (&compiled, compiled.evaluate(&[], &no_vars(), &BTreeMap::new())) {
                 (CompiledBody::Static(_), Ok(out)) => {
                     assert_eq!(out, snippet, "static fallback should return source verbatim");
                 }
@@ -346,7 +428,7 @@ mod tests {
             s
         "#,
         );
-        let result = body.evaluate(&[], &no_vars());
+        let result = body.evaluate(&[], &no_vars(), &BTreeMap::new());
         assert!(
             result.is_err(),
             "expected string-size limit to halt growth, got: {result:?}"
@@ -387,7 +469,7 @@ mod tests {
         assert!(pred.evaluate(&kinds).unwrap());
 
         let body = CompiledBody::compile("inline_formula");
-        let result = body.evaluate(&[], &no_vars());
+        let result = body.evaluate(&[], &no_vars(), &BTreeMap::new());
         assert!(
             matches!(&body, CompiledBody::Static(_)) || result.is_err(),
             "body referencing a node kind should not silently get a bool: {result:?}"
@@ -403,7 +485,7 @@ mod tests {
             rec(0)
         "#,
         );
-        let result = body.evaluate(&[], &no_vars());
+        let result = body.evaluate(&[], &no_vars(), &BTreeMap::new());
         assert!(
             result.is_err(),
             "expected call-depth limit to halt recursion, got: {result:?}"
