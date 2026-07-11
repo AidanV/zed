@@ -105,6 +105,7 @@ zeroize.workspace = true
 zlog.workspace = true
 ztracing.workspace = true
 tracing.workspace = true
+rope.workspace = true
 
 [dev-dependencies]
 client = { workspace = true, features = ["test-support"] }
