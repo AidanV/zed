@@ -61,9 +61,9 @@ crates/ted/
     palette.rs          # theme Hsla -> terminal colors (§12)
 ```
 
-`ted` is a working title taken from the branch name (**t**erminal **ed**itor).
-It is short, does not collide with an existing crate, and nothing in this
-document depends on it. Rename before merge if desired.
+`ted` stands for **T**UI **Z**ed. It is short, does not collide with an
+existing crate, and nothing in this document depends on it. Rename before
+merge if desired.
 
 ### 3.1 Implementation conventions
 
@@ -108,7 +108,8 @@ every editor and vim entry point takes `&mut Window`. Three consequences:
   the `DispatchTree` built during the previous frame's paint. `Editor`'s
   actions are registered inside its element (`register_action` →
   `window.on_action`, `crates/editor/src/element.rs:10630`). If nothing draws,
-  no keybinding resolves.
+  no keybinding resolves (§4.2.1 has the exact call chain, and why it's paint
+  specifically, not layout, that this depends on).
 - **Layout produces state the editor needs.** Soft-wrap width, visible line
   count and horizontal viewport are computed during
   `EditorElement::prepaint` (`crates/editor/src/element.rs:8050-8055`,
@@ -154,7 +155,7 @@ Each frame:
 1. Terminal events are translated to `gpui::Keystroke` / `PlatformInput` and
    dispatched into the headless `Window` exactly as a real platform would.
 2. GPUI lays out the real Zed element tree at a size derived from the terminal
-   grid, and discards the resulting scene.
+   grid, and discards the resulting scene (§4.2.1).
 3. `ted` reads a **`ViewSnapshot`** (§10) out of the entities — display rows,
    syntax chunks, selections, cursor, scroll offset, vim mode, active modal —
    and paints it with Ratatui.
@@ -164,6 +165,91 @@ dictating it. Geometry cannot drift between the two, and drawing tabs, docks or
 a project panel later needs no new mechanism: those elements report their cell
 rects the same way. `ted` tells the backend the terminal size, which is the
 window size, and reads cell rectangles back (§10.2).
+
+### 4.2.1 What "layout, then discard" means precisely
+
+Step 2 is doing two GPUI-internal passes at once, and the shipped code never
+lets them be pulled apart. The call chain from a platform redraw event down to
+the actual discard:
+
+| Stage | What runs | Citation |
+|---|---|---|
+| Platform registers the frame callback | `platform_window.on_request_frame(callback)` | `crates/gpui/src/window.rs:1551`; trait method at `platform.rs:837` |
+| Platform invokes it on vsync/redraw | e.g. macOS's `CVDisplayLink` calling the stored closure | `gpui_macos/src/window.rs:2701-2831` |
+| Callback builds the frame | `window.draw(cx)` | entry point `window.rs:2811`; its own doc comment reads "Produces a new frame ... To actually show the contents ... use `Self::present`" |
+| ↳ layout (`DrawPhase::Prepaint`) | `draw_roots`: `root_element.request_layout` then `prepaint_as_root` | `window.rs:2987-3054` |
+| ↳ paint (`DrawPhase::Paint`) | `draw_roots`: `root_element.paint` | `window.rs:3057-3071` |
+| Callback shows the frame | `window.present()` | `window.rs:1656`; body at `window.rs:2960` |
+| ↳ hand the `Scene` to the platform | `self.platform_window.draw(&self.rendered_frame.scene)` | `window.rs:2962` |
+| `ted`'s override of that call — the actual discard | `TerminalWindow::draw(&Scene)` is a no-op | §6.1 |
+
+`Window::draw` only *builds* `Scene` into `self.rendered_frame`; nothing is
+shown yet, by GPUI's own design — that separation between "build the frame"
+and "show the frame" is an existing seam `ted` reuses, not one it has to carve
+out. `Window::present` is the single call site that hands the finished `Scene`
+to the platform. On a real platform that reaches a Metal or wgpu renderer
+(`gpui_macos/src/metal_renderer.rs:446`;
+`gpui_linux/src/linux/{x11,wayland}/window.rs:1703`/`:1707`) which walks the
+scene and issues GPU commands. `TerminalWindow` implements that same trait
+method and does nothing with its argument — so
+"discards the resulting scene" names one specific call site, not a general
+skipping of work.
+
+**Layout and paint are separable at the `Element` API, but not in the pipeline
+`ted` runs.** `Element::request_layout`, `::prepaint` and `::paint`
+(`crates/gpui/src/element.rs:73-104`) are independent trait methods, and
+`AnyElement::layout_as_root` (`element.rs:499-549`, `:632-639`) does call
+layout without ever touching paint. But `draw_roots` — the function
+`Window::draw` actually calls — runs prepaint and paint back to back
+unconditionally; there is no parameter or branch that stops after prepaint.
+The only "don't draw" switch that exists is `GpuiMode::Test { skip_drawing }`
+(`app.rs:651-673`), a test-only escape hatch that skips both passes together,
+not paint alone. So `ted` cannot get "layout without painting" for free through
+the normal `request_frame` path.
+
+**That turns out to be fortunate: `ted` needs paint to run anyway.**
+`EditorElement` registers vim's and the editor's keybindings into the dispatch
+tree from inside `paint`, not prepaint — `register_actions` /
+`register_key_listeners` are called at `element.rs:9478-9479`, which call the
+free function `register_action` (`element.rs:10630`) → `window.on_action`
+(`window.rs:5814`), and `on_action` opens with
+`self.invalidator.debug_assert_paint()` (`window.rs:5819`) — calling it from
+prepaint would trip that assertion. So §4.1's "actions require a rendered
+element tree" is stricter than "layout": specifically the *paint* phase must
+run every frame for vim's keybindings to exist in the dispatch tree at all.
+This is also why §7's frame loop cannot economize by asking GPUI to
+layout-only on a quiet frame — the moment a keystroke needs to resolve, paint
+must have run since the last input.
+
+By contrast, `Editor::last_bounds` (§10.2) — the geometry `ted`'s
+`ViewSnapshot` reads — is written during *prepaint*, before paint starts:
+`editor.last_bounds = Some(bounds)` at `element.rs:8048`, inside
+`EditorElement::prepaint` (`element.rs:7971-9456`). So the geometry `ted`
+depends on is already committed by the time the (discarded) painting begins;
+paint's only effect `ted` relies on is the dispatch-tree registration above,
+not any further geometry.
+
+**What's actually thrown away, and why that costs almost nothing extra.**
+`Scene` (`crates/gpui/src/scene.rs:41-53`) is seven parallel vectors —
+`shadows`, `quads`, `paths`, `underlines`, `monochrome_sprites`,
+`subpixel_sprites`, `polychrome_sprites`, `surfaces` — each populated through
+`Scene::insert_primitive` (`scene.rs:87`). Text specifically:
+`Window::paint_glyph` (`window.rs:4143`) runs once per shaped glyph, called
+from `text_system/line.rs:535`, and rasterizes into the sprite atlas before
+pushing a `MonochromeSprite` / `SubpixelSprite` that carries a `tile:
+AtlasTile` (`scene.rs:711-764`) — by the time a glyph reaches `Scene` it is
+already an opaque atlas-tile handle, not even a `GlyphId` any more; the
+`GlyphId` + `FontId` pair exists only transiently as the atlas lookup key
+(`RenderGlyphParams`, `text_system.rs:1023`). This is the same fact §4.3's
+rejected-approaches table invokes against painting the real `Scene` as text —
+by the time a primitive is in `Scene`, there is nothing left to reverse-map.
+It is also why discarding it costs `ted` almost nothing beyond the layout and
+paint traversal itself: `CellTextSystem::rasterize_glyph` (§5.6) is a 1×1
+transparent-tile stub, so every atlas lookup `paint_glyph` performs is
+trivial, and the `Scene` left behind is a handful of small vectors of
+already-cheap primitives, not a rendered framebuffer. The real cost of step 2
+is the traversal — accounted for in §19's frame budget — not the scene it
+happens to leave behind.
 
 ### 4.3 Rejected approaches
 
@@ -957,7 +1043,7 @@ collaborator presence somewhere. Both are additive.
 
 | Stage | Budget (80×24) | Notes |
 |---|---|---|
-| GPUI layout of the Zed tree | < 2ms | Only on dirty frames; GPUI's view cache skips clean subtrees. |
+| GPUI layout + paint of the Zed tree (§4.2.1 — the two run as one traversal, not two) | < 2ms | Only on dirty frames; GPUI's view cache skips clean subtrees. |
 | `ViewSnapshot` construction | < 1ms | Dominated by `highlighted_chunks` over ≤ rows lines. |
 | Ratatui render + diff | < 1ms | |
 | Terminal write + flush | < 3ms | Usually the largest term; Ratatui's diffing keeps the byte count small. |
