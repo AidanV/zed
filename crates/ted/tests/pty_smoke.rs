@@ -31,6 +31,9 @@ struct Terminal {
     writer: Box<dyn Write + Send>,
     output: mpsc::Receiver<Vec<u8>>,
     screen: Screen,
+    /// Every byte `ted` has written, which is the only way to assert on the
+    /// terminal *modes* it set: they leave no trace on the screen.
+    transcript: Vec<u8>,
     rows: u16,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
@@ -53,6 +56,11 @@ impl Terminal {
         command.arg(file);
         command.arg("--user-data-dir");
         command.arg(data_dir);
+        // A child `ted` suspends to inherits this, so a scripted one can record
+        // what it did next to the file under test using a relative path.
+        if let Some(parent) = file.parent() {
+            command.cwd(parent);
+        }
         for argument in extra {
             command.arg(argument);
         }
@@ -79,10 +87,16 @@ impl Terminal {
             writer,
             output,
             screen: Screen::new(COLUMNS, ROWS),
+            transcript: Vec::new(),
             rows: ROWS,
             child,
             _master: pty.master,
         })
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        self.transcript.extend_from_slice(chunk);
+        self.screen.feed(chunk);
     }
 
     /// Feeds output into the screen model until it has been quiet for [`QUIET`],
@@ -99,7 +113,7 @@ impl Terminal {
         while Instant::now() < deadline {
             match self.output.recv_timeout(QUIET) {
                 Ok(chunk) => {
-                    self.screen.feed(&chunk);
+                    self.feed(&chunk);
                     quiet_since = Instant::now();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -113,14 +127,101 @@ impl Terminal {
     }
 
     fn send(&mut self, keys: &str) {
+        self.type_keys(keys);
+        self.settle(AFTER_KEYS);
+    }
+
+    /// Types without waiting for the screen to settle. While a child owns the
+    /// terminal `ted` paints nothing, so there is no frame to wait for and the
+    /// keys are not `ted`'s to answer.
+    fn type_keys(&mut self, keys: &str) {
         self.writer.write_all(keys.as_bytes()).ok();
         self.writer.flush().ok();
-        self.settle(AFTER_KEYS);
+    }
+
+    /// Waits for a scripted child to record that it reached a point, still
+    /// draining output so a full pty buffer can never be what blocks it.
+    fn wait_for_file(&mut self, path: &std::path::Path, timeout: Duration) -> anyhow::Result<()> {
+        self.wait_until(path, |_| true, timeout)
+    }
+
+    /// Waits for a scripted child to record *what* it did. The shell creates
+    /// the file when it opens the redirect and writes to it afterwards, so
+    /// existence alone does not mean the contents are there yet.
+    fn wait_for_contents(
+        &mut self,
+        path: &std::path::Path,
+        wanted: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        self.wait_until(path, |contents| contents.trim() == wanted, timeout)
+            .map_err(|_| {
+                let contents = std::fs::read_to_string(path).unwrap_or_default();
+                anyhow::anyhow!("{} holds {contents:?}, not {wanted:?}", path.display())
+            })
+    }
+
+    fn wait_until(
+        &mut self,
+        path: &std::path::Path,
+        ready: impl Fn(&str) -> bool,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Ok(contents) = std::fs::read_to_string(path)
+                && ready(&contents)
+            {
+                return Ok(());
+            }
+            match self.output.recv_timeout(Duration::from_millis(50)) {
+                Ok(chunk) => self.feed(&chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        anyhow::bail!("{} never appeared", path.display())
+    }
+
+    fn transcript_mark(&self) -> usize {
+        self.transcript.len()
+    }
+
+    /// Waits for `ted` to write something in particular.
+    ///
+    /// This is how a suspended `ted` is observed at all: it is not painting, so
+    /// the screen model has nothing to say, and it is out of raw mode, so a key
+    /// typed before it asks for one sits in the terminal's line buffer where no
+    /// reader can see it until the next byte arrives.
+    fn wait_for_output(&mut self, needle: &str, timeout: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.transcript_since(0).contains(needle) {
+                return Ok(());
+            }
+            match self.output.recv_timeout(Duration::from_millis(50)) {
+                Ok(chunk) => self.feed(&chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        anyhow::bail!("ted never wrote {needle:?}")
+    }
+
+    fn transcript_since(&self, mark: usize) -> String {
+        String::from_utf8_lossy(self.transcript.get(mark..).unwrap_or_default()).into_owned()
     }
 
     /// Resizes the pty, which delivers SIGWINCH to `ted` exactly as a terminal
     /// emulator would.
     fn resize(&mut self, columns: u16, rows: u16) {
+        self.resize_quietly(columns, rows);
+        self.settle(AFTER_KEYS);
+    }
+
+    /// Resizes without waiting for a frame. While `ted` is suspended nothing
+    /// repaints, so waiting would only burn the timeout.
+    fn resize_quietly(&mut self, columns: u16, rows: u16) {
         self._master
             .resize(PtySize {
                 rows,
@@ -131,7 +232,6 @@ impl Terminal {
             .ok();
         self.screen = Screen::new(columns, rows);
         self.rows = rows;
-        self.settle(AFTER_KEYS);
     }
 
     fn row(&self, index: u16) -> String {
@@ -325,6 +425,12 @@ impl Fixture {
 
     fn file(&self) -> std::path::PathBuf {
         self.directory.join("main.rs")
+    }
+
+    /// Somewhere for a scripted child to record what it did, next to the file
+    /// under test and cleaned up with it.
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self.directory.join(name)
     }
 
     fn data_dir(&self) -> std::path::PathBuf {
@@ -552,6 +658,135 @@ fn no_vim_types_printable_characters_straight_into_the_buffer() -> anyhow::Resul
     );
     // The file itself is untouched until something saves it.
     assert_eq!(fixture.contents(), "alpha\n");
+    Ok(())
+}
+
+#[test]
+fn a_suspended_child_owns_the_input_and_ted_takes_the_terminal_back() -> anyhow::Result<()> {
+    let (fixture, mut terminal) = open("suspend", "alpha\nbeta\n")?;
+    let started = fixture.path("started");
+    let captured = fixture.path("captured");
+    let mark = terminal.transcript_mark();
+
+    // A scripted child rather than a real file manager, so the test depends on
+    // nothing being installed (SPEC §20.3). It blocks on stdin, which is
+    // exactly where a reader thread that had not parked would steal the input.
+    terminal.send(":!echo yes > started; read line; echo $line > captured");
+    terminal.type_keys("\r");
+    terminal.wait_for_file(&started, Duration::from_secs(10))?;
+
+    terminal.type_keys("hello\r");
+    terminal.wait_for_contents(&captured, "hello", Duration::from_secs(10))?;
+
+    // The child has exited and `ted` is holding the screen so its output can be
+    // read; any key hands the screen back.
+    terminal.wait_for_output("press any key", AFTER_KEYS)?;
+    terminal.send(" ");
+
+    // Ratatui's diff buffer describes the screen as it was before the child
+    // painted over it, so a resume that did not force a full repaint would
+    // leave the grid blank.
+    assert!(
+        terminal.row(0).ends_with("alpha"),
+        "the buffer was not repainted after the child: {:?}",
+        terminal.row(0)
+    );
+    // `hello` as vim motions ends in `o`, which opens a line and enters insert
+    // mode, so a leaked keystroke cannot hide here.
+    let status = terminal.status();
+    assert!(
+        status.starts_with("NORMAL main.rs"),
+        "the child's input reached ted: {status:?}"
+    );
+    assert!(
+        !status.contains("[+]"),
+        "the child's input edited the buffer: {status:?}"
+    );
+
+    let transcript = terminal.transcript_since(mark);
+    assert!(
+        transcript.contains("\u{1b}[?1049l"),
+        "ted kept the alternate screen while the child ran"
+    );
+    assert!(
+        transcript.contains("\u{1b}[?1049h"),
+        "ted did not take the alternate screen back"
+    );
+    assert!(
+        transcript.contains("\u{1b}[>"),
+        "the keyboard enhancement flags were not pushed again on resume"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_resize_while_suspended_is_recovered_and_a_failure_is_reported() -> anyhow::Result<()> {
+    // 60 columns of text: it fits on one row at 80 columns and cannot at 50.
+    let (fixture, mut terminal) = open("suspend-resize", &format!("{}\n", "ab ".repeat(20)))?;
+    let suspended = fixture.path("suspended");
+
+    terminal.send(":!touch suspended; exit 3");
+    terminal.type_keys("\r");
+    // The child running is what proves the terminal has been handed over; the
+    // screen says nothing, because a suspended `ted` paints nothing.
+    terminal.wait_for_file(&suspended, Duration::from_secs(10))?;
+
+    // The reader is parked, so no `Event::Resize` is delivered, and the one the
+    // terminal queues is consumed by the prompt `ted` is holding the screen
+    // with. Re-querying the grid on resume is the only thing that can recover
+    // this (SPEC §7.1).
+    terminal.resize_quietly(50, 20);
+    terminal.wait_for_output("press any key", AFTER_KEYS)?;
+    let mark = terminal.transcript_mark();
+    terminal.send(" ");
+    if terminal.status().is_empty() {
+        let rows: Vec<String> = (0..20).map(|r| terminal.row(r)).collect();
+        panic!("ROWS: {rows:#?}\nAFTER KEY: {:?}", terminal.transcript_since(mark));
+    }
+
+    assert!(
+        terminal.status().starts_with("NORMAL main.rs"),
+        "the status line is not on the new last row: {:?}",
+        terminal.status()
+    );
+    assert!(
+        terminal.row(1).contains("ab"),
+        "the editor was not relaid out at the new size: {:?}",
+        terminal.row(1)
+    );
+    // A non-zero exit is reported rather than swallowed; the notification line
+    // sits directly above the status line.
+    let notification = terminal.row(terminal.rows - 2);
+    assert!(
+        notification.contains("exit status: 3"),
+        "the child's failure was not reported: {notification:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn interrupting_the_child_does_not_take_ted_with_it() -> anyhow::Result<()> {
+    let (_fixture, mut terminal) = open("suspend-interrupt", "alpha\n")?;
+
+    terminal.send(":!sleep 30\r");
+    // Out of raw mode the terminal turns ctrl-C back into a signal, and sends
+    // it to every process in the foreground process group — `ted` included
+    // (SPEC §7.1).
+    terminal.type_keys("\u{3}");
+    terminal.wait_for_output("press any key", AFTER_KEYS)?;
+    terminal.send(" ");
+
+    assert!(
+        !terminal.exited(Duration::from_millis(500)),
+        "ted did not survive a ctrl-C aimed at its child"
+    );
+    // A frame `ted` painted after the suspension, rather than the one left on
+    // screen from before it.
+    let notification = terminal.row(ROWS - 2);
+    assert!(
+        notification.contains("signal"),
+        "the interrupted child was not reported: {notification:?}"
+    );
     Ok(())
 }
 

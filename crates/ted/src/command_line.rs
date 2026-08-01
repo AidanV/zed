@@ -30,9 +30,33 @@ pub enum Update {
     Cancel,
 }
 
+/// A `:` command that means something only because `ted` owns a tty (SPEC
+/// §13.4). These cannot go through the interceptor, which resolves a query to a
+/// `Box<dyn Action>`; they suspend the process instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostCommand {
+    /// `:!<command>` — run a command with the terminal to itself.
+    Shell(String),
+}
+
+/// What `enter` does with the completion the user chose.
+pub enum Effect {
+    Dispatch(Box<dyn Action>),
+    Host(HostCommand),
+}
+
+impl Clone for Effect {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Dispatch(action) => Self::Dispatch(action.boxed_clone()),
+            Self::Host(command) => Self::Host(command.clone()),
+        }
+    }
+}
+
 struct Completion {
     label: String,
-    action: Box<dyn Action>,
+    effect: Effect,
 }
 
 pub struct CommandLine {
@@ -174,11 +198,22 @@ impl CommandLine {
 
     /// Recomputes the completion list for the current query.
     ///
-    /// The interceptor is vim's, so `:w`, `:42` and `:%s/a/b/g` resolve to real
-    /// actions with no parsing here. When it declines the query — or is
-    /// non-exclusive — `ted` falls back to matching action names, which is the
-    /// same policy Zed's own palette applies.
+    /// The host table is checked first (SPEC §13.4). Everything else goes to
+    /// vim's interceptor, so `:w`, `:42` and `:%s/a/b/g` resolve to real actions
+    /// with no parsing here. When it declines the query — or is non-exclusive —
+    /// `ted` falls back to matching action names, which is the same policy Zed's
+    /// own palette applies.
     pub async fn refresh(&mut self, workspace: WeakEntity<Workspace>, cx: &mut AsyncApp) {
+        if let Some(command) = host_command(&self.query) {
+            self.completions = vec![Completion {
+                label: "run in this terminal".to_owned(),
+                effect: Effect::Host(command),
+            }];
+            self.selected = Some(0);
+            self.message = None;
+            return;
+        }
+
         let query = self.query.clone();
         let intercepted = cx
             .update(|cx| GlobalCommandPaletteInterceptor::intercept(&query, workspace.clone(), cx));
@@ -190,7 +225,7 @@ impl CommandLine {
             exclusive = result.exclusive;
             completions.extend(result.results.into_iter().map(|item| Completion {
                 label: item.string,
-                action: item.action,
+                effect: Effect::Dispatch(item.action),
             }));
         }
 
@@ -207,12 +242,26 @@ impl CommandLine {
         self.completions = completions;
     }
 
-    /// The action `enter` should dispatch: the selected completion, or the
-    /// first one when the user never cycled.
-    pub fn selected_action(&self) -> Option<Box<dyn Action>> {
+    /// What `enter` should do: the selected completion's effect, or the first
+    /// one's when the user never cycled.
+    pub fn selected_effect(&self) -> Option<Effect> {
         let index = self.selected.unwrap_or(0);
-        Some(self.completions.get(index)?.action.boxed_clone())
+        Some(self.completions.get(index)?.effect.clone())
     }
+}
+
+/// The host-command table (SPEC §13.4), checked before the interceptor.
+///
+/// `:!` is the whole table, and only in its bare form. vim resolves that one to
+/// a `SpawnInTerminal` aimed at a terminal panel `ted` does not have, so it is
+/// dead here without a host that owns a tty; its other forms — `:%!sort`,
+/// `:.,.+3!fmt`, `:r!date` — filter buffer text through the command and are
+/// real editor edits, so they stay with the interceptor
+/// (`crates/vim/src/command.rs`). A range has been seeded into the query as a
+/// prefix by then, which is what makes the two distinguishable here.
+fn host_command(query: &str) -> Option<HostCommand> {
+    let command = query.strip_prefix('!')?.trim();
+    (!command.is_empty()).then(|| HostCommand::Shell(command.to_owned()))
 }
 
 /// Actions whose humanized name contains every character of `query` in order,
@@ -241,7 +290,7 @@ fn matching_action_names(query: &str, cx: &mut App) -> Vec<Completion> {
         }
         matches.push(Completion {
             label: humanized,
-            action,
+            effect: Effect::Dispatch(action),
         });
     }
 
@@ -344,6 +393,26 @@ mod tests {
         assert_eq!(line.query(), "s/é/e/");
         line.handle_key(&key(KeyCode::Backspace));
         assert_eq!(line.query(), "s/é/e");
+    }
+
+    #[test]
+    fn only_the_bare_bang_is_a_host_command() {
+        assert_eq!(
+            host_command("!ls -l"),
+            Some(HostCommand::Shell("ls -l".to_owned()))
+        );
+        assert_eq!(
+            host_command("! git commit "),
+            Some(HostCommand::Shell("git commit".to_owned()))
+        );
+        assert_eq!(host_command("!"), None);
+        assert_eq!(host_command("w"), None);
+        // The forms vim turns into buffer edits keep their meaning: a range has
+        // already been seeded into the query when one is in play.
+        assert_eq!(host_command("'<,'>!sort"), None);
+        assert_eq!(host_command(".,.+3!fmt"), None);
+        assert_eq!(host_command("%!sort"), None);
+        assert_eq!(host_command("r!date"), None);
     }
 
     #[test]

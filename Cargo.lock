@@ -18705,6 +18705,7 @@ dependencies = [
  "gpui_tokio",
  "language",
  "languages",
+ "libc",
  "log",
  "menu",
  "multi_buffer",

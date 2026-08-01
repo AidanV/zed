@@ -67,6 +67,11 @@ workspace.workspace = true
 zed_actions.workspace = true
 zlog.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# Suspending ignores the terminal-generated signals for the child's lifetime and
+# restores them in the child before `exec` (SPEC §7.1).
+libc.workspace = true
+
 [dev-dependencies]
 editor = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }

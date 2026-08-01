@@ -22,19 +22,20 @@ use crossterm::terminal::{
 use crossterm::{execute, queue};
 use editor::Editor;
 use futures::StreamExt as _;
-use futures::channel::mpsc::UnboundedSender;
 use gpui::{App, AppContext as _, AsyncApp, Entity};
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend as _, CrosstermBackend};
 use theme::ActiveTheme as _;
+use util::ResultExt as _;
 
 use crate::bootstrap::{self, Backend};
-use crate::command_line::{CommandLine, Update};
+use crate::command_line::{CommandLine, Effect, HostCommand, Update};
 use crate::input::keystroke_for;
 use crate::palette::{ColorDepth, Palette};
 use crate::platform::{TerminalPlatform, TerminalWindowState, set_window_grid};
 use crate::render::{render, reserved_rows};
 use crate::snapshot::{CommandLineView, CursorShape, StatusView, ViewSnapshot};
+use crate::suspend::{self, Reader};
 
 /// Below this the editor's width arithmetic goes negative, which is not a case
 /// Zed is expected to handle (SPEC §10.2).
@@ -126,33 +127,15 @@ fn start(
     Ok(())
 }
 
-/// A plain OS thread rather than an event source wired into three different run
-/// loops. `crossterm::event::read` blocks, and the channel send is what wakes
-/// the foreground executor — `examples/wake_probe.rs` measures that path.
-fn spawn_reader_thread(sender: UnboundedSender<Event>) {
-    std::thread::spawn(move || {
-        loop {
-            match crossterm::event::read() {
-                Ok(event) => {
-                    // `REPORT_EVENT_TYPES` makes the terminal report releases,
-                    // and nothing downstream acts on one: each would cost a
-                    // draw and a projection, and would clear a notification the
-                    // press that raised it had only just put on screen.
-                    if matches!(&event, Event::Key(key) if matches!(key.kind, KeyEventKind::Release))
-                    {
-                        continue;
-                    }
-                    if sender.unbounded_send(event).is_err() {
-                        return;
-                    }
-                }
-                Err(error) => {
-                    log::error!("terminal reader stopped: {error}");
-                    return;
-                }
-            }
-        }
-    });
+/// The terminal itself: what `ted` draws on, what it last drew there, and the
+/// thread reading from it. Grouped because a suspension gives up all three at
+/// once and has to re-assert all three on the way back (SPEC §7.1).
+struct Tty {
+    terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
+    /// The snapshot currently on screen, or `None` when the next frame must be
+    /// painted whatever it contains.
+    painted: Option<ViewSnapshot>,
+    reader: Reader,
 }
 
 /// The mutable state the loop carries between frames, kept together so the
@@ -189,7 +172,11 @@ async fn drive(
     terminal.hide_cursor().ok();
 
     let (sender, mut events) = futures::channel::mpsc::unbounded();
-    spawn_reader_thread(sender);
+    let mut tty = Tty {
+        terminal,
+        painted: None,
+        reader: Reader::spawn(sender),
+    };
 
     let mut session = Session {
         backend,
@@ -200,7 +187,6 @@ async fn drive(
         messages: Vec::new(),
         busy_frames: BUSY_FRAMES_AFTER_INPUT,
     };
-    let mut painted: Option<ViewSnapshot> = None;
     let mut reserved = u16::MAX;
 
     loop {
@@ -239,9 +225,9 @@ async fn drive(
         else {
             return Ok(());
         };
-        if painted.as_ref() != Some(&snapshot) {
-            paint(&mut terminal, &snapshot, &session.palette)?;
-            painted = Some(snapshot);
+        if tty.painted.as_ref() != Some(&snapshot) {
+            paint(&mut tty.terminal, &snapshot, &session.palette)?;
+            tty.painted = Some(snapshot);
             session.busy_frames = session.busy_frames.max(1);
         }
 
@@ -261,7 +247,6 @@ async fn drive(
             return Ok(());
         };
         session.busy_frames = BUSY_FRAMES_AFTER_INPUT;
-        session.messages.clear();
 
         // One event per frame, deliberately. Dispatching a queued burst together
         // would let a held key's backlog drain in fewer frames, but a keystroke
@@ -279,8 +264,18 @@ async fn drive(
             Event::Key(key) if is_quit(&key) && session.command_line.is_none() => {
                 return Ok(());
             }
-            Event::Key(key) => handle_key(&mut session, key, cx).await?,
+            Event::Key(key) => {
+                // `ted`'s own messages are transient: the next keystroke is the
+                // user acknowledging them. A resize is not — it may not even be
+                // something the user did.
+                session.messages.clear();
+                if let Some(command) = handle_key(&mut session, key, cx).await? {
+                    suspend_to(&mut session, &mut tty, command, &window_state, reserved, cx)
+                        .await?;
+                }
+            }
             Event::Paste(text) => {
+                session.messages.clear();
                 // One edit, not replayed keystrokes: replaying would run vim
                 // motions over the pasted text (SPEC §8.2).
                 if let Some(editor) = active_editor(&session, cx) {
@@ -299,25 +294,63 @@ async fn drive(
                 session.columns = new_columns;
                 session.rows = new_rows;
                 resize_window(&session, reserved, &window_state);
-                terminal.clear().ok();
-                painted = None;
+                force_full_repaint(&mut tty.terminal);
+                tty.painted = None;
             }
             Event::FocusGained | Event::FocusLost | Event::Mouse(_) => {}
         }
     }
 }
 
+/// Hands the terminal to a child process and takes it back (SPEC §7.1).
+///
+/// Nothing about the terminal is assumed on the way back: the child may have
+/// pushed its own keyboard flags or changed the cursor shape, painted over
+/// every cell Ratatui believes it knows, and been resized without `ted` ever
+/// hearing the `Event::Resize` its parked reader was not there to receive.
+async fn suspend_to(
+    session: &mut Session,
+    tty: &mut Tty,
+    command: HostCommand,
+    window_state: &TerminalWindowState,
+    reserved: u16,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let child = match command {
+        HostCommand::Shell(command) => suspend::Child::shell(&command),
+    };
+
+    let message = suspend::run(child, &tty.reader, &mut tty.terminal, cx).await?;
+    session.messages.extend(message);
+    tty.painted = None;
+
+    if let Some((columns, rows)) = crossterm::terminal::size().log_err() {
+        session.columns = columns;
+        session.rows = rows;
+    }
+    resize_window(session, reserved, window_state);
+    session.busy_frames = BUSY_FRAMES_AFTER_INPUT;
+    Ok(())
+}
+
 /// Routes a keystroke either into `ted`'s own `:` line or into GPUI's dispatch
 /// tree. The `:` line is the only thing `ted` handles itself; everything else,
 /// including `/` search, belongs to the backend.
-async fn handle_key(session: &mut Session, key: KeyEvent, cx: &mut AsyncApp) -> Result<()> {
+///
+/// Returns a host command when the keystroke asked for one, since running it
+/// needs the terminal itself rather than anything reachable from here.
+async fn handle_key(
+    session: &mut Session,
+    key: KeyEvent,
+    cx: &mut AsyncApp,
+) -> Result<Option<HostCommand>> {
     if session.command_line.is_some() {
         return handle_command_line_key(session, key, cx).await;
     }
 
     if opens_command_line(session, &key, cx) {
         let Some(editor) = active_editor(session, cx) else {
-            return Ok(());
+            return Ok(None);
         };
         let prefix = cx.update(|cx| crate::command_line::prefix_for(&editor, cx));
         let mut command_line = CommandLine::new(prefix);
@@ -325,11 +358,11 @@ async fn handle_key(session: &mut Session, key: KeyEvent, cx: &mut AsyncApp) -> 
             .refresh(session.backend.workspace.downgrade(), cx)
             .await;
         session.command_line = Some(command_line);
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(keystroke) = keystroke_for(&key) else {
-        return Ok(());
+        return Ok(None);
     };
     // Deliberately `App::update_window` rather than `WindowHandle::update`: the
     // latter holds a mutable borrow of the root view for the duration of the
@@ -338,16 +371,16 @@ async fn handle_key(session: &mut Session, key: KeyEvent, cx: &mut AsyncApp) -> 
         window.dispatch_keystroke(keystroke, cx);
     })
     .ok();
-    Ok(())
+    Ok(None)
 }
 
 async fn handle_command_line_key(
     session: &mut Session,
     key: KeyEvent,
     cx: &mut AsyncApp,
-) -> Result<()> {
+) -> Result<Option<HostCommand>> {
     let Some(command_line) = session.command_line.as_mut() else {
-        return Ok(());
+        return Ok(None);
     };
 
     match command_line.handle_key(&key) {
@@ -359,21 +392,22 @@ async fn handle_command_line_key(
         }
         Update::Cancel => session.command_line = None,
         Update::Submit => {
-            let action = command_line.selected_action();
+            let effect = command_line.selected_effect();
             let query = command_line.query().to_owned();
             session.command_line = None;
-            match action {
-                Some(action) => {
+            match effect {
+                Some(Effect::Dispatch(action)) => {
                     cx.update_window(session.backend.window.into(), |_, window, cx| {
                         window.dispatch_action(action, cx);
                     })
                     .ok();
                 }
+                Some(Effect::Host(command)) => return Ok(Some(command)),
                 None => session.messages.push(format!("not a command: :{query}")),
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// `:` opens `ted`'s command line whenever vim would have opened Zed's palette:
@@ -449,6 +483,17 @@ fn paint(
     }
     set_cursor_shape(snapshot.cursor_shape);
     Ok(())
+}
+
+/// Clears the screen and throws away Ratatui's record of what was on it, so the
+/// next draw emits every cell rather than the handful that changed.
+///
+/// `Terminal::clear` would do both, but only after asking the terminal where
+/// its cursor is and waiting on stdin for the answer — and it skips the reset
+/// when no answer comes, which is exactly the case that needs it most.
+pub(crate) fn force_full_repaint(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) {
+    terminal.backend_mut().clear().log_err();
+    terminal.swap_buffers();
 }
 
 /// The terminal blinks its own cursor, so its *shape* is how `ted` shows vim's
@@ -534,7 +579,10 @@ fn search_line(session: &Session, cx: &mut AsyncApp) -> Option<CommandLineView> 
     })
 }
 
-fn enter_terminal_mode() -> Result<()> {
+/// Idempotent, because a suspension leaves and re-enters terminal mode around
+/// the child, and re-emits all of this unconditionally rather than trusting
+/// that the child left the flag stack as it found it (SPEC §7.1).
+pub(crate) fn enter_terminal_mode() -> Result<()> {
     enable_raw_mode().context("could not enter raw mode")?;
     TERMINAL_IS_RAW.store(true, Ordering::SeqCst);
 
@@ -568,10 +616,10 @@ fn enter_terminal_mode() -> Result<()> {
     Ok(())
 }
 
-/// Idempotent, because it runs from both the panic hook and normal shutdown.
-/// `ted` owns the terminal's mode, so leaving it raw would hand the user a
-/// broken shell (SPEC §3.1, §7).
-fn restore_terminal_mode() {
+/// Idempotent, because it runs from the panic hook, from normal shutdown and
+/// from a suspension. `ted` owns the terminal's mode, so leaving it raw would
+/// hand the user a broken shell (SPEC §3.1, §7).
+pub(crate) fn restore_terminal_mode() {
     if !TERMINAL_IS_RAW.swap(false, Ordering::SeqCst) {
         return;
     }

@@ -1,6 +1,7 @@
 # `ted` — a terminal UI for Zed
 
-**Status:** M0 and M1 implemented (§21); M2 onward not started
+**Status:** M0 and M1 implemented (§21); M2 in progress — the suspend primitive
+(§7.1) and `:!` (§13.4) are in, the rest of M2 is not started
 **Scope:** a new crate + binary in this repository that presents Zed's editor as a
 full-screen terminal application, using Ratatui for presentation and Zed's own
 `editor` + `vim` + `workspace` + `project` crates for all behaviour.
@@ -617,9 +618,38 @@ resized without `ted` hearing about it. Resume queries
 `crossterm::terminal::size()` directly and drives the result through the normal
 `resize_to_cells` path (§10.2) rather than trusting the cached grid.
 
-The child inherits `ted`'s stdio and runs in the foreground; `ted` waits on it
-and reads nothing from stdin for the duration. A non-zero exit is reported
-through the notification line, not swallowed.
+**Typeahead left behind by the child is dropped, because it cannot be trusted to
+be visible.** Two mechanisms conspire. A byte that arrives while the terminal is
+in canonical mode — which is what "restored" means — is held by the line
+discipline and reported to nobody until the line is complete. And
+`crossterm::event::poll` is edge-triggered underneath (mio's epoll), so once raw
+mode makes that byte readable there is no new edge to report it: it surfaces
+only when the *next* keystroke arrives, one keystroke behind the user forever
+after. The same edge is also lost when crossterm's event source reports a
+pending SIGWINCH, which it does without draining the terminal. So resume flushes
+the terminal's input queue (`tcflush`) and drains crossterm's parsed events
+before the reader restarts. Nothing is lost by it: what the user typed then was
+typed at the child.
+
+**The child runs in the foreground, so terminal signals reach `ted` too.** ctrl-C
+and ctrl-\ go to every process in the foreground process group, and `ted`'s
+default disposition would terminate it — losing unsaved buffers because the user
+interrupted a `:!make`. For as long as `ted` is out of raw mode it installs a
+handler that does nothing. A handler rather than `SIG_IGN`: `exec` resets a
+*handled* signal to its default in the child but preserves an *ignored* one, so
+ignoring would leave ctrl-C doing nothing to the child either.
+
+**A child that printed to the screen gets a keypress before the screen is taken
+back**, which is what vim's "Press ENTER" prompt is for: `ted` is one frame away
+from painting over the output. It is a property of the child, not of the
+primitive — a full-screen program like a file manager (§13.4) has already had
+the user's attention and resumes without a prompt.
+
+The child inherits `ted`'s stdio and runs in the foreground. `ted` awaits it
+rather than waiting on it, so GPUI keeps running — language servers, file
+watching and the rest do not stall for the child's lifetime. A child that fails
+to start or exits non-zero is reported through the notification line, not
+swallowed.
 
 ---
 
@@ -989,6 +1019,17 @@ Mechanically, `command_line::Completion` carries an effect rather than an action
 — either the `Box<dyn Action>` it carries today or a host command — and `enter`
 dispatches or suspends accordingly.
 
+**`:!`** is the primitive's own binding, and the boundary with vim's `:!` is
+finer than it looks. `ShellExec` (`crates/vim/src/command.rs`) parses every form
+of it, but resolves the *bare* one to a `SpawnInTerminal` aimed at a terminal
+panel `ted` does not have — dead without a host that owns a tty. Its other forms
+— `:%!sort`, `:.,.+3!fmt`, `:r!date` — filter buffer text through the command
+and are real editor edits, so they stay with the interceptor. The host table
+therefore claims exactly the queries starting with `!`; a range has been seeded
+into the query as a prefix by then (§13.2), which is what makes the two
+distinguishable without parsing either. The command runs through the user's
+shell, so pipes, redirection and quoting mean what they mean at a prompt.
+
 **`:Explore`** suspends and runs a file manager, defaulting to
 [Yazi](https://yazi-rs.github.io) when it is on `PATH` (detected with the `which`
 crate, already a workspace dependency). Yazi exits writing its selection to
@@ -1251,6 +1292,8 @@ confirming `MacDispatcher`'s foreground wake path under §7's bridge.
 line, buffer switching, multiple items in one pane, diagnostics rendered
 inline, LSP completions as a popup. The suspend primitive (§7.1) with its
 reader-thread handshake, plus `:!` and `:Explore` over a local worktree (§13.4).
+The primitive and `:!` are implemented; `:Explore` and the navigation half are
+not.
 *Acceptance:* a real editing session on this repository without leaving `ted`;
 suspending to a child and resuming leaves no input stolen, no stale grid and no
 altered terminal mode, asserted by the pty harness (§20.3).
@@ -1297,6 +1340,8 @@ connection (§13.4). Optionally move the frontend out of process across the
 | Chrome hidden by settings still leaves the editor inset by a row or column | Low | `ted` paints at the reported rect and fills the remainder with the editor background, so the result is correct if slightly wasteful. M0 measures the actual inset and settles whether settings can reach full-bleed. |
 | The reader thread and a suspended-to child both read stdin | High, and nondeterministic | §7.1: `poll`-based reader loop plus an explicit acknowledgement handshake before the child is spawned. A `paused` flag *without* the acknowledgement leaves a permanent race whose symptom is occasional swallowed keystrokes in the child — very hard to attribute. |
 | A child process leaves terminal modes, cursor shape or the screen altered | Medium | §7.1: resume re-emits `ted`'s full mode setup unconditionally rather than assuming the flag stack returned as it was left, forces a full repaint instead of diffing against a stale Ratatui buffer, and re-queries the grid size because no `Event::Resize` arrives while the reader is parked. |
+| Input typed while the terminal was cooked is invisible to `poll` afterwards, so every later keystroke lands one behind | High if unaddressed, and unattributable | §7.1: the line discipline holds it and the edge-triggered poll underneath crossterm never reports it, so resume flushes the terminal's input queue rather than hoping to read it. The `:!` prompt reads its key with a level-triggered `poll(2)` for the same reason. |
+| ctrl-C at a child kills `ted` too, losing unsaved buffers | High | §7.1: a do-nothing handler for SIGINT and SIGQUIT for exactly as long as `ted` is out of raw mode, which `exec` resets to the default in the child so the key still interrupts what it was aimed at. |
 | `:Explore` depends on a binary that may be absent or an unexpected version | Low | §13.4: the command is a setting rather than a hard-coded binary, presence is detected with `which`, and a miss reports on the notification line. `ted` reads only the chooser file, so it does not depend on the child's output format. |
 
 ---
