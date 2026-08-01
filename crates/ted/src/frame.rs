@@ -134,6 +134,14 @@ fn spawn_reader_thread(sender: UnboundedSender<Event>) {
         loop {
             match crossterm::event::read() {
                 Ok(event) => {
+                    // `REPORT_EVENT_TYPES` makes the terminal report releases,
+                    // and nothing downstream acts on one: each would cost a
+                    // draw and a projection, and would clear a notification the
+                    // press that raised it had only just put on screen.
+                    if matches!(&event, Event::Key(key) if matches!(key.kind, KeyEventKind::Release))
+                    {
+                        continue;
+                    }
                     if sender.unbounded_send(event).is_err() {
                         return;
                     }
@@ -255,10 +263,19 @@ async fn drive(
         session.busy_frames = BUSY_FRAMES_AFTER_INPUT;
         session.messages.clear();
 
+        // One event per frame, deliberately. Dispatching a queued burst together
+        // would let a held key's backlog drain in fewer frames, but a keystroke
+        // is not safe to dispatch until the one before it has been drawn *and*
+        // whatever it spawned has run: GPUI rebuilds the dispatch tree during
+        // paint (SPEC §4.2.1), and deploying the search bar or a modal finishes
+        // in a task. Batching routes the rest of the burst against the tree the
+        // previous frame built — `/beta` types `beta` as vim motions rather than
+        // into the query. Keeping up with auto-repeat is a matter of making the
+        // frame cheap, not of dispatching more per frame.
         match event {
             // The escape hatch, and the only way out without vim. With a
-            // command line open it cancels that instead, which is both what vim
-            // does and what stops a stray `:` from stranding the user.
+            // command line open it cancels that instead, which is both what
+            // vim does and what stops a stray `:` from stranding the user.
             Event::Key(key) if is_quit(&key) && session.command_line.is_none() => {
                 return Ok(());
             }

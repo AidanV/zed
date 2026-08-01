@@ -397,6 +397,26 @@ fn vim_motions_move_the_cursor_position_in_the_status_line() -> anyhow::Result<(
 }
 
 #[test]
+fn a_burst_of_repeats_lands_exactly_where_it_was_typed() -> anyhow::Result<()> {
+    let contents = (1..=60)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    let (_fixture, mut terminal) = open("repeat", &contents)?;
+
+    // A held key arrives faster than the loop retires a frame, so the events
+    // queue up behind it. Every one still has to land: the failure this guards
+    // is the queue being coalesced or truncated to catch up, which would settle
+    // the cursor short of where it was typed.
+    terminal.send(&"j".repeat(20));
+    assert!(
+        terminal.status().trim_end().ends_with("21:1"),
+        "status was {:?}",
+        terminal.status()
+    );
+    Ok(())
+}
+
+#[test]
 fn colon_w_saves_through_vims_interceptor() -> anyhow::Result<()> {
     let (fixture, mut terminal) = open("save", "alpha\nbeta\n")?;
 

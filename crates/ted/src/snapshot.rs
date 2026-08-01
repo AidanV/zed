@@ -501,15 +501,18 @@ fn build_editor_view(
     let show_line_numbers = editor.line_numbers_enabled(cx);
     let cursor_display_row = editor.selections.newest_display(display).head().row().0;
 
+    let end_row = first_row
+        .saturating_add(visible)
+        .min(last_display_row.saturating_add(1));
+    let built_rows = rows_from_chunks(&editor_snapshot, first_row..end_row, &style);
+
     let mut row_infos = display.row_infos(DisplayRow(first_row));
     let mut rows_view = Vec::new();
-    for display_row in first_row..first_row.saturating_add(visible) {
-        if display_row > last_display_row {
-            break;
-        }
+    for (offset, (text, spans)) in built_rows.into_iter().enumerate() {
+        let display_row = first_row.saturating_add(offset as u32);
         let info = row_infos.next().unwrap_or_default();
-        let mut row = RowView::new(display_row, display.line(DisplayRow(display_row)));
-        row.spans = styled_spans(&editor_snapshot, display_row, &row.text, &style);
+        let mut row = RowView::new(display_row, text);
+        row.spans = spans;
         row.kind = if display.is_block_line(DisplayRow(display_row)) {
             RowKind::Block
         } else {
@@ -612,55 +615,60 @@ fn line_number_for(
     Some(buffer_row + 1)
 }
 
-/// Splits one display row's highlighted chunks into byte-ranged spans over
-/// `text`. `highlighted_chunks` is the same call `EditorElement` makes, so the
+/// The text and styling of every visible row, from one pass over the display
+/// map. `highlighted_chunks` is the same call `EditorElement` makes, so the
 /// colours are exactly the ones GUI Zed would paint.
-fn styled_spans(
+///
+/// One call for the whole range, not one per row: constructing the iterator
+/// seeks the multibuffer and the syntax tree, and asking it for a single row
+/// pays that seek again for every row on screen. `EditorElement` makes exactly
+/// one call for its visible range too (`element.rs:3119`) and splits the chunks
+/// on newlines, which is also where each row's text comes from — so the text
+/// and the styling cannot disagree about where a row ends.
+fn rows_from_chunks(
     snapshot: &editor::EditorSnapshot,
-    display_row: u32,
-    text: &str,
+    rows: Range<u32>,
     style: &editor::EditorStyle,
-) -> Vec<StyledSpan> {
+) -> Vec<(String, Vec<StyledSpan>)> {
+    let mut built =
+        vec![(String::new(), Vec::new()); rows.end.saturating_sub(rows.start) as usize];
     let language_aware = LanguageAwareStyling {
         tree_sitter: true,
         diagnostics: true,
     };
     let chunks = snapshot.display_snapshot.highlighted_chunks(
-        DisplayRow(display_row)..DisplayRow(display_row + 1),
+        DisplayRow(rows.start)..DisplayRow(rows.end),
         language_aware,
         style,
     );
 
-    let mut spans = Vec::new();
-    let mut offset = 0usize;
+    let mut row = 0usize;
     for chunk in chunks {
-        // Chunks are yielded over the whole row range including its trailing
-        // newline, which is not part of the row's text.
-        let chunk_text = chunk.text.trim_end_matches('\n');
-        if chunk_text.is_empty() {
-            continue;
-        }
-        let end = (offset + chunk_text.len()).min(text.len());
-        if offset >= end {
+        if row >= built.len() {
             break;
         }
-        spans.push(StyledSpan {
-            range: offset..end,
-            style: span_style(chunk.style, style),
-        });
-        offset = end;
+        let chunk_style = span_style(chunk.style, style);
+        // A chunk is not bounded by a row, so its newlines are what advance the
+        // row rather than the chunk boundary.
+        for (index, segment) in chunk.text.split('\n').enumerate() {
+            if index > 0 {
+                row += 1;
+            }
+            let Some((text, spans)) = built.get_mut(row) else {
+                break;
+            };
+            if segment.is_empty() {
+                continue;
+            }
+            let start = text.len();
+            text.push_str(segment);
+            spans.push(StyledSpan {
+                range: start..text.len(),
+                style: chunk_style,
+            });
+        }
     }
-
-    if offset < text.len() {
-        spans.push(StyledSpan {
-            range: offset..text.len(),
-            style: SpanStyle {
-                foreground: Some(style.text.color),
-                ..Default::default()
-            },
-        });
-    }
-    spans
+    built
 }
 
 fn span_style(
