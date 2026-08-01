@@ -7,6 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::Result;
 use collections::HashMap;
@@ -29,6 +30,40 @@ use gpui::{
 use crate::cell::grid_size;
 use crate::text_system::CellTextSystem;
 
+/// The GPUI window's size in cells, packed as `columns << 16 | rows`.
+///
+/// This is the terminal grid *minus* the rows `ted` paints itself (SPEC §10.2),
+/// and it lives in a static because `AppState::build_window_options` is a plain
+/// `fn` pointer with nowhere to carry it: `Workspace::new_local` calls it to
+/// build the window it opens, long after `ted` last knew the terminal size.
+static WINDOW_GRID: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_window_grid(columns: u16, rows: u16) {
+    WINDOW_GRID.store((columns as u32) << 16 | rows as u32, Ordering::SeqCst);
+}
+
+pub fn window_grid() -> (u16, u16) {
+    let packed = WINDOW_GRID.load(Ordering::SeqCst);
+    ((packed >> 16) as u16, packed as u16)
+}
+
+/// The window options every `ted` window is opened with (SPEC §6.1).
+///
+/// `show: false` because there is no compositor to show it to, and `focus: true`
+/// because the terminal window is conceptually always the focused one.
+pub fn terminal_window_options(_cx: &mut gpui::App) -> gpui::WindowOptions {
+    let (columns, rows) = window_grid();
+    gpui::WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+            Point::default(),
+            grid_size(columns, rows),
+        ))),
+        focus: true,
+        show: false,
+        ..Default::default()
+    }
+}
+
 /// A `gpui::Platform` for `ted`. Every method not listed below is a mechanical
 /// delegation to `inner`, which is the real headless platform for the current
 /// OS (calloop on Linux, `CFRunLoopRun` on macOS) — that's what supplies a
@@ -39,6 +74,9 @@ pub struct TerminalPlatform {
     text_system: Arc<CellTextSystem>,
     display: Rc<TerminalDisplay>,
     window: RefCell<Option<Rc<TerminalWindowState>>>,
+    /// The last thing `ted` put on the clipboard, so yank and put keep working
+    /// with no OS clipboard and no OSC 52 (SPEC §16, tier 3).
+    clipboard: RefCell<Option<ClipboardItem>>,
 }
 
 impl TerminalPlatform {
@@ -50,6 +88,7 @@ impl TerminalPlatform {
             text_system: Arc::new(CellTextSystem::new()),
             display: Rc::new(TerminalDisplay::new(columns, rows)),
             window: RefCell::new(None),
+            clipboard: RefCell::new(None),
         }
     }
 
@@ -141,7 +180,10 @@ impl Platform for TerminalPlatform {
         // window-server session. On every platform the stock headless window
         // also no-ops the frame/resize/activation callbacks the frame loop
         // depends on (§6.1), so a `TerminalWindow` is required either way.
-        let state = Rc::new(TerminalWindowState::new(options.bounds, self.display.clone()));
+        let state = Rc::new(TerminalWindowState::new(
+            options.bounds,
+            self.display.clone(),
+        ));
         *self.window.borrow_mut() = Some(state.clone());
         Ok(Box::new(TerminalWindow(state)))
     }
@@ -309,20 +351,34 @@ impl Platform for TerminalPlatform {
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        self.inner.read_from_clipboard()
+        // Reads never go over OSC 52: replies are a security hazard and are
+        // disabled by default in every terminal that implements them (SPEC §16).
+        self.inner
+            .read_from_clipboard()
+            .or_else(|| self.clipboard.borrow().clone())
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        self.inner.write_to_clipboard(item)
+        // All three tiers, not the first that works: the OS clipboard read back
+        // by `read_from_clipboard` may be unreachable (no window-server session
+        // over SSH), and the in-process copy is what makes yank/put work anyway.
+        *self.clipboard.borrow_mut() = Some(item.clone());
+        if let Some(text) = item.text() {
+            write_osc52(&text);
+        }
+        self.inner.write_to_clipboard(item);
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn read_from_primary(&self) -> Option<ClipboardItem> {
-        self.inner.read_from_primary()
+        self.inner
+            .read_from_primary()
+            .or_else(|| self.clipboard.borrow().clone())
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn write_to_primary(&self, item: ClipboardItem) {
+        *self.clipboard.borrow_mut() = Some(item.clone());
         self.inner.write_to_primary(item)
     }
 
@@ -359,6 +415,28 @@ impl Platform for TerminalPlatform {
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>) {
         self.inner.on_keyboard_layout_change(callback)
     }
+}
+
+/// Asks the terminal to put `text` on the *user's* clipboard, which over SSH is
+/// the local machine's rather than the remote one's — the case a TUI editor
+/// exists for (SPEC §16, tier 2).
+///
+/// Written unconditionally: terminals that do not implement OSC 52, or have it
+/// disabled, ignore the sequence, and there is no reply to wait for. Payloads
+/// above the widely-implemented limit are dropped rather than truncated, since a
+/// half-pasted yank is worse than none.
+fn write_osc52(text: &str) {
+    const MAX_PAYLOAD_BYTES: usize = 100_000;
+    if text.is_empty() || text.len() > MAX_PAYLOAD_BYTES {
+        return;
+    }
+
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut out = std::io::stdout();
+    use std::io::Write as _;
+    write!(out, "\x1b]52;c;{encoded}\x07").ok();
+    out.flush().ok();
 }
 
 /// The terminal grid's bounds in pixels, standing in for a monitor so
@@ -685,10 +763,7 @@ impl PlatformWindow for TerminalWindow {
         *self.0.on_should_close.borrow_mut() = Some(callback);
     }
 
-    fn on_hit_test_window_control(
-        &self,
-        _callback: Box<dyn FnMut() -> Option<WindowControlArea>>,
-    ) {
+    fn on_hit_test_window_control(&self, _callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
         // No custom titlebar controls to hit-test.
     }
 

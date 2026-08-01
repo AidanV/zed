@@ -1095,6 +1095,23 @@ impl BufferSearchBar {
         self.query_editor.read(cx).text(cx)
     }
 
+    /// The one-based index of the current match and the total number of matches
+    /// in the active item, i.e. the `3/17` the search bar renders. `None` while
+    /// the query is empty or matches nothing.
+    ///
+    /// Exists for embedders that draw their own search line rather than
+    /// rendering this toolbar item.
+    pub fn match_summary(&self) -> Option<(usize, usize)> {
+        let searchable_item = self.active_searchable_item.as_ref()?;
+        let index = self.active_match_index?;
+        let total = self
+            .searchable_items_with_matches
+            .get(&searchable_item.downgrade())
+            .map(|(matches, _)| matches.len())
+            .unwrap_or(0);
+        Some((index + 1, total))
+    }
+
     pub fn replacement(&self, cx: &mut App) -> String {
         self.replacement_editor.read(cx).text(cx)
     }

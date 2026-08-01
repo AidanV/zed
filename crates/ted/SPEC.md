@@ -1,6 +1,6 @@
 # `ted` — a terminal UI for Zed
 
-**Status:** draft specification, not yet implemented
+**Status:** M0 and M1 implemented (§21); M2 onward not started
 **Scope:** a new crate + binary in this repository that presents Zed's editor as a
 full-screen terminal application, using Ratatui for presentation and Zed's own
 `editor` + `vim` + `workspace` + `project` crates for all behaviour.

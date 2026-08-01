@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use editor::Editor;
 use editor::display_map::DisplayRow;
-use gpui::{AppContext as _, BorrowAppContext as _, Entity, HeadlessAppContext, Pixels, WindowHandle};
+use gpui::{
+    AppContext as _, BorrowAppContext as _, Entity, HeadlessAppContext, Pixels, WindowHandle,
+};
 use language::Buffer;
 use settings::SettingsStore;
 use ted::cell::{CELL_HEIGHT, CELL_WIDTH, grid_size, text_cells};

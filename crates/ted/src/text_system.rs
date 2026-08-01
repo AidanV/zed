@@ -52,7 +52,10 @@ fn fixed_font_metrics() -> FontMetrics {
         x_height: X_HEIGHT,
         bounding_box: Bounds {
             origin: point(0.0, DESCENT),
-            size: size(UNITS_PER_EM as f32 * cell::CELL_WIDTH_PER_EM, ASCENT - DESCENT),
+            size: size(
+                UNITS_PER_EM as f32 * cell::CELL_WIDTH_PER_EM,
+                ASCENT - DESCENT,
+            ),
         },
     }
 }
@@ -62,9 +65,9 @@ fn fixed_font_metrics() -> FontMetrics {
 /// texture; SPEC does not require exact emoji detection) and never affects a
 /// measured width, which always comes from `unicode-width` via `cell::cluster_cells`.
 fn cluster_is_emoji(cluster: &str) -> bool {
-    cluster.chars().any(|ch| {
-        matches!(ch as u32, 0x1F000..=0x1FFFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF)
-    })
+    cluster
+        .chars()
+        .any(|ch| matches!(ch as u32, 0x1F000..=0x1FFFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF))
 }
 
 #[derive(Default)]
@@ -206,7 +209,10 @@ impl PlatformTextSystem for CellTextSystem {
         };
         let width = raster_bounds.size.width.0.max(0) as usize;
         let height = raster_bounds.size.height.0.max(0) as usize;
-        Ok((raster_bounds.size, vec![0u8; width * height * channels_per_pixel]))
+        Ok((
+            raster_bounds.size,
+            vec![0u8; width * height * channels_per_pixel],
+        ))
     }
 
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
@@ -341,7 +347,9 @@ mod tests {
                 "em_width at {size_px}px"
             );
             assert_eq!(
-                text_system.em_advance(font_id, font_size).expect("em_advance"),
+                text_system
+                    .em_advance(font_id, font_size)
+                    .expect("em_advance"),
                 expected,
                 "em_advance at {size_px}px"
             );
@@ -351,7 +359,9 @@ mod tests {
                 "ch_width at {size_px}px"
             );
             assert_eq!(
-                text_system.ch_advance(font_id, font_size).expect("ch_advance"),
+                text_system
+                    .ch_advance(font_id, font_size)
+                    .expect("ch_advance"),
                 expected,
                 "ch_advance at {size_px}px"
             );
@@ -365,7 +375,9 @@ mod tests {
                 expected
             );
             assert_eq!(
-                text_system.em_advance(font_id, font_size).expect("em_advance"),
+                text_system
+                    .em_advance(font_id, font_size)
+                    .expect("em_advance"),
                 expected
             );
         }
@@ -461,7 +473,10 @@ mod tests {
             for &ch in &chars {
                 let expected = ch.width().unwrap_or(0) as f32 * cell_width;
                 let actual = text_system.layout_width(font_id, font_size, ch);
-                assert_eq!(actual, expected, "layout_width mismatch for {ch:?} at {size_px}px");
+                assert_eq!(
+                    actual, expected,
+                    "layout_width mismatch for {ch:?} at {size_px}px"
+                );
             }
         }
     }

@@ -12,47 +12,53 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
-    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-    enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use crossterm::{execute, queue};
 use editor::Editor;
-use editor::display_map::DisplayRow;
 use futures::StreamExt as _;
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use gpui::{App, AppContext as _, AsyncApp, WindowHandle};
+use futures::channel::mpsc::UnboundedSender;
+use gpui::{App, AppContext as _, AsyncApp, Entity};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use theme::ActiveTheme as _;
 
-use crate::bootstrap;
-use crate::cell::{CELL_HEIGHT, CELL_WIDTH};
+use crate::bootstrap::{self, Backend};
+use crate::command_line::{CommandLine, Update};
 use crate::input::keystroke_for;
-use crate::platform::{TerminalPlatform, TerminalWindowState};
-use crate::render::render;
-use crate::snapshot::{CellPoint, CellRect, EditorView, RowView, StatusView, ViewSnapshot};
-
-/// Rows `ted` paints itself and therefore withholds from the GPUI window. The
-/// window is sized to the grid *minus* these, so the editor's reported rect can
-/// never overlap a row `ted` owns (SPEC §10.2).
-const RESERVED_ROWS: u16 = 1;
+use crate::palette::{ColorDepth, Palette};
+use crate::platform::{TerminalPlatform, TerminalWindowState, set_window_grid};
+use crate::render::{render, reserved_rows};
+use crate::snapshot::{CommandLineView, CursorShape, StatusView, ViewSnapshot};
 
 /// Below this the editor's width arithmetic goes negative, which is not a case
 /// Zed is expected to handle (SPEC §10.2).
 const MINIMUM_COLUMNS: u16 = 20;
 const MINIMUM_ROWS: u16 = 5;
 
+/// SPEC §7: ~8ms while input is arriving or something is still settling, backing
+/// off when idle. Calling `request_frame` on a clean window is cheap — GPUI
+/// early-returns without laying out — but the terminal write is not, so the idle
+/// tier is what keeps a terminal editor at ~0% CPU.
+const BUSY_FRAME_INTERVAL: Duration = Duration::from_millis(8);
 const IDLE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+/// Frames to stay on the busy cadence after the last input, long enough for an
+/// asynchronous rewrap or a language server's first diagnostics to land.
+const BUSY_FRAMES_AFTER_INPUT: u32 = 24;
 
 /// Set once the terminal has been put into raw mode, so the panic hook and the
 /// normal shutdown path can both restore it and neither does so twice.
 static TERMINAL_IS_RAW: AtomicBool = AtomicBool::new(false);
 
 pub struct Options {
-    pub path: Option<PathBuf>,
+    pub paths: Vec<PathBuf>,
+    pub vim: bool,
+    pub opaque_background: bool,
 }
 
 pub fn run(options: Options) -> Result<()> {
@@ -61,6 +67,7 @@ pub fn run(options: Options) -> Result<()> {
     enter_terminal_mode()?;
     install_panic_hook();
 
+    set_window_grid(columns, rows.saturating_sub(reserved_rows(false, 0)));
     let platform = std::rc::Rc::new(TerminalPlatform::new(columns, rows));
     let result = std::rc::Rc::new(std::cell::RefCell::new(Ok(())));
 
@@ -72,7 +79,7 @@ pub fn run(options: Options) -> Result<()> {
         .run({
             let result = result.clone();
             move |cx| {
-                if let Err(error) = start(options.path.clone(), columns, rows, &platform, cx) {
+                if let Err(error) = start(&options, columns, rows, platform.clone(), cx) {
                     *result.borrow_mut() = Err(error);
                     cx.quit();
                 }
@@ -84,41 +91,31 @@ pub fn run(options: Options) -> Result<()> {
 }
 
 fn start(
-    path: Option<PathBuf>,
+    options: &Options,
     columns: u16,
     rows: u16,
-    platform: &TerminalPlatform,
+    platform: std::rc::Rc<TerminalPlatform>,
     cx: &mut App,
 ) -> Result<()> {
-    bootstrap::init(cx)?;
+    let app_state = bootstrap::init(options.vim, cx)?;
 
-    let editor_rows = rows.saturating_sub(RESERVED_ROWS);
-    let opened = bootstrap::open_editor(path.as_deref(), columns, editor_rows, cx)?;
-    let window_state = platform
-        .window()
-        .context("TerminalPlatform did not record the window it opened")?;
-    window_state.activate_once();
-
-    let (sender, receiver) = futures::channel::mpsc::unbounded();
-    spawn_reader_thread(sender);
-
-    let path_label = opened
-        .path
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "[No Name]".to_owned());
+    let opening = bootstrap::open(options.paths.clone(), app_state, cx);
+    let background = cx.theme().colors().editor_background;
+    let palette = Palette::new(ColorDepth::detect(), background, options.opaque_background);
 
     cx.spawn(async move |cx| {
-        let loop_result = drive(
-            receiver,
-            opened.window,
-            window_state,
-            path_label,
-            columns,
-            rows,
-            cx,
-        )
+        let loop_result = async {
+            let backend = opening.await?;
+            // Only recorded once `open_window` has run, which happens inside
+            // `bootstrap::open`.
+            let window_state = platform
+                .window()
+                .context("TerminalPlatform did not record the window it opened")?;
+            window_state.activate_once();
+            drive(backend, window_state, palette, columns, rows, cx).await
+        }
         .await;
+
         if let Err(error) = loop_result {
             log::error!("ted's frame loop stopped: {error}");
         }
@@ -150,36 +147,103 @@ fn spawn_reader_thread(sender: UnboundedSender<Event>) {
     });
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The mutable state the loop carries between frames, kept together so the
+/// reserved-row count and the lines that justify it cannot drift apart.
+struct Session {
+    backend: Backend,
+    palette: Palette,
+    columns: u16,
+    rows: u16,
+    command_line: Option<CommandLine>,
+    /// Messages `ted` itself raised, cleared on the next keystroke so they stay
+    /// transient (SPEC §13.3). Notifications the *backend* raised are read fresh
+    /// each frame by `snapshot::backend_notifications`.
+    messages: Vec<String>,
+    busy_frames: u32,
+}
+
+impl Session {
+    fn fits(&self) -> bool {
+        self.columns >= MINIMUM_COLUMNS && self.rows >= MINIMUM_ROWS
+    }
+}
+
 async fn drive(
-    mut events: UnboundedReceiver<Event>,
-    window: WindowHandle<Editor>,
+    backend: Backend,
     window_state: std::rc::Rc<TerminalWindowState>,
-    path_label: String,
-    mut columns: u16,
-    mut rows: u16,
+    palette: Palette,
+    columns: u16,
+    rows: u16,
     cx: &mut AsyncApp,
 ) -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))
         .context("could not initialize the terminal backend")?;
     terminal.hide_cursor().ok();
 
+    let (sender, mut events) = futures::channel::mpsc::unbounded();
+    spawn_reader_thread(sender);
+
+    let mut session = Session {
+        backend,
+        palette,
+        columns,
+        rows,
+        command_line: None,
+        messages: Vec::new(),
+        busy_frames: BUSY_FRAMES_AFTER_INPUT,
+    };
     let mut painted: Option<ViewSnapshot> = None;
+    let mut reserved = u16::MAX;
 
     loop {
+        // `:q` closes the active item rather than the window, so an empty
+        // workspace is what "quit" looks like from here (SPEC §14.3).
+        if cx.update(|cx| session.backend.is_empty(cx)) {
+            return Ok(());
+        }
+
+        let command_line = session
+            .command_line
+            .as_ref()
+            .map(|command_line| command_line.view())
+            .or_else(|| search_line(&session, cx));
+
+        let mut notifications = session.messages.clone();
+        notifications.extend(backend_notifications(&session, cx));
+
+        // A line appearing or disappearing changes how much of the grid the
+        // window may use, and that is a resize like any other (SPEC §10.2).
+        let wanted = reserved_rows(command_line.is_some(), notifications.len());
+        if wanted != reserved {
+            reserved = wanted;
+            resize_window(&session, reserved, &window_state);
+        }
+
         // Never call this from inside a `cx.update(..)` closure: GPUI's
         // registered frame callback does its own work through
         // `handle.update(&mut cx, ..)` on an `AsyncApp`, which cannot run while
         // the `App` is already borrowed.
         window_state.request_frame();
 
-        let snapshot = build_snapshot(&window, &path_label, columns, rows, cx)?;
+        // A closed window is how a `workspace::CloseWindow` reaches this loop,
+        // which is a normal way to quit rather than a failure.
+        let Ok(snapshot) = build_snapshot(&session, reserved, command_line, notifications, cx)
+        else {
+            return Ok(());
+        };
         if painted.as_ref() != Some(&snapshot) {
-            paint(&mut terminal, &snapshot)?;
+            paint(&mut terminal, &snapshot, &session.palette)?;
             painted = Some(snapshot);
+            session.busy_frames = session.busy_frames.max(1);
         }
 
-        let timer = cx.background_executor().timer(IDLE_FRAME_INTERVAL);
+        let interval = if session.busy_frames > 0 {
+            session.busy_frames -= 1;
+            BUSY_FRAME_INTERVAL
+        } else {
+            IDLE_FRAME_INTERVAL
+        };
+        let timer = cx.background_executor().timer(interval);
         let event = futures::select_biased! {
             event = events.next() => event,
             _ = futures::FutureExt::fuse(timer) => continue,
@@ -188,37 +252,36 @@ async fn drive(
         let Some(event) = event else {
             return Ok(());
         };
+        session.busy_frames = BUSY_FRAMES_AFTER_INPUT;
+        session.messages.clear();
 
         match event {
-            Event::Key(key) if is_quit(&key) => return Ok(()),
-            Event::Key(key) => {
-                if let Some(keystroke) = keystroke_for(&key) {
-                    // Deliberately `App::update_window` rather than
-                    // `WindowHandle::update`: the latter holds a mutable borrow
-                    // of the root view for the duration of the closure, and
-                    // dispatch routes into the editor's own action handlers,
-                    // which update that same entity.
-                    cx.update_window(window.into(), |_, window, cx| {
-                        window.dispatch_keystroke(keystroke, cx);
-                    })
-                    .ok();
-                }
+            // The escape hatch, and the only way out without vim. With a
+            // command line open it cancels that instead, which is both what vim
+            // does and what stops a stray `:` from stranding the user.
+            Event::Key(key) if is_quit(&key) && session.command_line.is_none() => {
+                return Ok(());
             }
+            Event::Key(key) => handle_key(&mut session, key, cx).await?,
             Event::Paste(text) => {
                 // One edit, not replayed keystrokes: replaying would run vim
                 // motions over the pasted text (SPEC §8.2).
-                window
-                    .update(cx, |editor, window, cx| {
-                        editor.handle_input(&text, window, cx);
-                    })
-                    .ok();
+                if let Some(editor) = active_editor(&session, cx) {
+                    session
+                        .backend
+                        .window
+                        .update(cx, |_, window, cx| {
+                            editor.update(cx, |editor, cx| {
+                                editor.handle_input(&text, window, cx);
+                            });
+                        })
+                        .ok();
+                }
             }
             Event::Resize(new_columns, new_rows) => {
-                columns = new_columns;
-                rows = new_rows;
-                if fits(columns, rows) {
-                    window_state.resize_to_cells(columns, rows.saturating_sub(RESERVED_ROWS));
-                }
+                session.columns = new_columns;
+                session.rows = new_rows;
+                resize_window(&session, reserved, &window_state);
                 terminal.clear().ok();
                 painted = None;
             }
@@ -227,22 +290,137 @@ async fn drive(
     }
 }
 
-fn is_quit(key: &crossterm::event::KeyEvent) -> bool {
+/// Routes a keystroke either into `ted`'s own `:` line or into GPUI's dispatch
+/// tree. The `:` line is the only thing `ted` handles itself; everything else,
+/// including `/` search, belongs to the backend.
+async fn handle_key(session: &mut Session, key: KeyEvent, cx: &mut AsyncApp) -> Result<()> {
+    if session.command_line.is_some() {
+        return handle_command_line_key(session, key, cx).await;
+    }
+
+    if opens_command_line(session, &key, cx) {
+        let Some(editor) = active_editor(session, cx) else {
+            return Ok(());
+        };
+        let prefix = cx.update(|cx| crate::command_line::prefix_for(&editor, cx));
+        let mut command_line = CommandLine::new(prefix);
+        command_line
+            .refresh(session.backend.workspace.downgrade(), cx)
+            .await;
+        session.command_line = Some(command_line);
+        return Ok(());
+    }
+
+    let Some(keystroke) = keystroke_for(&key) else {
+        return Ok(());
+    };
+    // Deliberately `App::update_window` rather than `WindowHandle::update`: the
+    // latter holds a mutable borrow of the root view for the duration of the
+    // closure, and dispatch routes into handlers that update that same entity.
+    cx.update_window(session.backend.window.into(), |_, window, cx| {
+        window.dispatch_keystroke(keystroke, cx);
+    })
+    .ok();
+    Ok(())
+}
+
+async fn handle_command_line_key(
+    session: &mut Session,
+    key: KeyEvent,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let Some(command_line) = session.command_line.as_mut() else {
+        return Ok(());
+    };
+
+    match command_line.handle_key(&key) {
+        Update::Unchanged => {}
+        Update::QueryChanged => {
+            command_line
+                .refresh(session.backend.workspace.downgrade(), cx)
+                .await;
+        }
+        Update::Cancel => session.command_line = None,
+        Update::Submit => {
+            let action = command_line.selected_action();
+            let query = command_line.query().to_owned();
+            session.command_line = None;
+            match action {
+                Some(action) => {
+                    cx.update_window(session.backend.window.into(), |_, window, cx| {
+                        window.dispatch_action(action, cx);
+                    })
+                    .ok();
+                }
+                None => session.messages.push(format!("not a command: :{query}")),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `:` opens `ted`'s command line whenever vim would have opened Zed's palette:
+/// in a mode where `:` is a command rather than text. Without vim there is no
+/// `:` line at all, and `:` is just a character.
+fn opens_command_line(session: &Session, key: &KeyEvent, cx: &mut AsyncApp) -> bool {
+    if key.code != KeyCode::Char(':')
+        || matches!(key.kind, KeyEventKind::Release)
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return false;
+    }
+    let Some(editor) = active_editor(session, cx) else {
+        return false;
+    };
+
+    cx.update_window(session.backend.window.into(), |_, window, cx| {
+        use gpui::Focusable as _;
+        // Vim's mode is the editor's even while something else holds focus —
+        // the `/` search bar's own query editor, most of all — and a `:` typed
+        // there is text, not a command.
+        let focused = editor
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx);
+        focused
+            && vim::mode(editor.read(cx), cx)
+                .is_some_and(|mode| !matches!(mode, vim::Mode::Insert | vim::Mode::Replace))
+    })
+    .unwrap_or(false)
+}
+
+fn active_editor(session: &Session, cx: &mut AsyncApp) -> Option<Entity<Editor>> {
+    cx.update(|cx| session.backend.active_editor(cx))
+}
+
+fn is_quit(key: &KeyEvent) -> bool {
     !matches!(key.kind, KeyEventKind::Release)
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('c'))
 }
 
-fn fits(columns: u16, rows: u16) -> bool {
-    columns >= MINIMUM_COLUMNS && rows >= MINIMUM_ROWS
+/// Sizes the GPUI window to the grid *minus* the rows `ted` paints itself, so
+/// the editor's reported rect can never overlap one of them (SPEC §10.2).
+/// `resize_to_cells` invokes GPUI's own `on_resize` callback, which is what
+/// triggers relayout.
+fn resize_window(session: &Session, reserved: u16, window_state: &TerminalWindowState) {
+    if !session.fits() {
+        return;
+    }
+    let rows = session.rows.saturating_sub(reserved);
+    set_window_grid(session.columns, rows);
+    window_state.resize_to_cells(session.columns, rows);
 }
 
 fn paint(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     snapshot: &ViewSnapshot,
+    palette: &Palette,
 ) -> Result<()> {
     terminal.draw(|frame| {
-        render(snapshot, frame.buffer_mut());
+        render(snapshot, palette, frame.buffer_mut());
         if let Some(cursor) = snapshot.cursor {
             frame.set_cursor_position((cursor.column, cursor.row));
         }
@@ -252,114 +430,90 @@ fn paint(
     } else {
         terminal.hide_cursor().ok();
     }
+    set_cursor_shape(snapshot.cursor_shape);
     Ok(())
 }
 
-/// Reads the projection out of the entities *after* the draw: `Editor::style`
-/// and `last_bounds` are populated during element layout, so a snapshot taken
-/// before the first frame has neither (SPEC §10.2, "Ordering").
+/// The terminal blinks its own cursor, so its *shape* is how `ted` shows vim's
+/// mode without drawing a cell — and it is also what screen readers and
+/// terminal cursor-shape escapes expect (SPEC §7).
+fn set_cursor_shape(shape: CursorShape) {
+    use crossterm::cursor::SetCursorStyle;
+    let style = match shape {
+        CursorShape::Block => SetCursorStyle::SteadyBlock,
+        CursorShape::Bar => SetCursorStyle::SteadyBar,
+        CursorShape::Underline => SetCursorStyle::SteadyUnderScore,
+    };
+    let mut out = stdout();
+    queue!(out, style).ok();
+    out.flush().ok();
+}
+
+fn backend_notifications(session: &Session, cx: &mut AsyncApp) -> Vec<String> {
+    cx.update_window(session.backend.window.into(), |_, window, cx| {
+        crate::snapshot::backend_notifications(&session.backend.workspace, window, cx)
+    })
+    .unwrap_or_default()
+}
+
 fn build_snapshot(
-    window: &WindowHandle<Editor>,
-    path_label: &str,
-    columns: u16,
-    rows: u16,
+    session: &Session,
+    reserved: u16,
+    command_line: Option<CommandLineView>,
+    notifications: Vec<String>,
     cx: &mut AsyncApp,
 ) -> Result<ViewSnapshot> {
-    if !fits(columns, rows) {
+    if !session.fits() {
         return Ok(ViewSnapshot {
-            columns,
-            rows,
-            editor: None,
+            columns: session.columns,
+            rows: session.rows,
             status: StatusView {
                 path: Some(format!(
                     "terminal too small (need {MINIMUM_COLUMNS}x{MINIMUM_ROWS})"
                 )),
                 ..Default::default()
             },
-            cursor: None,
+            ..Default::default()
         });
     }
 
-    // The window's root view *is* the editor, so `WindowHandle::update` already
-    // hands us `&mut Editor`. Going through the entity handle again here would
-    // nest an update inside an update and panic.
-    window
-        .update(cx, |editor, window, cx| {
-            {
-                let snapshot = editor.snapshot(window, cx);
-                let display = &snapshot.display_snapshot;
-
-                let text_rect = editor
-                    .last_bounds()
-                    .map(|bounds| CellRect {
-                        x: (f32::from(bounds.origin.x) / f32::from(CELL_WIDTH)) as u16,
-                        y: (f32::from(bounds.origin.y) / f32::from(CELL_HEIGHT)) as u16,
-                        width: (f32::from(bounds.size.width) / f32::from(CELL_WIDTH)) as u16,
-                        height: (f32::from(bounds.size.height) / f32::from(CELL_HEIGHT)) as u16,
-                    })
-                    .unwrap_or(CellRect::new(0, 0, columns, rows - RESERVED_ROWS));
-
-                let scroll = editor.scroll_position(cx);
-                let first_row = scroll.y.max(0.0) as u32;
-                // Fractional visible counts mean a partial bottom row; render
-                // the whole ones and drop the partial (SPEC §5.3).
-                let visible = editor.visible_line_count().unwrap_or(0.0).floor() as u32;
-                let last_display_row = display.max_point().row().0;
-
-                let rows_view = (first_row..first_row.saturating_add(visible))
-                    .take_while(|row| *row <= last_display_row)
-                    .map(|row| RowView::new(row, display.line(DisplayRow(row))))
-                    .collect::<Vec<_>>();
-
-                let cursor = cursor_cell(editor, &snapshot, &rows_view, &text_rect, first_row);
-
-                let dirty = editor.buffer().read(cx).is_dirty(cx);
-
-                Ok(ViewSnapshot {
-                    columns,
-                    rows,
-                    editor: Some(EditorView {
-                        text_rect,
-                        scroll_columns: scroll.x.max(0.0) as u16,
-                        rows: rows_view,
-                        max_display_row: last_display_row,
-                        soft_wrapped: true,
-                    }),
-                    status: StatusView {
-                        path: Some(path_label.to_owned()),
-                        dirty,
-                        mode: None,
-                        message: None,
-                    },
-                    cursor,
-                })
-            }
-        })
-        .context("window closed while building a frame")?
+    cx.update_window(session.backend.window.into(), |_, window, cx| {
+        crate::snapshot::build(
+            crate::snapshot::Frame {
+                columns: session.columns,
+                rows: session.rows,
+                reserved_rows: reserved,
+                command_line,
+                notifications,
+                workspace: &session.backend.workspace,
+            },
+            window,
+            cx,
+        )
+    })
+    .context("window closed while building a frame")
 }
 
-/// The primary cursor's cell, converted through the row's `byte_to_cell` table
-/// — `DisplayPoint::column()` is a byte offset, and that table is the only
-/// permitted conversion (SPEC §5.4).
-fn cursor_cell(
-    editor: &mut Editor,
-    snapshot: &editor::EditorSnapshot,
-    rows: &[RowView],
-    text_rect: &CellRect,
-    first_row: u32,
-) -> Option<CellPoint> {
-    let head = editor
-        .selections
-        .newest_display(&snapshot.display_snapshot)
-        .head();
-    let display_row = head.row().0;
-
-    let row = rows.iter().find(|row| row.display_row == display_row)?;
-    let column = row.cell_for_byte(head.column() as usize);
-
-    Some(CellPoint {
-        column: text_rect.x + column.min(text_rect.width.saturating_sub(1)),
-        row: text_rect.y + (display_row - first_row) as u16,
+/// Projects the pane's `BufferSearchBar` into `ted`'s bottom line. Vim's `/`
+/// and `?` dispatch into that bar and type into its own editor, so `ted` only
+/// mirrors what is already there (SPEC §14.2).
+fn search_line(session: &Session, cx: &mut AsyncApp) -> Option<CommandLineView> {
+    cx.update(|cx| {
+        let search_bar = session.backend.active_pane_search_bar(cx)?;
+        let search_bar = search_bar.read(cx);
+        if search_bar.is_dismissed() {
+            return None;
+        }
+        let (index, total) = search_bar.match_summary().unwrap_or((0, 0));
+        let query = search_bar.query(cx);
+        Some(CommandLineView {
+            prefix: '/',
+            cursor: query.len(),
+            query,
+            completions: Vec::new(),
+            selected_completion: None,
+            message: Some(format!("{index}/{total}")),
+        })
     })
 }
 
@@ -406,7 +560,13 @@ fn restore_terminal_mode() {
     }
     let mut out = stdout();
     queue!(out, PopKeyboardEnhancementFlags).ok();
-    execute!(out, DisableBracketedPaste, LeaveAlternateScreen).ok();
+    execute!(
+        out,
+        crossterm::cursor::SetCursorStyle::DefaultUserShape,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )
+    .ok();
     out.flush().ok();
     disable_raw_mode().ok();
 }

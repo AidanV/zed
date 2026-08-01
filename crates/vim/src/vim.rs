@@ -46,8 +46,9 @@ use settings::RegisterSetting;
 pub use settings::{
     ModeContent, Settings, SettingsStore, UseSystemClipboard, update_settings_file,
 };
+pub use state::Mode;
 use state::{
-    HelixJumpBehaviour, HelixJumpLabel, Mode, Operator, RecordedSelection, SearchState, VimGlobals,
+    HelixJumpBehaviour, HelixJumpLabel, Operator, RecordedSelection, SearchState, VimGlobals,
 };
 use std::{mem, ops::Range, sync::Arc};
 use surrounds::SurroundsType;
@@ -495,6 +496,38 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+/// The mode `editor` is in, or `None` when vim mode is disabled — the addon is
+/// only attached to editors while [`VimModeSetting`] is on.
+///
+/// Exists for embedders that render their own mode indicator instead of the
+/// `ModeIndicator` status-bar item, which reaches the same state through
+/// `VimAddon` directly.
+pub fn mode(editor: &Editor, cx: &App) -> Option<Mode> {
+    Some(editor.addon::<VimAddon>()?.entity.read(cx).mode)
+}
+
+/// The range prefix vim's own `:` bindings seed the command palette with:
+/// `'<,'>` in visual modes, `.` or `.,.+n` for a pending count, empty
+/// otherwise. Consumes the pending count and forced-motion flag exactly as
+/// those bindings do, so the next motion does not inherit them.
+///
+/// Exists for embedders that render their own command line instead of opening
+/// `command_palette::CommandPalette`.
+pub fn take_command_line_prefix(editor: &Editor, cx: &mut App) -> String {
+    let visual = mode(editor, cx).is_some_and(|mode| mode.is_visual());
+    let count = Vim::take_count(cx);
+    Vim::take_forced_motion(cx);
+
+    if visual {
+        return "'<,'>".to_string();
+    }
+    match count {
+        None => String::new(),
+        Some(1) => ".".to_string(),
+        Some(count) => format!(".,.+{}", count.saturating_sub(1)),
+    }
 }
 
 #[derive(Clone)]

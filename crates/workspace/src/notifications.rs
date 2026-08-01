@@ -71,7 +71,9 @@ pub trait Notification:
 pub struct SuppressEvent;
 
 impl Workspace {
-    #[cfg(any(test, feature = "test-support"))]
+    /// The notifications currently showing. A notification's content is a view,
+    /// so this is all an embedder that cannot render views has to go on — but
+    /// it is enough to tell the user something happened rather than dropping it.
     pub fn notification_ids(&self) -> Vec<NotificationId> {
         self.notifications
             .iter()

@@ -1369,7 +1369,9 @@ impl DisplayMap {
         }
     }
 
-    #[cfg(test)]
+    /// Whether a soft-wrap pass is still running, which happens on large files
+    /// after the wrap width changes. Callers that paint rows themselves use
+    /// this to tell "no rows yet" apart from "no rows at all".
     pub fn is_rewrapping(&self, cx: &gpui::App) -> bool {
         self.wrap_map.read(cx).is_rewrapping()
     }

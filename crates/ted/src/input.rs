@@ -68,10 +68,7 @@ pub fn keystroke_for(event: &KeyEvent) -> Option<Keystroke> {
 
     // Zed's keymaps spell shifted symbols as the symbol itself (`<`, not
     // `shift-,`), so shift is only a modifier for keys that have a case.
-    if modifiers.shift
-        && key.chars().count() == 1
-        && key.to_lowercase() == key.to_uppercase()
-    {
+    if modifiers.shift && key.chars().count() == 1 && key.to_lowercase() == key.to_uppercase() {
         modifiers.shift = false;
     }
 
@@ -105,7 +102,10 @@ mod tests {
     fn assert_binds_as(actual: Option<Keystroke>, expected: &str) {
         let actual = actual.expect("expected a keystroke");
         let expected = parsed(expected);
-        assert_eq!(actual.modifiers, expected.modifiers, "modifiers for {expected:?}");
+        assert_eq!(
+            actual.modifiers, expected.modifiers,
+            "modifiers for {expected:?}"
+        );
         assert_eq!(actual.key, expected.key, "key for {expected:?}");
     }
 
@@ -122,8 +122,7 @@ mod tests {
 
     #[test]
     fn uppercase_letters_carry_shift_and_the_typed_character() {
-        let keystroke =
-            key(KeyCode::Char('G'), KeyModifiers::SHIFT).expect("expected a keystroke");
+        let keystroke = key(KeyCode::Char('G'), KeyModifiers::SHIFT).expect("expected a keystroke");
         assert_eq!(keystroke.key, "g");
         assert!(keystroke.modifiers.shift);
         assert_eq!(keystroke.key_char.as_deref(), Some("G"));

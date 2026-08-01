@@ -4,8 +4,10 @@
 
 pub mod bootstrap;
 pub mod cell;
+pub mod command_line;
 pub mod frame;
 pub mod input;
+pub mod palette;
 pub mod platform;
 pub mod render;
 pub mod snapshot;
