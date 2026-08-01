@@ -51,6 +51,7 @@ crates/ted/
     bootstrap.rs        # App/AppState/Workspace construction (§9)
     frame.rs            # frame loop, dirty tracking, present (§7)
     input.rs            # terminal event -> gpui::Keystroke / PlatformInput (§8)
+    suspend.rs          # handing the terminal to a child process (§7.1)
     snapshot.rs         # ViewSnapshot: the backend -> frontend projection (§10)
     render/
       render.rs         # ratatui root
@@ -560,6 +561,66 @@ Terminal I/O is bridged in:
   pop keyboard enhancement flags) from a panic hook *and* a normal shutdown
   path, so a panic never leaves the user with a broken terminal.
 
+### 7.1 Suspending: handing the terminal to a child process
+
+`ted` runs other terminal programs by giving up the tty, waiting, and taking it
+back — the `git commit` / `:!` handoff. This is the primitive behind `:Explore`
+(§13.4), `:!`, and any later `:Git`-style integration; those are bindings on top
+of it, not separate mechanisms. It is also why M4 does not need to embed a
+terminal emulator to run one program (§21).
+
+The terminal-mode half already exists and composes: `enter_terminal_mode` and
+`restore_terminal_mode` (`src/frame.rs`) are an idempotent pair guarded by
+`TERMINAL_IS_RAW`, so suspend is `restore` → spawn → wait → `enter`. Four things
+have to be true around that.
+
+**The reader thread must be parked, and must acknowledge it.** This is the only
+hard part. `spawn_reader_thread` blocks in `crossterm::event::read()`, and a
+blocking read on stdin cannot be cancelled. If the thread is still inside
+`read()` when the child starts, both processes are reading the same file
+descriptor and input is split between them nondeterministically — keystrokes
+vanish into `ted`'s channel while the user is driving the child. So:
+
+- The reader loop becomes `poll(POLL_INTERVAL)?` followed by `read()` only when
+  `poll` reports input.
+- Suspending sets a `paused` flag and then **waits for the reader to
+  acknowledge** on a condvar. The reader acknowledges only from the point where
+  `poll` timed out, which is the one place it is provably not inside `read()`,
+  then parks until `paused` clears.
+- A flag check without the acknowledgement leaves a permanent race. The
+  handshake is the mechanism; the flag alone is not.
+
+Worst-case handoff latency is one `POLL_INTERVAL` (50ms is invisible). Events
+read after the flag was set but before the acknowledgement are delivered
+normally — the user typed them before the suspend took effect, so they belong to
+`ted`.
+
+**The frame loop must stop painting.** GPUI keeps running throughout — the
+background executor, language servers and file watching should not stall for the
+lifetime of the child — but `paint()` must not run, because a single escape
+sequence written while the child owns the screen corrupts it. `Session` carries a
+suspended state that skips presentation while still pumping GPUI. Notifications
+raised during the suspension queue and render on resume rather than being
+dropped (§13.3).
+
+**Resume re-asserts everything rather than assuming.** The child may have pushed
+its own keyboard-enhancement flags, changed the cursor shape, or used the kitty
+graphics protocol. `enter_terminal_mode` re-emits `ted`'s full setup
+unconditionally, and the cursor shape is re-applied from the current vim mode.
+Ratatui's diff buffer is stale after the child has painted, so the resume path
+clears and forces a full repaint instead of diffing against a buffer that no
+longer describes the screen.
+
+**Resize during the suspension is invisible and must be recovered.** With the
+reader parked, no `Event::Resize` is delivered, so the child may have been
+resized without `ted` hearing about it. Resume queries
+`crossterm::terminal::size()` directly and drives the result through the normal
+`resize_to_cells` path (§10.2) rather than trusting the cached grid.
+
+The child inherits `ted`'s stdio and runs in the foreground; `ted` waits on it
+and reads nothing from stdin for the duration. A non-zero exit is reported
+through the notification line, not swallowed.
+
 ---
 
 ## 8. Input
@@ -910,6 +971,62 @@ project it as a centred modal with numbered answers. Workspace notifications
 important, because a TUI that silently drops an "unable to save" error is worse
 than useless.
 
+### 13.4 Host commands, and `:Explore`
+
+A few `:` commands mean something only because `ted` owns a tty. They cannot go
+through §13.2's interceptor, because the interceptor resolves to a
+`Box<dyn Action>` and these do not dispatch an action — they suspend the process
+(§7.1). `ted` therefore keeps a small **host-command table**, checked before the
+interceptor, in its own namespace.
+
+This is the one place `ted` parses a `:` command itself, and the boundary is
+worth stating precisely: the host table holds commands that exist *because of the
+terminal host*, not a second copy of vim's command set. Adding `:Explore` to
+`crates/vim/src/command.rs` would be wrong — GUI Zed has no tty to hand over.
+Anything expressible as an action stays with the interceptor.
+
+Mechanically, `command_line::Completion` carries an effect rather than an action
+— either the `Box<dyn Action>` it carries today or a host command — and `enter`
+dispatches or suspends accordingly.
+
+**`:Explore`** suspends and runs a file manager, defaulting to
+[Yazi](https://yazi-rs.github.io) when it is on `PATH` (detected with the `which`
+crate, already a workspace dependency). Yazi exits writing its selection to
+`--chooser-file`, one path per line, so the round trip is:
+
+```
+:Explore  ->  suspend (§7.1)
+          ->  yazi --chooser-file=<tmp> --cwd-file=<tmp> <start-dir>
+          ->  resume, read the file, workspace.open_paths(paths, ..)
+```
+
+Multiple selected paths open as multiple buffers in one call. The start directory
+is the active buffer's parent, falling back to the first worktree root. The
+command is a setting, not a hard-coded binary, so `broot`, `nnn` or `ranger` work
+by configuration; a missing binary surfaces on the notification line (§13.3)
+rather than failing silently or panicking.
+
+**Why an external file manager instead of a project panel.** Yazi is better at
+file *management* — bulk rename, move, delete, previews — than anything `ted`
+would build, and the integration is nearly free because `ted` hosts a real
+`Project` with real worktree fs-watching: mutations Yazi makes on disk propagate
+back into open buffers with no coordination code on either side. This is why §21
+carries no project-panel milestone.
+
+**What stays native.** The fuzzy file finder (M2). Type-to-filter over project
+files with Zed's ordering and history is a different interaction from browsing a
+tree, and `file_finder` already provides it. Both coexist; neither replaces the
+other.
+
+**Scope.** M2 targets local worktrees. Yazi has since grown a VFS layer with a
+built-in `sftp` scheme, which makes the same integration work against an
+SSH-remote project — the chooser returns `sftp://host//path` and `ted` maps it
+back onto the project's connection. That is deferred to M5, where the rest of the
+remote and collaboration story lives (§18). A collab-*joined* project is the one
+case that cannot work at all: the files exist only over Zed's collab protocol,
+with no filesystem locally and no SSH access to the host by design, so `:Explore`
+declines there and the finder handles it.
+
 ---
 
 ## 14. Vim specifics
@@ -1090,6 +1207,12 @@ Kept deliberately small, additive, and defaulted.
 - End-to-end smoke: run `ted` against a pty (`portable-pty`) in CI, send
   keystrokes, assert the emitted grid. Catches terminal-mode and escape-
   sequence regressions that no in-process test can.
+- Suspend (§7.1), in the same pty harness, with a scripted child standing in for
+  the file manager so the test has no external dependency: assert that input sent
+  while the child runs reaches the child and not `ted`, that the grid is fully
+  repainted on resume, that a resize performed during the suspension is picked
+  up, and that terminal modes match their pre-suspend state afterwards. The
+  input-stealing race is invisible to any in-process test.
 
 ---
 
@@ -1126,8 +1249,11 @@ confirming `MacDispatcher`'s foreground wake path under §7's bridge.
 
 **M2 — Navigation.** Own-implementation `:` completions, file finder, go-to-
 line, buffer switching, multiple items in one pane, diagnostics rendered
-inline, LSP completions as a popup. *Acceptance:* a real editing session on
-this repository without leaving `ted`.
+inline, LSP completions as a popup. The suspend primitive (§7.1) with its
+reader-thread handshake, plus `:!` and `:Explore` over a local worktree (§13.4).
+*Acceptance:* a real editing session on this repository without leaving `ted`;
+suspending to a child and resuming leaves no input stolen, no stale grid and no
+altered terminal mode, asserted by the pty harness (§20.3).
 
 **M3 — Fidelity.** Mirror-strategy modal projection with the `PickerDelegate`
 hook. Blocks, folds, inlay hints, git diff gutter, multi-cursor, visual block.
@@ -1136,15 +1262,19 @@ palette, file finder, outline, project symbols, and the generic fallback is
 never hit in normal use.
 
 **M4 — Layout.** Pane splits rendered as cell-space splits driven by reported
-bounds. Project panel as an optional sidebar. Terminal panel — note the
+bounds. No project panel: §13.4's external file manager covers browsing and file
+management, and a sidebar would duplicate it. Terminal panel — note the
 recursion, and that `terminal_view` is itself a GPUI view over `alacritty_terminal`;
 projecting a terminal inside a terminal is best done by reading the
-`terminal::Terminal` grid directly, not through `ViewSnapshot`.
+`terminal::Terminal` grid directly, not through `ViewSnapshot`. Note that §7.1
+already covers running *one* program without embedding an emulator, so the panel
+is only needed for a persistent terminal alongside the editor.
 
 **M5 — Collaboration + optional process split.** Terminal-friendly sign-in,
-collaborator cursors and presence, following. Optionally move the frontend out
-of process across the `ViewSnapshot` boundary, which also enables "attach a TUI
-to a running Zed."
+collaborator cursors and presence, following. `:Explore` against an SSH-remote
+project, mapping Yazi's `sftp://host//path` selections back onto the project's
+connection (§13.4). Optionally move the frontend out of process across the
+`ViewSnapshot` boundary, which also enables "attach a TUI to a running Zed."
 
 ---
 
@@ -1165,6 +1295,9 @@ to a running Zed."
 | Reserved rows put `ted`'s status line inside the editor's reported rect | Medium | §10.2: the GPUI window is sized to the grid *minus* reserved rows, so the rects cannot overlap by construction. |
 | Splits create state M1 cannot render | Low | §14.3: surface pane count in the status line so it is visible even when unrendered. |
 | Chrome hidden by settings still leaves the editor inset by a row or column | Low | `ted` paints at the reported rect and fills the remainder with the editor background, so the result is correct if slightly wasteful. M0 measures the actual inset and settles whether settings can reach full-bleed. |
+| The reader thread and a suspended-to child both read stdin | High, and nondeterministic | §7.1: `poll`-based reader loop plus an explicit acknowledgement handshake before the child is spawned. A `paused` flag *without* the acknowledgement leaves a permanent race whose symptom is occasional swallowed keystrokes in the child — very hard to attribute. |
+| A child process leaves terminal modes, cursor shape or the screen altered | Medium | §7.1: resume re-emits `ted`'s full mode setup unconditionally rather than assuming the flag stack returned as it was left, forces a full repaint instead of diffing against a stale Ratatui buffer, and re-queries the grid size because no `Event::Resize` arrives while the reader is parked. |
+| `:Explore` depends on a binary that may be absent or an unexpected version | Low | §13.4: the command is a setting rather than a hard-coded binary, presence is detected with `which`, and a miss reports on the notification line. `ted` reads only the chooser file, so it does not depend on the child's output format. |
 
 ---
 
@@ -1179,6 +1312,8 @@ to a running Zed."
 | Vim default | **Vim on by default**, `--no-vim` for plain Zed bindings. A nano-style keymap is deferred past M2 if wanted at all. §14.1. |
 | Overlay strategy | **Own implementations for M2, Mirror from M3** via a defaulted `PickerDelegate::text_for_match` hook. §13.1, §20.2. |
 | `:` command line | **`ted`'s own bottom line**, resolved through vim's existing interceptor rather than projecting Zed's palette modal. §13.2. |
+| File browsing and management | **Suspend to an external file manager**, Yazi by default, instead of building a project panel. Better at file management than anything `ted` would write, and its disk mutations propagate through the real `Project`'s fs watching for free. The fuzzy finder stays native. §7.1, §13.4, §21/M4. |
+| Terminal-host `:` commands | **A `ted`-local host-command table checked before the interceptor**, for commands that exist only because `ted` owns a tty. Not a second vim command parser; anything expressible as an action stays with the interceptor. §13.4. |
 
 ### Remaining
 
