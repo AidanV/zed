@@ -37,6 +37,8 @@ pub enum Update {
 pub enum HostCommand {
     /// `:!<command>` — run a command with the terminal to itself.
     Shell(String),
+    /// `:Explore` — browse files in a file manager (SPEC §13.4).
+    Explore,
 }
 
 /// What `enter` does with the completion the user chose.
@@ -204,11 +206,12 @@ impl CommandLine {
     /// `ted` falls back to matching action names, which is the same policy Zed's
     /// own palette applies.
     pub async fn refresh(&mut self, workspace: WeakEntity<Workspace>, cx: &mut AsyncApp) {
-        if let Some(command) = host_command(&self.query) {
-            self.completions = vec![Completion {
-                label: "run in this terminal".to_owned(),
-                effect: Effect::Host(command),
-            }];
+        let host = host_command(&self.query);
+        // `:!` answers its query alone: everything vim resolves for one is aimed
+        // at a terminal panel `ted` does not have. `:Explore` shares its letters
+        // with real action names, so it leads the list rather than replacing it.
+        if matches!(host, Some(HostCommand::Shell(_))) {
+            self.completions = host.into_iter().map(host_completion).collect();
             self.selected = Some(0);
             self.message = None;
             return;
@@ -218,7 +221,7 @@ impl CommandLine {
         let intercepted = cx
             .update(|cx| GlobalCommandPaletteInterceptor::intercept(&query, workspace.clone(), cx));
 
-        let mut completions = Vec::new();
+        let mut completions: Vec<Completion> = host.into_iter().map(host_completion).collect();
         let mut exclusive = false;
         if let Some(task) = intercepted {
             let result = task.await;
@@ -252,16 +255,40 @@ impl CommandLine {
 
 /// The host-command table (SPEC §13.4), checked before the interceptor.
 ///
-/// `:!` is the whole table, and only in its bare form. vim resolves that one to
-/// a `SpawnInTerminal` aimed at a terminal panel `ted` does not have, so it is
+/// These are the commands that exist *because* `ted` owns a tty, not a second
+/// copy of vim's command set: they do not resolve to a `Box<dyn Action>` at all,
+/// they suspend the process. Anything expressible as an action stays with the
+/// interceptor — adding `:Explore` to `crates/vim/src/command.rs` would be
+/// wrong, because GUI Zed has no tty to hand over.
+///
+/// `:!` is claimed only in its bare form. vim resolves that one to a
+/// `SpawnInTerminal` aimed at a terminal panel `ted` does not have, so it is
 /// dead here without a host that owns a tty; its other forms — `:%!sort`,
 /// `:.,.+3!fmt`, `:r!date` — filter buffer text through the command and are
 /// real editor edits, so they stay with the interceptor
 /// (`crates/vim/src/command.rs`). A range has been seeded into the query as a
 /// prefix by then, which is what makes the two distinguishable here.
 fn host_command(query: &str) -> Option<HostCommand> {
-    let command = query.strip_prefix('!')?.trim();
-    (!command.is_empty()).then(|| HostCommand::Shell(command.to_owned()))
+    if let Some(command) = query.strip_prefix('!') {
+        let command = command.trim();
+        return (!command.is_empty()).then(|| HostCommand::Shell(command.to_owned()));
+    }
+
+    // Matched as a prefix, as vim matches its own commands: `:Ex` is `:Explore`.
+    // Case-sensitively, so a `:e` meant for vim's `:edit` is left alone.
+    let typed = query.trim_end();
+    (!typed.is_empty() && "Explore".starts_with(typed)).then_some(HostCommand::Explore)
+}
+
+fn host_completion(command: HostCommand) -> Completion {
+    let label = match &command {
+        HostCommand::Shell(_) => "run in this terminal",
+        HostCommand::Explore => "Explore — browse files",
+    };
+    Completion {
+        label: label.to_owned(),
+        effect: Effect::Host(command),
+    }
 }
 
 /// Actions whose humanized name contains every character of `query` in order,
@@ -413,6 +440,23 @@ mod tests {
         assert_eq!(host_command(".,.+3!fmt"), None);
         assert_eq!(host_command("%!sort"), None);
         assert_eq!(host_command("r!date"), None);
+    }
+
+    #[test]
+    fn explore_is_matched_by_prefix_the_way_vim_matches_a_command() {
+        for typed in ["E", "Ex", "Explo", "Explore", "Explore "] {
+            assert_eq!(
+                host_command(typed),
+                Some(HostCommand::Explore),
+                "{typed:?} should have reached the host table"
+            );
+        }
+        // Lower case belongs to vim: `:e` is `:edit`, and `:explore` is not a
+        // command `ted` claims.
+        assert_eq!(host_command("e"), None);
+        assert_eq!(host_command("explore"), None);
+        assert_eq!(host_command("Explores"), None);
+        assert_eq!(host_command(""), None);
     }
 
     #[test]

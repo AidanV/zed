@@ -12,6 +12,7 @@
 //! or painted over every cell, so resume re-asserts the terminal rather than
 //! assuming any of it came back as it was left.
 
+use std::ffi::OsString;
 use std::io::{Stdout, Write as _, stdout};
 use std::process::ExitStatus;
 use std::sync::Arc;
@@ -186,8 +187,10 @@ pub struct Child {
     /// What to call it in messages: what the user asked for, rather than the
     /// shell `ted` may be running it through.
     pub label: String,
-    pub program: String,
-    pub arguments: Vec<String>,
+    /// `OsString` rather than `String` because `:Explore` substitutes paths
+    /// into its arguments (SPEC §13.4), and a path is not required to be UTF-8.
+    pub program: OsString,
+    pub arguments: Vec<OsString>,
     /// Whether to wait for a keypress before taking the screen back. A command
     /// that printed to the screen needs it or its output vanishes in the time
     /// it takes to draw one frame; a full-screen program that has already had
@@ -201,8 +204,8 @@ impl Child {
     pub fn shell(command: &str) -> Self {
         Self {
             label: format!("!{command}"),
-            program: util::shell::get_system_shell(),
-            arguments: vec!["-c".to_owned(), command.to_owned()],
+            program: util::shell::get_system_shell().into(),
+            arguments: vec!["-c".into(), command.into()],
             wait_for_key: true,
         }
     }
@@ -274,7 +277,7 @@ async fn spawn_and_wait(child: &Child) -> Result<ExitStatus> {
     command
         .status()
         .await
-        .with_context(|| format!("could not run {}", child.program))
+        .with_context(|| format!("could not run {}", child.program.display()))
 }
 
 /// Waits for a keypress before the screen is taken back. Vim prompts here for
@@ -490,7 +493,10 @@ mod tests {
     fn a_shell_child_is_labelled_by_what_the_user_typed() {
         let child = Child::shell("git commit -v");
         assert_eq!(child.label, "!git commit -v");
-        assert_eq!(child.arguments, vec!["-c", "git commit -v"]);
+        assert_eq!(
+            child.arguments,
+            vec![OsString::from("-c"), OsString::from("git commit -v")]
+        );
         assert!(child.wait_for_key);
     }
 }

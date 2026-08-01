@@ -437,6 +437,21 @@ impl Fixture {
         self.directory.join("data")
     }
 
+    /// `ted`'s own settings file, beside the `settings.json` it shares with GUI
+    /// Zed (SPEC §9).
+    fn write_config(&self, contents: &str) -> anyhow::Result<()> {
+        let config = self.data_dir().join("config");
+        std::fs::create_dir_all(&config)?;
+        std::fs::write(config.join("ted.json"), contents)?;
+        Ok(())
+    }
+
+    /// Sets the `file_manager` argv `:Explore` runs, so the command can be
+    /// driven without Yazi or anything else installed.
+    fn set_file_manager(&self, argv: &str) -> anyhow::Result<()> {
+        self.write_config(&format!(r#"{{ "file_manager": {argv} }}"#))
+    }
+
     fn contents(&self) -> String {
         std::fs::read_to_string(self.file()).unwrap_or_default()
     }
@@ -786,6 +801,120 @@ fn interrupting_the_child_does_not_take_ted_with_it() -> anyhow::Result<()> {
     assert!(
         notification.contains("signal"),
         "the interrupted child was not reported: {notification:?}"
+    );
+    Ok(())
+}
+
+/// SPEC §13.4: `:Explore` suspends to a file manager and opens whatever it
+/// wrote to the chooser file. A scripted stand-in rather than Yazi, so the test
+/// depends on nothing being installed — and, since `ted` reads only the chooser
+/// file, on none of the real thing's behaviour either.
+#[test]
+fn explore_opens_what_the_file_manager_chose() -> anyhow::Result<()> {
+    let fixture = Fixture::new("explore", "alpha\n")?;
+    let first = fixture.path("first.rs");
+    let second = fixture.path("second.rs");
+    std::fs::write(&first, "fn first() {}\n")?;
+    std::fs::write(&second, "fn second() {}\n")?;
+    let explored = fixture.path("explored");
+
+    // Two paths, to show that a multiple selection opens as multiple buffers in
+    // one call. `{chooser}` is what `ted` substitutes; the rest is the script's.
+    fixture.set_file_manager(&format!(
+        r#"["sh", "-c", "echo '{}' > '{{chooser}}'; echo '{}' >> '{{chooser}}'; touch '{}'"]"#,
+        first.display(),
+        second.display(),
+        explored.display()
+    ))?;
+
+    let mut terminal = Terminal::open(&fixture.file(), &fixture.data_dir(), &[])?;
+    terminal.settle(STARTUP);
+
+    terminal.send(":Explore");
+    terminal.type_keys("\r");
+    terminal.wait_for_file(&explored, Duration::from_secs(10))?;
+    // A file manager is full-screen and has already had the user's attention,
+    // so `ted` takes the screen back without a prompt (SPEC §7.1).
+    terminal.settle(AFTER_KEYS);
+
+    // Which of the two ends up active is not something one call to `open_paths`
+    // promises, so cycle the pane and assert on what is in it. `main.rs` is
+    // still there too, so three steps see everything.
+    let mut opened = Vec::new();
+    for _ in 0..3 {
+        opened.push((terminal.status(), terminal.row(0)));
+        terminal.send(":bnext\r");
+    }
+
+    assert!(
+        opened.iter().any(|(status, _)| status.contains("first.rs")),
+        "the first chosen file was not opened: {opened:#?}"
+    );
+    let Some((_, drawn)) = opened
+        .iter()
+        .find(|(status, _)| status.contains("second.rs"))
+    else {
+        panic!("the second chosen file was not opened: {opened:#?}");
+    };
+    assert!(
+        drawn.contains("fn second()"),
+        "the chosen file's contents were not drawn: {drawn:?}"
+    );
+    Ok(())
+}
+
+/// SPEC §13.4: a missing binary surfaces on the notification line rather than
+/// failing silently — and, because it is found before anything is handed over,
+/// without the terminal ever leaving `ted`'s hands.
+#[test]
+fn explore_reports_a_file_manager_that_is_not_installed() -> anyhow::Result<()> {
+    let fixture = Fixture::new("explore-missing", "alpha\n")?;
+    fixture.set_file_manager(r#"["ted-no-such-file-manager"]"#)?;
+
+    let mut terminal = Terminal::open(&fixture.file(), &fixture.data_dir(), &[])?;
+    terminal.settle(STARTUP);
+    let mark = terminal.transcript_mark();
+
+    terminal.send(":Explore\r");
+
+    let notification = terminal.row(ROWS - 2);
+    assert!(
+        notification.contains("ted-no-such-file-manager"),
+        "the missing file manager was not reported: {notification:?}"
+    );
+    assert!(
+        !terminal.transcript_since(mark).contains("\u{1b}[?1049l"),
+        "ted gave up the alternate screen for a child it could not run"
+    );
+    assert!(
+        terminal.status().starts_with("NORMAL main.rs"),
+        "the buffer was not still on screen: {:?}",
+        terminal.status()
+    );
+    Ok(())
+}
+
+/// SPEC §9: a `ted.json` that cannot be parsed falls back to the defaults, and
+/// says so. Silence here is the worst outcome — the user would find out when
+/// `:Explore` ran a program they had configured away from.
+#[test]
+fn a_malformed_ted_json_is_reported_rather_than_ignored() -> anyhow::Result<()> {
+    let fixture = Fixture::new("ted-json", "alpha\n")?;
+    fixture.write_config(r#"{ "file_manager": ["yazi" }"#)?;
+
+    let mut terminal = Terminal::open(&fixture.file(), &fixture.data_dir(), &[])?;
+    terminal.settle(STARTUP);
+
+    let notification = terminal.row(ROWS - 2);
+    assert!(
+        notification.contains("ted.json"),
+        "the unusable config was not reported: {notification:?}"
+    );
+    // Reported, not fatal: there is still an editor under the notification.
+    assert!(
+        terminal.status().starts_with("NORMAL main.rs"),
+        "ted did not start with an unusable config: {:?}",
+        terminal.status()
     );
     Ok(())
 }

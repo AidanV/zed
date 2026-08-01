@@ -1,7 +1,8 @@
 # `ted` — a terminal UI for Zed
 
 **Status:** M0 and M1 implemented (§21); M2 in progress — the suspend primitive
-(§7.1) and `:!` (§13.4) are in, the rest of M2 is not started
+(§7.1) and both host commands over it, `:!` and `:Explore` (§13.4), are in; the
+navigation half of M2 is not started
 **Scope:** a new crate + binary in this repository that presents Zed's editor as a
 full-screen terminal application, using Ratatui for presentation and Zed's own
 `editor` + `vim` + `workspace` + `project` crates for all behaviour.
@@ -50,9 +51,11 @@ crates/ted/
     platform.rs         # TerminalPlatform, TerminalWindow, TerminalDisplay
     text_system.rs      # CellTextSystem (§5.6)
     bootstrap.rs        # App/AppState/Workspace construction (§9)
+    config.rs           # ted.json: the settings that are ted's alone (§9)
     frame.rs            # frame loop, dirty tracking, present (§7)
     input.rs            # terminal event -> gpui::Keystroke / PlatformInput (§8)
     suspend.rs          # handing the terminal to a child process (§7.1)
+    explore.rs          # :Explore over a file manager (§13.4)
     snapshot.rs         # ViewSnapshot: the backend -> frontend projection (§10)
     render/
       render.rs         # ratatui root
@@ -753,6 +756,22 @@ applies a non-persisted override layer:
   either way. Hiding chrome just means the editor gets the whole grid.
 - `vim_mode: true` unless `--no-vim`.
 
+**`ted`'s own settings.** The settings that exist only because `ted` is a
+terminal host — `file_manager` (§13.4) so far — live in **`ted.json`**, beside
+`settings.json` and `keymap.json` in the same config directory, read by `ted`
+alone. The shared file is shared on purpose: language config, tab size,
+formatters and LSP settings should mean the same thing in both. A key only one
+of the two can act on is a different thing, and putting it in `settings.json`
+would mean adding it to Zed's settings schema, offering it for completion in a
+GUI that cannot honour it, and making a single run of `ted` a permanent addition
+to a Zed user's configuration. Switching between GUI and TUI configures neither.
+
+`ted.json` is JSON with comments and trailing commas, like every other file Zed
+asks a user to write by hand. Absent means the defaults; unusable — malformed,
+or carrying a key `ted` does not know — falls back to the defaults *and reports
+on the notification line* (§13.3), because the alternative is a config that
+silently does nothing until the day it matters.
+
 **Keymap.** Load `assets/keymaps/default-linux.json` then, when vim is enabled,
 `assets/keymaps/vim.json`, each stamped with the right `KeybindSource` — the
 exact sequence in `crates/vim/src/test/vim_test_context.rs:100-119`. Then layer
@@ -1031,21 +1050,25 @@ distinguishable without parsing either. The command runs through the user's
 shell, so pipes, redirection and quoting mean what they mean at a prompt.
 
 **`:Explore`** suspends and runs a file manager, defaulting to
-[Yazi](https://yazi-rs.github.io) when it is on `PATH` (detected with the `which`
-crate, already a workspace dependency). Yazi exits writing its selection to
+[Yazi](https://yazi-rs.github.io). Yazi exits writing its selection to
 `--chooser-file`, one path per line, so the round trip is:
 
 ```
 :Explore  ->  suspend (§7.1)
-          ->  yazi --chooser-file=<tmp> --cwd-file=<tmp> <start-dir>
+          ->  yazi --chooser-file=<tmp> <start-dir>
           ->  resume, read the file, workspace.open_paths(paths, ..)
 ```
 
 Multiple selected paths open as multiple buffers in one call. The start directory
-is the active buffer's parent, falling back to the first worktree root. The
-command is a setting, not a hard-coded binary, so `broot`, `nnn` or `ranger` work
-by configuration; a missing binary surfaces on the notification line (§13.3)
-rather than failing silently or panicking.
+is the active buffer's parent, falling back to the first worktree root.
+
+The command is `ted.json`'s `file_manager` (§9) rather than a hard-coded binary —
+an argument vector with `{chooser}` and `{directory}` substituted into it, so
+`broot`, `nnn` or `ranger` work by configuration, and `ted` depends on none of
+the child's output beyond the chooser file. Presence on `PATH` is checked with
+the `which` crate before anything is handed over, so a missing binary surfaces
+on the notification line (§13.3) with the screen still `ted`'s, rather than as a
+spawn failure that flashes past between two full repaints.
 
 **Why an external file manager instead of a project panel.** Yazi is better at
 file *management* — bulk rename, move, delete, previews — than anything `ted`
@@ -1059,7 +1082,9 @@ files with Zed's ordering and history is a different interaction from browsing a
 tree, and `file_finder` already provides it. Both coexist; neither replaces the
 other.
 
-**Scope.** M2 targets local worktrees. Yazi has since grown a VFS layer with a
+**Scope.** M2 targets local worktrees, and `:Explore` declines on anything else
+rather than browsing this machine's filesystem on a project's behalf when the
+project's files are somewhere else. Yazi has since grown a VFS layer with a
 built-in `sftp` scheme, which makes the same integration work against an
 SSH-remote project — the chooser returns `sftp://host//path` and `ted` maps it
 back onto the project's connection. That is deferred to M5, where the rest of the
@@ -1292,8 +1317,7 @@ confirming `MacDispatcher`'s foreground wake path under §7's bridge.
 line, buffer switching, multiple items in one pane, diagnostics rendered
 inline, LSP completions as a popup. The suspend primitive (§7.1) with its
 reader-thread handshake, plus `:!` and `:Explore` over a local worktree (§13.4).
-The primitive and `:!` are implemented; `:Explore` and the navigation half are
-not.
+The primitive, `:!` and `:Explore` are implemented; the navigation half is not.
 *Acceptance:* a real editing session on this repository without leaving `ted`;
 suspending to a child and resuming leaves no input stolen, no stale grid and no
 altered terminal mode, asserted by the pty harness (§20.3).
@@ -1359,6 +1383,7 @@ connection (§13.4). Optionally move the frontend out of process across the
 | `:` command line | **`ted`'s own bottom line**, resolved through vim's existing interceptor rather than projecting Zed's palette modal. §13.2. |
 | File browsing and management | **Suspend to an external file manager**, Yazi by default, instead of building a project panel. Better at file management than anything `ted` would write, and its disk mutations propagate through the real `Project`'s fs watching for free. The fuzzy finder stays native. §7.1, §13.4, §21/M4. |
 | Terminal-host `:` commands | **A `ted`-local host-command table checked before the interceptor**, for commands that exist only because `ted` owns a tty. Not a second vim command parser; anything expressible as an action stays with the interceptor. §13.4. |
+| Where `ted`'s own settings live | **`ted.json`, beside `settings.json`**, read by `ted` alone — not a `ted` section in Zed's settings schema. `settings.json` is shared because its keys mean the same thing in both; a key only `ted` can act on does not, and putting it there would make one run of `ted` a permanent addition to a GUI user's configuration. Switching between GUI and TUI configures neither. §9. |
 
 ### Remaining
 

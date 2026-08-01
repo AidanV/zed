@@ -5,6 +5,8 @@
 pub mod bootstrap;
 pub mod cell;
 pub mod command_line;
+pub mod config;
+pub mod explore;
 pub mod frame;
 pub mod input;
 pub mod palette;

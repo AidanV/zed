@@ -30,6 +30,8 @@ use util::ResultExt as _;
 
 use crate::bootstrap::{self, Backend};
 use crate::command_line::{CommandLine, Effect, HostCommand, Update};
+use crate::config::{self, Config};
+use crate::explore;
 use crate::input::keystroke_for;
 use crate::palette::{ColorDepth, Palette};
 use crate::platform::{TerminalPlatform, TerminalWindowState, set_window_grid};
@@ -142,6 +144,7 @@ struct Tty {
 /// reserved-row count and the lines that justify it cannot drift apart.
 struct Session {
     backend: Backend,
+    config: Config,
     palette: Palette,
     columns: u16,
     rows: u16,
@@ -178,13 +181,17 @@ async fn drive(
         reader: Reader::spawn(sender),
     };
 
+    // Read here rather than during bootstrap so a malformed `ted.json` has a
+    // notification line to be reported on (SPEC §9).
+    let (config, complaint) = config::load();
     let mut session = Session {
         backend,
+        config,
         palette,
         columns,
         rows,
         command_line: None,
-        messages: Vec::new(),
+        messages: complaint.into_iter().collect(),
         busy_frames: BUSY_FRAMES_AFTER_INPUT,
     };
     let mut reserved = u16::MAX;
@@ -316,13 +323,32 @@ async fn suspend_to(
     reserved: u16,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    let child = match command {
-        HostCommand::Shell(command) => suspend::Child::shell(&command),
+    let (child, explore) = match command {
+        HostCommand::Shell(command) => (suspend::Child::shell(&command), None),
+        HostCommand::Explore => match cx
+            .update(|cx| explore::prepare(&session.config, &session.backend, cx))
+        {
+            Ok((child, explore)) => (child, Some(explore)),
+            // Nothing has been handed over yet, so there is still a screen to
+            // say so on.
+            Err(error) => {
+                session.messages.push(format!("Explore: {error}"));
+                return Ok(());
+            }
+        },
     };
 
     let message = suspend::run(child, &tty.reader, &mut tty.terminal, cx).await?;
     session.messages.extend(message);
     tty.painted = None;
+
+    // After the terminal is back, so a failure to open has somewhere to be
+    // reported and the buffers it opens are drawn on the next frame.
+    if let Some(explore) = explore {
+        session
+            .messages
+            .extend(explore.open_selection(&session.backend, cx).await);
+    }
 
     if let Some((columns, rows)) = crossterm::terminal::size().log_err() {
         session.columns = columns;
