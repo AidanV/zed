@@ -2,7 +2,7 @@
 
 **Status:** M0 and M1 implemented (§21); M2 in progress — the suspend primitive
 (§7.1) and both host commands over it, `:!` and `:Explore` (§13.4), are in; the
-navigation half of M2 is not started
+navigation half of M2 is specified in §24 and not started
 **Scope:** a new crate + binary in this repository that presents Zed's editor as a
 full-screen terminal application, using Ratatui for presentation and Zed's own
 `editor` + `vim` + `workspace` + `project` crates for all behaviour.
@@ -818,7 +818,7 @@ pub struct ViewSnapshot {
     pub editor: Option<EditorView>,
     pub status: StatusView,
     pub command_line: Option<CommandLineView>,
-    pub overlay: Option<OverlayView>,
+    pub overlay: Option<OverlayView>,     // §24.1
     pub notifications: Vec<NotificationView>,
     pub cursor: Option<CursorView>,       // terminal hardware cursor
 }
@@ -986,7 +986,10 @@ Two honest options:
 
 **Recommendation:** Own for M2 (fast, unblocks `:` and file open), Mirror from
 M3 onward as the general mechanism, because it is the only approach that scales
-to the dozens of pickers Zed has. `ted` keeps a registry mapping modal `TypeId`
+to the dozens of pickers Zed has. Own is also, for now, the only option that
+needs no upstream change first: `FileFinderDelegate` is a public struct whose
+constructor and every field are private (`crates/file_finder/src/file_finder.rs:368-390`),
+so there is nothing to read even before the rendering question arises (§24.4). `ted` keeps a registry mapping modal `TypeId`
 → projection adapter, with a generic fallback that renders
 `[modal: <type name> — not yet supported in ted]` so an unmirrored palette
 degrades visibly instead of invisibly swallowing keys.
@@ -1265,12 +1268,15 @@ Kept deliberately small, additive, and defaulted.
 | `editor` | `pub fn style(&self) -> Option<&EditorStyle>` (field exists at `editor.rs:1066`). Needed for `highlighted_chunks`. Alternative — make `create_style` public — is also acceptable; the accessor is less surface. |
 | `editor` | Make `PositionMap` (`element.rs:10100`, currently `pub(crate)`) readable, **or** confirm `ted` can compute everything from `DisplaySnapshot`. Prefer the latter; only escalate if a real gap appears. |
 | workspace root `Cargo.toml` | add `crates/ted` to `members`; add `ratatui`, `crossterm`, `unicode-width`, `unicode-segmentation`, `arboard` to `[workspace.dependencies]`. |
+| workspace root `Cargo.toml` | add `underline-color` to `ratatui`'s feature list. It is in Ratatui's defaults, and the workspace takes `default-features = false`, so severity-coloured underlines (§24.8) are otherwise unreachable. |
 
 ### 20.2 Likely, as milestones land
 
 | Crate | Change |
 |---|---|
-| `picker` | Defaulted `PickerDelegate::text_for_match(&self, ix) -> Option<PickerRowText>`, for §13.1's Mirror strategy. |
+| `picker` | Defaulted `PickerDelegate::text_for_match(&self, ix) -> Option<PickerRowText>`, for §13.1's Mirror strategy. The trait already has the precedent — `render_match_with_checkbox` defaults to `None` (`crates/picker/src/picker.rs:377-386`) — but note that `set_selected_index`, `update_matches`, `confirm` and `dismissed` all take `&mut Window`, so Mirror drives a picker through a window rather than beside one. |
+| `editor` | A public reader for the completions menu — `context_menu` is private (`editor.rs:1006`) and `context_menu_visible()` / `context_menu_origin()` are the only public readers, so nothing outside the crate can see an entry, a label or the selection. Prefer a method returning plain data over `&CompletionsMenu`, which keeps §10's no-handles rule intact. One reader also unblocks signature help and code actions (§24.9). |
+| `vim` | `pub fn status_label(editor, cx)`, in the shape of the `vim::mode` and `vim::take_command_line_prefix` helpers that already exist for embedders (`crates/vim/src/vim.rs:507`, `:517`). `Vim::status_label` is a public field (`:553`) but `VimAddon` is `pub(crate)`, so `ctrl-g` (`vim::ShowLocation`) shows nothing in `ted` (§24.5). |
 | `gpui` | **Nothing required.** `Window::draw`, `dispatch_keystroke`, `dispatch_event` and `pending_input_keystrokes` are public; `Platform`, `PlatformWindow` and `PlatformTextSystem` are public traits. |
 | `gpui_linux` | Nothing required — but `headless/window.rs` is the reference implementation for `TerminalWindow`. If duplication becomes annoying, promote the atlas stub to `gpui` as a shared `NullAtlas`. |
 
@@ -1330,18 +1336,30 @@ confirming `MacDispatcher`'s foreground wake path under §7's bridge.
 
 **M2 — Navigation.** Own-implementation `:` completions, file finder, go-to-
 line, buffer switching, multiple items in one pane, diagnostics rendered
-inline, LSP completions as a popup. The suspend primitive (§7.1) with its
+inline, LSP completions as a popup — **each specified in §24**, which is where
+the design direction for them lives. The suspend primitive (§7.1) with its
 reader-thread handshake, plus `:!` and `:Explore` over a local worktree (§13.4).
 The primitive, `:!` and `:Explore` are implemented; the navigation half is not.
-*Acceptance:* a real editing session on this repository without leaving `ted`;
-suspending to a child and resuming leaves no input stolen, no stale grid and no
-altered terminal mode, asserted by the pty harness (§20.3).
+*Acceptance:* §24.10, plus the suspend half already asserted by the pty harness
+(§20.3) — no input stolen, no stale grid, no altered terminal mode.
 
 **M3 — Fidelity.** Mirror-strategy modal projection with the `PickerDelegate`
 hook. Blocks, folds, inlay hints, git diff gutter, multi-cursor, visual block.
 Mouse. 256/16-colour fallbacks. *Acceptance:* the modal registry covers command
 palette, file finder, outline, project symbols, and the generic fallback is
 never hit in normal use.
+
+**M3.5 — The status line, and completions.** Two things M2 deliberately set
+aside, grouped because each is a design of its own rather than a feature to
+finish. The status line gets one: what it carries (mode, path, position,
+diagnostics counts, vim's location string from `ctrl-g`, pane and item
+indicators), how it behaves when the grid is narrow, and what belongs on it at
+all rather than on a surface of its own — every §24 question that ended "waits
+for the status line" lands here. Alongside it, the language-server completions
+popup (§24.9), signature help and the code-action menu, which arrive together
+behind one new `editor` reader (§20.2). This milestone also settles what
+"quit" means once the last item in a pane closes (§24.7): exiting on an empty
+pane is M2's placeholder, not the intended behaviour.
 
 **M4 — Layout.** Pane splits rendered as cell-space splits driven by reported
 bounds. No project panel: §13.4's external file manager covers browsing and file
@@ -1398,6 +1416,16 @@ connection (§13.4). Optionally move the frontend out of process across the
 | `:` command line | **`ted`'s own bottom line**, resolved through vim's existing interceptor rather than projecting Zed's palette modal. §13.2. |
 | File browsing and management | **Suspend to an external file manager**, Yazi by default, instead of building a project panel. Better at file management than anything `ted` would write, and its disk mutations propagate through the real `Project`'s fs watching for free. The fuzzy finder stays native. §7.1, §13.4, §21/M4. |
 | Terminal-host `:` commands | **A `ted`-local host-command table checked before the interceptor**, for commands that exist only because `ted` owns a tty. Not a second vim command parser; anything expressible as an action stays with the interceptor. §13.4. |
+| File finder shape | **Helix's picker, two columns, no preview pane** — a bordered box, query and match count on the top row, then file name and dimmed directory. Ranked by score alone; recents only when the query is empty. §24.4. |
+| Go to line | **Nothing new.** `:42` through vim's interceptor is the feature; no preview, no `ted`-owned surface. The only code is a bare number prompt for `--no-vim`, where there is no `:` line. §24.5. |
+| Buffer switching | **A small box in the top middle, most recent first**, where Zed puts its own switcher. Cycling only — no query row, no preview, no closing from the list. One surface, one verb. §24.6. |
+| Several items in one pane | **A tab strip along the top, shaped like Zed's**, which costs one rect offset in the projection. No numbers, overflow scrolls to keep the active tab visible, labels from `Pane::tab_details`. `:q` closes a tab and the rest take its place. §24.7. |
+| The `:` line | **Ghost text, not a list.** One row: the rest of the best-matching command dimmed after the cursor, `right` accepts it, a count on the right. Nothing ever covers the buffer for a half-typed command. §24.3. |
+| Keys in `ted`'s own surfaces | **`ctrl-n` / `ctrl-p` move a selection, and only those** — not `ctrl-j`/`ctrl-k`, not the arrows. Every surface opens with an empty query, and there is no `:` command history. §24.2, §24.3. |
+| Overlay behaviour | **Floats over the editor and never reserves rows**, so the buffer behind it never relayouts — and therefore **grows to fit its matches**, downward from a fixed top edge, up to a cap. The query row never moves; only the bottom border does. The selected row is the theme's selection background and nothing else — no bar, no caret — and the editor behind is left undimmed. §24.1. |
+| Terminals `ted` targets | **kitty and Ghostty, with a complete font.** No ASCII fallback for box drawing and no capability checks around it. This also makes §8.2's legacy keyboard mode and §12's 16-colour tier work for terminals `ted` no longer aims at — both are M3 items and can be dropped rather than built. §24.1. |
+| Diagnostics | **Severity in the buffer, message on demand.** A straight coloured underline (not a curl, which would cost a hand-written Ratatui backend), severity by colour with no glyph, dead code dimmed, and nothing that moves the code being read. `shift-k` opens a railed panel over the editor carrying the diagnostic *and* the language server's documentation, the rail's colour saying which is which. §24.8. |
+| Status line, and completions | **Both out of M2** (§21/M3.5). The status line needs a design rather than another field, and the completions popup is the one M2 surface that needed an upstream `editor` change — deferring it leaves M2 requiring no change to any crate but `ted`. §24.9, §24.10. |
 | Where `ted`'s own settings live | **`ted.json`, beside `settings.json`**, read by `ted` alone — not a `ted` section in Zed's settings schema. `settings.json` is shared because its keys mean the same thing in both; a key only `ted` can act on does not, and putting it there would make one run of `ted` a permanent addition to a GUI user's configuration. Switching between GUI and TUI configures neither. §9. |
 
 ### Remaining
@@ -1411,3 +1439,764 @@ connection (§13.4). Optionally move the frontend out of process across the
    disagree on East Asian ambiguous-width. `ted` is self-consistent either way,
    but the *setting* needs a default chosen — narrow (matches most modern
    terminals) is the likely answer, with an override.
+4. **One detail of M2's look.** Everything else is decided (§23's table above).
+   What is left is the right-hand end of the `:` line (§24.3): the candidate
+   count, the selected action's keybinding, or — the likely answer — the
+   keybinding when the selected action has one and there is room for it, and the
+   count otherwise.
+
+---
+
+## 24. M2 — Navigation, surface by surface
+
+§21's M2 line names seven features. This section says what each one *is*: the
+state it reads, the keys it answers to, what it puts on the grid, and the choices
+still open. M1 made one buffer editable; M2 is the milestone where `ted` stops
+being one buffer, and every feature in it answers one of two questions — *what
+else is there* (the finder, the switcher, several items in a pane) or *what is
+here* (`:` completions, go-to-line, diagnostics, language-server completions).
+
+| Feature | The surface it needs | § |
+|---|---|---|
+| `:` completions | the `:` line itself — ghost text, no list | 24.3 |
+| File finder | a Helix-shaped picker, name and directory columns | 24.4 |
+| Go to line | nothing new — `:42` already does it | 24.5 |
+| Buffer switching | a small box, top-middle, most recent first | 24.6 |
+| Several items in one pane | a tab strip, and what `:q` closes | 24.7 |
+| Diagnostics inline | underline in the buffer, message on `shift-k` | 24.8 |
+| Language-server completions | **deferred past M2**; §24.9 records the shape | 24.9 |
+
+Two of them — the finder and the switcher — are the same widget with different
+content, which is why §24.1 specifies that widget once and those two sections
+only say what fills it. Nothing else in M2 is an overlay: the `:` line stays one
+row, the tab strip is a row of its own, and diagnostics live in the buffer until
+asked about.
+
+**Two things M2 deliberately does not touch.** The status line needs a design of
+its own and gets a milestone of its own (§21), so nothing here adds to it —
+where a surface wants to report something the status line would carry, it waits.
+And language-server completions move out with it (§24.9): the popup is the one
+M2 surface that needed an upstream `editor` change, and deferring it leaves M2
+with no required change to any crate but `ted`.
+
+Two constraints from earlier sections govern all of it. §13.1 decided **Own for
+M2**: these are `ted`'s own lists over Zed's own data, not projections of Zed's
+`Picker` views, and the Mirror hook that replaces them is M3. And §10's rule
+still holds — the `ViewSnapshot` carries no GPUI handles, so every list below is
+plain rows of text and byte offsets by the time the renderer sees it.
+
+### 24.1 The list overlay: one widget, two consumers
+
+**What it is.** A rectangle of rows painted over the editor, with an optional
+query line, a selected row, and a footer. §10.1 already reserves the field
+(`overlay: Option<OverlayView>`); M2 is where it acquires a shape:
+
+```rust
+pub struct OverlayView {
+    /// Painted into the top border, Helix-style: "files", "buffers".
+    pub title: Option<String>,
+    pub query: Option<QueryView>,        // absent when the list is not filtered
+    pub rows: Vec<OverlayRow>,
+    pub selected: Option<usize>,
+    pub footer: Option<String>,          // "12 of 340", "no matches"
+    /// Grid (§24.4) | TopCentre (§24.6) | AtCell(CellPoint) (§24.9, later)
+    pub placement: OverlayPlacement,
+}
+
+pub struct OverlayRow {
+    pub text: String,
+    pub spans: Vec<StyledSpan>,          // the editor's span type, reused
+    /// Byte offsets in `text` that matched the query, emphasised by the
+    /// renderer. Both `fuzzy_nucleo::StringMatch` and `CommandInterceptItem`
+    /// already report their matches in exactly this form.
+    pub matched: Vec<usize>,
+    /// Right-aligned on the same row: a keybinding, a directory, a count.
+    pub trailing: Option<String>,
+}
+```
+
+**It floats; it does not reserve.** This is the one structural decision in
+§24 and it is not cosmetic. `ted`'s bottom lines are *reserved* rows: the GPUI
+window is sized to the grid minus them (§10.2), so a line appearing resizes the
+window (`frame.rs`, `wanted != reserved` → `resize_window`). A resize relays out
+the editor and, on a large file, starts an asynchronous rewrap
+(`DisplayMap::is_rewrapping`). A ten-row list that grows and shrinks with every
+keystroke of a query would therefore reflow the whole buffer on every keystroke,
+and the user would watch the text behind the finder shuffle while typing. So the
+overlay is painted *over* the editor's cells, after the editor and before the
+bottom lines, and the window keeps its size. The editor underneath is unchanged
+and simply obscured.
+
+Two consequences worth stating because they are easy to get wrong:
+
+- **The hardware cursor moves into the overlay.** §7 places the terminal's real
+  cursor at the editor's primary cursor; while an overlay owns the keyboard the
+  cursor belongs in its query field, as a bar, regardless of vim's mode. An
+  overlay with no query (§24.9) hides the cursor rather than leaving it under
+  the popup.
+- **Overlay text goes through the same placement path as buffer text.**
+  `render::write` already walks graphemes and honours cell widths; `matched`
+  offsets are byte offsets, so they map through `byte_to_cell_table` like every
+  other conversion (§5.4). No second conversion path.
+
+**Decided: a box grows to fit its matches, downward, from a fixed top edge.** No
+blank rows are ever painted inside a box. The top edge — and with it the query
+row, which is the row being typed on — stays where it is; only the bottom edge
+moves, so the text under the cursor never shifts while the box is open.
+
+This is free precisely because §24.1's other decision went the way it did. If the
+overlay reserved rows, a height that changed on every keystroke would resize the
+GPUI window on every keystroke, and the buffer behind it would relayout and
+rewrap each time. Floating over the editor means a changing height costs one more
+row of painting and nothing else.
+
+**Scrolling.** The box grows only to a cap — a fraction of the grid, since a
+finder that covers the file it is about to open is a worse finder. Past that the
+list scrolls to keep the selection visible and the footer reports the position in
+the full list.
+
+**Both consumers are bordered boxes**, differing only in size and where they sit:
+the finder fills the grid (§24.4), the switcher is small and centred at the top
+(§24.6). Both are places you go, rather than lines you type on — which is why the
+`:` line, which you type on, stayed one row (§24.3). Nothing is anchored to a
+cell until completions arrive (§24.9).
+
+**No ASCII fallback.** `ted` targets kitty and Ghostty with a complete font, so
+box drawing, `▌`, `•` and `⋯` are assumed to render. Nothing in §24 needs a
+`+-|` twin, and none of it is guarded by a capability check.
+
+**Decided: the selected row is a background tint, and nothing else.** No `▌` bar,
+no `>` caret, so every row starts at the same column and no cells are spent on
+marking three-quarters of the list as *not* selected. The tint is the theme's
+own — `EditorStyle`'s selection background, the same colour a selection in the
+buffer uses (§10.3) — so it moves with the theme rather than being a colour `ted`
+invented.
+
+**The editor behind a box is not dimmed.** The border and the tint already say
+what is in front, and dimming would mean repainting every cell outside the box
+with a modified style on every frame — the one thing §19's budget says the
+terminal write should not be doing.
+
+### 24.2 Who owns the keyboard, and how a surface opens
+
+**What it is.** M1 had two keyboard owners: the `:` line, and everything else
+(GPUI's dispatch tree). M2 adds a third — an open overlay — and the rule stays
+the same: exactly one owner per keystroke, and `ted`'s own surfaces sit in front
+of GPUI, so a key that reaches an overlay never reaches the dispatch tree.
+
+The interesting half is not who owns a key but **how the surface opens at all**.
+`ctrl-p` is `file_finder::Toggle` (`assets/keymaps/default-linux.json`), `ctrl-g`
+is `go_to_line::Toggle`, `ctrl-tab` is `tab_switcher::Toggle`, and vim's own
+keymap adds `space f` and `space b`. Those bindings resolve inside GPUI, and what
+they open is a `Picker` modal `ted` cannot paint — today that lands on the "a
+modal is open that `ted` cannot render" notification (`snapshot.rs`).
+
+Three ways to get in front of that, in descending order of preference:
+
+1. **Rewrite the binding, not the key.** `ted` already loads and edits the keymap
+   at bootstrap — `filtered_action_names` drops the font-size bindings (§5.5).
+   The same pass can *retarget* every binding whose action is a modal `ted` owns
+   onto a `ted`-local action (`ted::OpenFileFinder`, `ted::OpenBufferSwitcher`,
+   `ted::GoToLine`, and `ted::Hover` for `shift-k` — §24.8 builds that box from
+   the buffer's diagnostics, so the editor's own hover machinery is not wanted),
+   handled by `App::on_action`
+   (`crates/gpui/src/app.rs:2164`) — a global listener, which runs at the end of
+   the bubble phase and therefore only when nothing in the window consumed the
+   action. Nothing else registers these, so nothing else can. The handler raises
+   a flag the frame loop reads. Every binding keeps working — including
+   multi-keystroke vim ones and anything in the user's `keymap.json` — because
+   GPUI still resolves the keystroke; only the action at the end of it changes.
+   Recommended.
+2. **A keystroke table checked before dispatch**, the shape `opens_command_line`
+   already has. Simple, but it can only see single keystrokes: `space f` is a
+   two-key binding resolved inside GPUI, and duplicating the keymap to find it
+   would be exactly the drift §13.1 is trying to avoid.
+3. **Let the modal open and mirror it.** The right long-run answer, and it is
+   M3's Mirror strategy (§13.1, §20.2). Not M2.
+
+**The table is consulted in two places, not one.** Rewriting the keymap catches
+every *keystroke*, and nothing else. A `:` command reaches the same modal by a
+different road: `:ls` and `:buffers` resolve inside vim's interceptor to
+`tab_switcher::ToggleAll` (`crates/vim/src/command.rs:1665-1666`), which arrives
+at `ted` as a `Box<dyn Action>` that no keymap pass has seen and that
+`CommandPaletteFilter` does not touch, because the interceptor is asked before
+any filtering. So the same action → surface table is applied a second time at the
+moment `ted` dispatches an effect from the `:` line (`Effect::Dispatch`), turning
+an action `ted` owns into its own overlay. With only the keymap half, `ctrl-tab`
+and `:ls` do different things.
+
+With both halves in place, the originals are hidden from the `:` line's
+action-name fallback through `CommandPaletteFilter`, the way the font-size
+actions are, and `ted`'s own actions take their place in the completion list.
+
+**Keys, once a surface is open.** One vocabulary across every consumer, so
+nothing has to be learnt twice:
+
+| Key | Effect |
+|---|---|
+| printable, `backspace`, `delete`, `left`/`right`, `home`/`end` | edit the query |
+| `ctrl-n` / `ctrl-p` | move the selection — and *only* these |
+| `enter` | confirm the selection |
+| `esc`, `ctrl-c` | dismiss, leaving the editor as it was |
+| `ctrl-s` / `ctrl-v` | confirm into a horizontal / vertical split (M4 renders them) |
+
+`esc` dismisses the overlay rather than quitting `ted`, exactly as it cancels an
+open `:` line today.
+
+**Two decisions inside that table, both deliberate.** `ctrl-j`/`ctrl-k` do not
+move the selection, and neither do the arrow keys: one pair of keys does one job
+everywhere, and nothing else claims `up`/`down` (§24.3 does not — there is no
+command history). And **a surface always opens with an empty query** —
+nothing is recalled from the last time it was open, so the first character typed
+is always the first character of the search rather than an edit to a query the
+user has to notice and clear.
+
+### 24.3 The `:` line's completions
+
+**Decided: ghost text on the line, and no list.** The `:` line stays one row. The
+rest of the selected command appears dimmed after the cursor, `right` accepts it
+into the query, and a count on the right says how many other candidates the
+matcher found. Nothing ever covers the buffer for a half-typed command, and the
+`:` line is not a consumer of §24.1's overlay after all.
+
+```
+  41     let snapshot = build_snapshot(&session, reserved)?;
+  42
+  43     render(&snapshot, &session.palette, frame.buffer_mut());
+  44 }
+  45
+ :wq — write and quit                                        ctrl-n: 4 more
+ NORMAL crates/ted/src/frame.rs [+]                                  128:12
+```
+
+**Keys.** `ctrl-n` / `ctrl-p` move through the candidates, replacing the ghost;
+`right` at the end of the query accepts the ghost; `enter` runs the selected
+candidate whether or not the ghost was accepted; `esc` cancels. `up` / `down` do
+nothing here.
+
+Two smaller gaps go with it:
+
+- **Matching.** Action names are matched today by a hand-rolled subsequence test
+  ordered by label length (`command_line.rs`, `matching_action_names`), which
+  decides which candidate the ghost shows — so with only one candidate visible,
+  the ordering *is* the feature. Zed's palette scores with
+  `fuzzy_nucleo::match_strings_async(.., Case::Smart, LengthPenalty::On, ..)`
+  (`crates/command_palette/src/command_palette.rs:491`; the matcher itself at
+  `crates/fuzzy_nucleo/src/strings.rs:100`). Calling it with the palette's own
+  arguments means `:w` ghosts whatever `:w` would have selected in GUI Zed, and
+  `fuzzy_nucleo` is the matcher the finder uses too.
+- **The keybinding, when there is room.** `Window::keystroke_text_for(&dyn
+  Action)` (`crates/gpui/src/window.rs:4861`) renders an action's binding as
+  text. With one row to work with it competes with the candidate count for the
+  right-hand end, which is the open question below — but showing it is what makes
+  `:save` teach you that `ctrl-s` was faster.
+
+**Where the state comes from.** Unchanged from §13.2 — the host table first
+(§13.4), then `GlobalCommandPaletteInterceptor::intercept`, then action names
+when the interceptor is not exclusive. M2 changes the ranking and the rendering,
+not the resolution.
+
+**Direction wanted.**
+
+- **The right-hand end of the line.** The candidate count (`ctrl-n: 4 more`), the
+  selected action's keybinding, or both when they fit and the count when they do
+  not.
+
+**No command history.** vim recalls previous `:` commands on `up`/`down`; `ted`
+does not, and it is not on the roadmap — so `up`/`down` stay unbound on the `:`
+line rather than being reserved for it.
+- **Host commands.** `:Explore` and `:!` are `ted`'s own (§13.4), and their ghost
+  reads like any other. Worth marking as `ted`'s — a distinct colour on the ghost
+  — or not worth the distinction?
+
+### 24.4 The file finder
+
+**What it is.** Type a few characters, get the project's files ranked, press
+`enter`, the file opens in the active pane. It is the only navigation surface
+with no vim-command equivalent to fall back on: Zed maps `:e`/`:edit` to
+`editor::actions::ReloadFile` rather than to opening a file
+(`crates/vim/src/command.rs:1475`), and the commands that do take a path —
+`:tabe <file>`, `:sp <file>`, `:vs <file>` (`:1499-1524`) — require typing it in
+full. §13.4 already settled that the finder and `:Explore` both exist and neither
+replaces the other: one searches, the other browses.
+
+**Where the state comes from.** Zed's own delegate cannot be reused —
+`FileFinderDelegate` is a public struct whose constructor and every field are
+private (`crates/file_finder/src/file_finder.rs:368-390`, `:960`), which is the
+concrete reason §13.1's "Own for M2" is the only option that does not need an
+upstream change first. Everything underneath it is public, and `ted` calls it
+directly:
+
+| What | Call |
+|---|---|
+| The worktrees to search | `WorktreeStore::visible_worktrees_and_single_files(cx)` (`crates/project/src/worktree_store.rs:441`) |
+| A candidate set per worktree | `project::PathMatchCandidateSet { snapshot, include_ignored, include_root_name, candidates: Candidates::Files }` (`crates/project/src/project.rs:6477-6489`) |
+| Ranking | `fuzzy_nucleo::match_path_sets(sets, query, relative_to, Case::Ignore, max, &cancel_flag, executor)` (`crates/fuzzy_nucleo/src/paths.rs:264`) → `PathMatch { score, positions, path, .. }` (`:46`) |
+| An empty query's rows | `Workspace::recent_navigation_history(limit, cx)` (`crates/workspace/src/workspace.rs:2763`) |
+| Opening | `Workspace::open_path`, the same call vim's `:e <file>` handler makes (`crates/vim/src/command.rs:641-666`) |
+
+That is the sequence `FileFinderDelegate::spawn_search` runs
+(`file_finder.rs:1043-1090`). What `ted` does not inherit is the merge of recents
+with fresh results and its comparator (`Matches::cmp_matches`,
+`file_finder.rs:629`), which is private — so the ranking policy is a decision
+`ted` makes rather than a port.
+
+**The search is asynchronous and cancellable, and the frame loop keeps
+painting.** `match_path_sets` takes an `&AtomicBool` and a background executor; a
+keystroke arriving while a search is in flight sets the flag and starts the next
+one. Until it lands, the overlay keeps showing the previous result set rather
+than blanking — on a repository this size the query changes faster than the scan
+finishes, and a list that empties between keystrokes reads as broken.
+
+**Decided: Helix's picker, in two columns, with no preview pane.** A bordered box
+the width of the grid, its top edge fixed and its height following the match
+count (§24.1); the query on the top row behind a `>` prompt with the count
+right-aligned beside it; a rule; then one row per match, the file name in a left
+column and its directory dimmed in a right one. Two files called
+`snapshot.rs` are told apart by the column next to them rather than by reading a
+path from the left, and no width goes to previewing a file that is one keystroke
+from being open anyway.
+
+```
+╭─ files ──────────────────────────────────────────────────────────────────────╮
+│ > ted/sna▏                                                             3/412 │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ snapshot.rs          crates/ted/src                                          │
+│ render.rs            crates/ted/src                                          │
+│ snapshot.rs          crates/ted/tests                                        │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+**Also decided, by consequence rather than by preference:**
+
+- **No `ctrl-h`.** Ignored files stay out; `include_ignored` is left `false`.
+- **Ranking is the matcher's score alone**, which is what Helix does and what the
+  borrowed shape implies. An empty query has nothing to score, so it lists
+  recents from `Workspace::recent_navigation_history`; the moment a character is
+  typed, score decides and recency stops mattering.
+- **Open files are not marked.** The tab strip (§24.7) is already on screen and
+  already says what is open, so a second answer in the finder would only be a
+  second thing to keep true.
+- **No icons.** They need a patched font to be anything but mojibake, and the
+  directory column is doing the work an icon would.
+
+**Direction wanted.** Nothing here — the surface is fully specified. What is left
+belongs to §24.1: how tall the box is, and how the selected row is marked.
+
+### 24.5 Go to line
+
+**Decided: `ted` builds nothing.** `:42` and `:$` already parse in vim's
+interceptor into a `vim::GoToLine` action and dispatch like any other
+(`crates/vim/src/command.rs:1859-1865`, handler `:865-887`), with no modal
+anywhere on the path, and that is the whole feature. No preview, no `ted`-owned
+line-jump surface, no second syntax. The rest of this section records what M2
+therefore does *not* do, so none of it is rediscovered later as a gap.
+
+- **No preview.** Zed's modal highlights the target row and centres it as the
+  number is typed, restoring the view on cancel
+  (`crates/go_to_line/src/go_to_line.rs:198-207`). `:42` jumps on `enter`, and
+  nothing happens before that.
+- **The line lands where vim puts it.** The modal confirms with
+  `SelectionEffects::scroll(Autoscroll::center())` (`:294`); vim's handler uses
+  default effects (`command.rs:865-887`), so the target lands wherever the
+  minimum scroll puts it — often the bottom row. Only vim's path exists in `ted`,
+  so there is nothing to disagree with until the modal is mirrored (M3), at which
+  point the same keystroke would have two behaviours and one of them has to give.
+- **`row:column` stays unavailable.** The modal parses `row:column` and relative
+  `+N`/`-N`/`fN`/`bN` (`go_to_line.rs:238-278`); vim's range parser handles `$`,
+  `.`, `%`, `+N`, `-N` (`command.rs:1264-1291`) and no columns. §13.4 forbids
+  `ted` from parsing `:` commands itself, so `:42:8` is an upstream addition to
+  vim or it is nothing.
+- **`ctrl-g` is a status-line question, and moves with it.** Under vim it is
+  `vim::ShowLocation` (`assets/keymaps/vim.json:75`), which writes
+  `Vim::status_label` (`crates/vim/src/vim.rs:553`, set at
+  `crates/vim/src/normal.rs:1027`) for a status-bar item `ted` does not render.
+  Nothing appears. That belongs to the status-line milestone (§21), not here.
+- **Without vim, `ctrl-g` is the one thing left to build**, because there is no
+  `:` line at all in a `--no-vim` session (§13.2 opens it only from a vim mode)
+  and `go_to_line::Toggle` would open a modal `ted` cannot paint. §24.2's table
+  routes it to a bare number prompt drawn like the `:` line, with no interceptor
+  behind it — a dozen lines, and the only go-to-line code in `ted`.
+
+### 24.6 Buffer switching
+
+**What it is.** The list of what is already open, most-recently-used first, with
+type-to-filter over it — Zed's tab switcher, as one of `ted`'s own lists.
+
+**What works today, and what is dead.** vim's command table resolves
+`:bn[ext]`, `:bN[ext]`, `:bp[revious]`, `:bf[irst]`, `:br[ewind]`, `:bl[ast]` and
+the whole `:tab*` family to real `workspace` actions, with counts
+(`crates/vim/src/command.rs:1655-1685`), and those reach a real `Pane` in `ted`
+today. `:ls` and `:buffers` resolve to `tab_switcher::ToggleAll` (`:1665-1666`),
+and `ctrl-tab` to `tab_switcher::Toggle` — both open a `Picker` modal `ted`
+cannot paint, so both are worse than missing: they swallow keys until `esc`.
+Those two are what M2 fixes.
+
+`:ls` is the case that forces §24.2's table to be consulted at dispatch as well
+as at keymap load: it arrives as an action the keymap pass never saw.
+
+**Where the state comes from.** The items as in §24.7, and the order from
+`Pane::activation_history()` / `Workspace::recently_activated_items(cx)` — the
+same two sources Zed's own switcher sorts by
+(`crates/tab_switcher/src/tab_switcher.rs:430`, `:502`), so "the second entry is
+where I just came from" holds in both. Filtering is `fuzzy::match_strings` over
+the labels, as everywhere else in §24.
+
+**One terminal-specific caveat.** ctrl-tab in a GUI is a *hold*: keep ctrl down,
+press tab to walk the list, release to confirm. That requires key-release events,
+which arrive only under the Kitty protocol's `REPORT_EVENT_TYPES` (§8.2) — and
+`ted` filters releases out today. Building the interaction on a key the terminal
+may never report would make the switcher behave differently on Terminal.app than
+on Ghostty, so the list confirms on `enter` and cancels on `esc` everywhere, and
+`ctrl-tab` while it is open simply moves the selection down.
+
+**On the grid.**
+
+```
+**Decided: a box in the top middle, most recent first.** Where Zed puts its own
+switcher, in the vocabulary §24.4 borrowed from Helix — a bordered box, the label
+column then a dimmed directory column, the selection on the second row because
+the first is the buffer you are already in. It floats like every other overlay
+(§24.1), so nothing behind it moves.
+
+```
+   1 //! The frame loop (SPEC §7) and the terminal's mode.
+   2          ╭──────────────────────────────────────────────╮
+   3          │ frame.rs •       crates/ted/src              │
+   4          │ snapshot.rs      crates/ted/src              │   ← selected
+   5          │ SPEC.md          crates/ted                  │
+   6          │ element.rs       crates/editor/src           │
+   7          ╰──────────────────────────────────────────────╯
+   8 use std::io::{Write, stdout};
+```
+
+**Decided: cycling only, with no query row.** The switcher is not a search — it
+is the list of what is open, and there are rarely enough of them to filter.
+`ctrl-tab` (and `ctrl-n`/`ctrl-p`) walks it, `enter` switches, `esc` cancels.
+That keeps it three rows shorter than the finder and keeps the two surfaces from
+blurring into each other: one is where you go to find a file, the other is where
+you go back to one.
+
+**No preview.** The selection moving does not activate anything; `enter` does.
+Zed's switcher behaves this way, and previewing would make `esc` a state change
+rather than a no-op.
+
+**No closing from the list either.** `tab_switcher::CloseSelectedItem` has no
+counterpart here; `:q` and `:bd` close buffers, and the switcher only switches.
+One surface, one verb.
+
+**Direction wanted.** Nothing, beyond §24.1's shared questions.
+
+### 24.7 Several items in one pane
+
+**What it is.** A pane holds a list of items and shows one. `ted` paints the
+active one and says nothing about the rest, because the tab bar is hidden (§9)
+and the status line reports a single path. That was honest in M1, when nothing
+could open a second file; from M2 on, `:Explore` returning three paths and the
+finder opening a fourth make it a hole of exactly the kind §14.3 refuses to
+accept — state the user can navigate into but cannot see.
+
+The navigation itself already works. vim's keymap binds `] b` / `[ b` to
+`pane::ActivateNextItem` / `ActivatePreviousItem`, `g t` / `g T` to
+`vim::GoToTab` / `GoToPreviousTab`, and `[ B` to `pane::ActivateItem(0)`
+(`assets/keymaps/vim.json`), all of which reach a real `Pane` through the
+dispatch tree and are correct today. What M2 owes is *sight* of it, and the
+closing semantics that follow.
+
+**Where the state comes from.** `Pane::items()` and `items_len()` for the list,
+the pane's active index for the marker, `Item::tab_content_text(0, cx)` for each
+label — the same call `snapshot::build` already makes for the status path, so
+labels are exactly the ones GUI Zed's tabs would carry — and `Item::is_dirty` for
+the modified marker.
+
+**Decided: a tab strip along the top, shaped like Zed's.** One row, the active
+tab carrying the editor's own background and the inactive ones a darker ground,
+separated the way Zed separates them. The strip is `ted`'s to paint, like the
+status line, and it is the only thing M2 adds above the editor.
+
+```
+ snapshot.rs │ frame.rs • │ render.rs │ SPEC.md
+   1 //! The frame loop (SPEC §7) and the terminal's mode.
+   2
+   3 use std::io::{Write, stdout};
+```
+
+**What that costs, mechanically** — this is the "rect offset". `ted` reserves
+rows only at the *bottom* today: `render::reserved_rows` counts upward from the
+status line, the GPUI window is sized to the grid minus that count, and the
+editor is painted at the rectangle the editor reports, whose row 0 is the
+terminal's row 0. A strip on top has nothing to do with that count; it means
+every rectangle the editor reports has to be shifted down by the strip's height
+before anything is painted from it. That is one addition in one place in
+`snapshot::build`, applied to `text_rect`, `gutter_rect` and the cursor together.
+Ten lines. The only way to get it wrong is to apply it to two of the three, which
+puts the cursor a row off its text — §5.4's failure mode wearing a new costume.
+
+**Decided: `:q` closes a tab and the others take its place.** vim's interceptor
+resolves it to `workspace::CloseActiveItem`, which does exactly that already. Two
+details follow: a save prompt (§13.3) must name the file it is about, since the
+item being closed need not be the one last looked at; and `ctrl-c` is the only
+single-key way out while any item remains.
+
+**Deferred: what happens when the last one closes.** `ted` exits when every pane
+is empty (`Backend::is_empty`) — "no buffers" is how quit reaches the frame loop
+today. That conflates closing a file with ending a session, and a later milestone
+replaces it: an empty pane should be a state `ted` can sit in, with quitting made
+explicit. Not M2; recorded here so the current behaviour is understood as a
+placeholder rather than a decision.
+
+**Decided, in the strip's details:**
+
+- **The active tab is the editor's own background**, inactive ones a darker
+  ground, exactly as Zed paints them — one row, no rule underneath, no second row
+  spent on marking which tab is live.
+- **No numbers.** `3gt` works and stays undiscoverable; the strip is a list of
+  file names, not a keyboard reference, and two cells per tab buys more room for
+  the names themselves.
+- **`•` after the label** is unsaved work, matching the switcher (§24.6).
+- **Overflow scrolls** so the active tab is always visible, the way Zed's tab bar
+  behaves. Eliding the middle would keep two tabs the user is not looking at and
+  hide the one they are.
+- **Labels come from `Pane::tab_details(items, window, cx)`**
+  (`crates/workspace/src/pane.rs:4913`), which is public and computes exactly the
+  detail level each tab needs — so two files called `mod.rs` grow a directory in
+  their labels and nothing else does.
+
+**Direction wanted.** Nothing.
+
+### 24.8 Diagnostics in the buffer
+
+**What it is.** Two things, deliberately kept apart: a mark under the offending
+text, which is always on, and the message, which appears only when asked for.
+`ted` gets the mark nearly free and has to reconstruct the message, because it is
+not readable where Zed keeps it.
+
+**The mark is already flowing, and its colour is being thrown away.**
+`highlighted_chunks(.., LanguageAwareStyling { diagnostics: true }, ..)` — the
+call `snapshot.rs` already makes — bakes severity into each chunk's
+`HighlightStyle` through `diagnostic_style(severity, ..)`
+(`crates/editor/src/display_map.rs:1907-1941`). `span_style` keeps only
+`underline: highlight.underline.is_some()` and discards the `UnderlineStyle`'s
+colour and its `wavy` flag, so an error and a warning look identical today.
+Carrying the colour through is the highest-value line in §24.8. What a terminal
+can do with it:
+
+- **Coloured underline** is `SGR 58`, which crossterm can emit
+  (`SetUnderlineColor`) and Ratatui carries as `Style::underline_color` — but
+  only with its `underline-color` feature, which is in Ratatui's default set and
+  therefore *off* here, since the workspace takes `default-features = false` with
+  `crossterm_0_29` and `std` (root `Cargo.toml`). A one-line change.
+- **Undercurl** (`CSI 4:3 m`) has no `Modifier` bit in Ratatui at all — there is
+  a single `UNDERLINED` — although crossterm knows `Attribute::Undercurled`.
+  Reaching it means `ted` implementing `Backend` itself rather than using
+  `CrosstermBackend`, since that is where cell attributes become escape
+  sequences; writing the escape around Ratatui instead would leave its diff
+  holding a wrong belief about the cell. Open, below.
+
+Where the raw severity is wanted rather than the styled colour — a gutter marker,
+a count — it is one layer down and fully public: `MultiBufferSnapshot::chunks`
+yields `Chunk { diagnostic_severity, is_unnecessary, underline, .. }`
+(`crates/language/src/buffer.rs:530-557`).
+
+**The message is not readable where Zed puts it.** Jumping to a diagnostic makes
+`Editor::activate_diagnostics` render the group into *block* rows
+(`crates/editor/src/diagnostics.rs:381-421`) behind a `RenderBlock` closure —
+`Arc<dyn Fn(&mut BlockContext) -> AnyElement>`
+(`display_map/block_map.rs:159`) — which is a private field on `CustomBlock` and
+returns an opaque element even if it were not. `blocks_in_range` hands `ted` the
+row and its height and nothing else. So `] d` in `ted` today jumps to the
+diagnostic and opens blank rows where the message belongs.
+
+`ted` reads the diagnostics from the buffer instead, which is public end to end:
+`EditorSnapshot` → `DisplaySnapshot::buffer_snapshot()` (`display_map.rs:1589`) →
+`MultiBufferSnapshot::diagnostics_in_range(range)`
+(`crates/multi_buffer/src/multi_buffer.rs:6198`) or `diagnostic_group(..)`
+(`:6176`) → `DiagnosticEntryRef { range, diagnostic }` → `Diagnostic { severity,
+message, group_id, is_primary, is_unnecessary, source, .. }`, every field public
+(`crates/language/src/diagnostic.rs:7-48`). That is the same source
+`Editor::inline_diagnostics` privately caches, so `ted` reads the original rather
+than a copy of it.
+
+Two things follow. Any message `ted` shows is its own text laid out in cells, not
+a projection of anything. And the editor's blocks are still there, occupying
+display rows and painting nothing — so `ted` keeps them from being inserted at
+all, which the settled design below makes easy: with the message on `shift-k`
+rather than under the line, there is nothing the blocks would have contributed.
+
+**Decided: the buffer shows severity and nothing else.** A coloured underline
+under the offending range, the colour carrying the severity with no glyph beside
+it, and dead code (`Diagnostic::is_unnecessary`, which is what Zed fades) dimmed.
+No end-of-line text, no rows inserted under the line, no gutter marker — the diff
+marker keeps the gutter cell it has, and nothing the language server says is ever
+allowed to move the code the user is reading.
+
+**Decided: a straight coloured underline, not a curl.** `SGR 58` through
+Ratatui's `Style::underline_color`, behind the `underline-color` feature (§20.1).
+A real undercurl would mean `ted` writing its own `Backend` in place of
+`CrosstermBackend` — around 150 lines, most of it Ratatui's own diff logic — for
+a difference the colour is already carrying.
+
+**Decided: the message appears on `shift-k`, in a railed panel over the editor.**
+`shift-k` is `editor::Hover` (`assets/keymaps/vim.json:78`), so the binding
+exists and needs no keymap work; `ted` retargets it the way §24.2 describes. The
+panel is a tinted block with a coloured bar down its left edge — no border, so
+nothing needs an ASCII fallback and four more cells go to the text. It dismisses
+on the next key.
+
+**The rail's colour says what kind of thing is talking.** The severity's colour
+for a diagnostic; a neutral accent for documentation from the language server. A
+position with both stacks them in one panel, diagnostics first, each with its own
+rail, so the two are never confused for one message.
+
+```
+  39     let reserved = reserved_rows(command_line.is_some(), prompt);
+  40     let snapshot = build_snapshot(&session, reserved)?;
+  41   ▌ error E0061
+  42   ▌ this function takes 5 arguments but 2 were supplied
+  43   ▌ rust-analyzer · 1 of 3 · ]d for the next
+  44   ▌
+  45   ▌ fn build_snapshot(session: &Session, reserved: u16, cx: &mut AsyncApp)
+  46   ▌ Reads the projection out of the entities. Must run after the draw.
+```
+
+**Documentation needs no upstream change either.** Zed's own hover popover keeps
+its text as an `Entity<Markdown>` behind `HoverState::info_popovers`
+(`crates/editor/src/hover_popover.rs:879-886`), which would mean reading rendered
+markdown back out of a view. `ted` asks the project instead:
+`LspStore::hover(&buffer, position, cx) -> Task<Option<Vec<Hover>>>`
+(`crates/project/src/lsp_store.rs:8180`), reached through `Project::lsp_store()`
+(`project.rs:2200`), returns `Hover { contents: Vec<HoverBlock { text: String,
+kind }>, range, language }` — all public (`project.rs:895-918`), all plain
+strings. `ted` lays them out itself, which is what it would do with the markdown
+anyway.
+
+Navigation between diagnostics already works and is unaffected: `] d` / `[ d` and
+`g ]` / `g [` are bound to `editor::GoToDiagnostic` / `GoToPreviousDiagnostic` in
+`assets/keymaps/vim.json`, `f8` / `shift-f8` in the Linux keymap.
+
+**Markdown is flattened in M2 and rendered later.** `HoverBlock::kind` says
+whether a block is markdown or plain text; M2 strips the markup and lays out the
+text, which is enough to read a type signature and a doc comment. Turning fences,
+emphasis and lists into terminal styling is a small renderer of its own and
+travels with the other deferred work (§21/M3.5) — the flattened version is not a
+placeholder that gets thrown away, it is the same panel with a better text pass
+behind it.
+
+**Direction wanted.**
+
+- **Counts.** A tally of the project's errors and warnings —
+  `Project::diagnostic_summary(false, cx)` returns exactly `{ error_count,
+  warning_count }` (`crates/project/src/project.rs:5080`) — would live in the
+  status line, so it waits for that milestone with everything else that would go
+  there.
+
+### 24.9 Completions from the language server — deferred
+
+**Deferred past M2**, and with it the one upstream change M2 would otherwise have
+required. What is settled is the shape: an outlined box at the cursor, placed
+where Zed places its menu, as text.
+
+```
+  39     let reserved = reserved_rows(command_line.is_some(), prompt);
+  40     let snapshot = build_sna▏
+  41                    ╭────────────────────────────────────────────╮
+  42                    │ build_snapshot      fn  (&Session, u16) -> │
+  43                    │ build_editor_view   fn  (&mut Editor, u16, │
+  44                    │ BUILD_PROFILE    const  &'static str       │
+  45                    ╰────────────────────────────────────────────╯
+```
+
+The rest of this section is the survey the milestone that picks it up starts
+from.
+
+**What it is.** The popup that appears as you type — and the only one of these
+surfaces that is a *pure projection*. Unlike the finder and the switcher, `ted`
+would not own the keyboard while it is up: the menu is the editor's own state,
+driven by editor actions that are already bound. `Editor && showing_completions` maps `enter` to
+`ConfirmCompletion`, `tab` to `ComposeCompletion`, `ctrl-n`/`ctrl-p`/`up`/`down`
+to `ContextMenuNext`/`Previous` and `pageup`/`pagedown` to First/Last
+(`assets/keymaps/default-linux.json:823-880`); vim adds `ctrl-x ctrl-o` →
+`ShowCompletions` (`assets/keymaps/vim.json:361`). That key context is derived
+from the editor's own state (`crates/editor/src/editor.rs:2683-2696`), so every
+one of those bindings resolves correctly in `ted` today. Keystrokes keep going
+exactly where they go now; `ted` has only to *see* the menu and paint it.
+
+**Seeing it is precisely what it cannot do.** `Editor::context_menu` is private
+(`editor.rs:1006`) and the only public readers are `context_menu_visible() ->
+bool` (`:4606`) and `context_menu_origin() -> Option<ContextMenuOrigin>`
+(`:4615`). `ted` can know that *a* menu is open and roughly what it is anchored
+to, and nothing about its contents — not the entries, not the selection, not even
+whether it is completions or code actions. **This is why the feature is
+deferred**: it is the only surface in §24 that cannot be built without an
+upstream change (§20.2) — a reader in the shape of
+`Editor::completions_menu(&self) -> Option<&CompletionsMenu>`, or better, a small
+method returning entries and selection as plain data, which fits §10's
+no-handles rule without `ted` touching editor-internal types at all.
+
+Everything behind that reader is already public: `CompletionsMenu::entries` and
+`selected_item` (`crates/editor/src/code_context_menus.rs:259`), `completions:
+Rc<RefCell<Box<[Completion]>>>`, `Completion::label: CodeLabel { text, runs,
+filter_range }` (`crates/language_core/src/code_label.rs:75-83`),
+`Completion::documentation`, and `Completion::kind()`
+(`crates/project/src/project.rs:6740`). `editor::styled_runs_for_code_label`
+(`editor.rs:12118`) turns a label's runs into styled ranges — the same call the
+GUI menu makes — so completion labels can carry syntax colour in the terminal for
+free once the entries are reachable.
+
+**Position is `ted`'s to compute.** The popup's bounds are decided inside
+`EditorElement::layout_cursor_popovers` (`element.rs:3783-3924`) and never
+written back onto the editor, so there is nothing to read — which is fine,
+because `ted` already knows the cursor's cell. The list opens on the row below
+the cursor, flips above when the rows are not there, and clamps to the text
+rect. `context_menu_origin()` still matters for the anchor that is not the cursor
+(`GutterIndicator(DisplayRow)`, which is how code actions deploy).
+
+**Blocked on the same reader:** signature help (`Editor::signature_help_state`,
+private, with no public reader at all — `editor.rs:1012`) and the code-action
+menu (the same `context_menu` field). All three arrive together or not at all,
+which is another reason they travel to a later milestone as one piece.
+
+**Still open when it is picked up.** Whether the box carries a documentation line
+under the list or nothing; whether the kind is a word (`fn`, `const`), a glyph or
+a colour; whether the signature column earns its width; whether labels take their
+syntax colour from `styled_runs_for_code_label` (free, and matches the GUI) or
+stay plain with only the matched characters emphasised; and what to paint when
+the open menu is code actions rather than completions.
+
+### 24.10 What M2 leaves out, what it needs upstream, and when it is done
+
+**Left out on purpose.**
+
+| Left out | Where it goes |
+|---|---|
+| Language-server completions, signature help, code actions (§24.9) | a later milestone, together, since one reader unblocks all three |
+| Markdown rendering in the hover panel (§24.8) | the same milestone; M2 flattens the text |
+| The status line's design — counts, `ctrl-g`'s location string, an item counter, anything else that would live there | its own milestone (§21) |
+| What "quit" means once the last item closes (§24.7) | the same milestone; `ted` exits on an empty pane until then |
+| Mirror-strategy projection of Zed's pickers (§13.1) | M3 — every list in §24 is `ted`'s own until then |
+| Project-wide search, outline and project-symbol pickers, mouse | M3 |
+| Rendered pane splits | M4 |
+| Edit predictions | not deferred so much as absent: §9 does not wire `edit_prediction` into the bootstrap at all |
+
+**Upstream changes.** With completions deferred, **M2 requires no change to any
+crate but `ted`**. What remains is one dependency flag and three proposals:
+
+| Crate | Change | Status |
+|---|---|---|
+| `ratatui` feature | enable `underline-color` in the workspace dependency | needed for severity-coloured underlines (§24.8) |
+| `editor` | a public reader for the completions menu | deferred with §24.9 |
+| `vim` | `pub fn status_label(editor, cx)`, in the shape of `vim::mode` | deferred with the status line (§24.5) |
+| `vim` | `:b <name>` / `:b <n>`, absent from the command table | proposal; expressible as `ActivateItem`, so §13.4 puts it upstream rather than in `ted`'s host table (§24.6) |
+| `vim` | `row:column` in the `:` range parser | proposal, so `:42:8` means the same in both (§24.5) |
+
+**Acceptance** (this expands the M2 line in §21): a real editing session on this
+repository without leaving `ted` — open it, find a file by name with the finder,
+jump to a line with `:42`, move between five open buffers and see all five in the
+tab strip, read a rust-analyzer error first as an underline where the code is
+wrong and then as a message on `shift-k`, and reach a command through the `:`
+line's ghost text without typing it out. The pty harness (§20.3) asserts the
+finder's grid, the switcher's order after two switches, the tab strip after a
+`:q`, the ghost text after two characters, and that `shift-k` on a diagnostic
+puts its text on screen. The suspend half of M2 keeps the acceptance it already
+has.
