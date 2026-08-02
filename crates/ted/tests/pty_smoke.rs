@@ -299,6 +299,11 @@ struct Screen {
     columns: u16,
     rows: u16,
     cells: Vec<char>,
+    /// The background each cell was written with, which is the only way to
+    /// assert on anything `ted` says with colour rather than with a glyph.
+    /// `None` is the terminal's own default background.
+    backgrounds: Vec<Option<(u8, u8, u8)>>,
+    background: Option<(u8, u8, u8)>,
     cursor: (u16, u16),
     pending: Vec<u8>,
 }
@@ -309,9 +314,17 @@ impl Screen {
             columns,
             rows,
             cells: vec![' '; usize::from(columns) * usize::from(rows)],
+            backgrounds: vec![None; usize::from(columns) * usize::from(rows)],
+            background: None,
             cursor: (0, 0),
             pending: Vec::new(),
         }
+    }
+
+    /// The background of one cell, by column and row.
+    fn background_at(&self, column: u16, row: u16) -> Option<(u8, u8, u8)> {
+        let index = usize::from(row) * usize::from(self.columns) + usize::from(column);
+        self.backgrounds.get(index).copied().flatten()
     }
 
     fn row(&self, index: u16) -> String {
@@ -332,12 +345,16 @@ impl Screen {
             if let Some(cell) = self.cells.get_mut(index) {
                 *cell = character;
             }
+            if let Some(background) = self.backgrounds.get_mut(index) {
+                *background = self.background;
+            }
         }
         self.cursor.0 = self.cursor.0.saturating_add(1).min(self.columns);
     }
 
     fn erase_all(&mut self) {
         self.cells.fill(' ');
+        self.backgrounds.fill(None);
     }
 
     fn is_blank(&self) -> bool {
@@ -422,8 +439,39 @@ impl Screen {
                     2 => start..start + usize::from(self.columns),
                     _ => start + usize::from(column)..start + usize::from(self.columns),
                 };
-                if let Some(cells) = self.cells.get_mut(range) {
+                if let Some(cells) = self.cells.get_mut(range.clone()) {
                     cells.fill(' ');
+                }
+                if let Some(backgrounds) = self.backgrounds.get_mut(range) {
+                    backgrounds.fill(None);
+                }
+            }
+            // Only the background is tracked: it is the one attribute a test
+            // here asserts on, and the rest would be state to keep correct for
+            // nobody. `0` resets it, `49` returns it to the terminal's default,
+            // and `48;2;r;g;b` sets it — the form a truecolor `ted` emits.
+            'm' => {
+                let mut parameters = numbers.iter().copied().peekable();
+                while let Some(parameter) = parameters.next() {
+                    match parameter {
+                        0 | 49 => self.background = None,
+                        48 => match parameters.next() {
+                            Some(2) => {
+                                let mut channel = || parameters.next().unwrap_or(0).min(255) as u8;
+                                let (red, green, blue) = (channel(), channel(), channel());
+                                self.background = Some((red, green, blue));
+                            }
+                            // An indexed background, which `ted` only emits
+                            // below truecolor. Not tracked, and saying so is
+                            // better than recording a colour it is not.
+                            Some(5) => {
+                                parameters.next();
+                                self.background = None;
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
                 }
             }
             'C' => self.cursor.0 = (self.cursor.0 + first.max(1)).min(self.columns),
@@ -773,6 +821,181 @@ fn a_file_is_drawn_with_a_gutter_and_a_status_line() -> anyhow::Result<()> {
         "status was {status:?}"
     );
     assert!(status.trim_end().ends_with("1:1"), "status was {status:?}");
+    Ok(())
+}
+
+/// Runs git against the fixture, with an identity the ambient environment
+/// cannot fail to provide and a config the developer's own `~/.gitconfig`
+/// cannot reach into. Blocking is what a test wants here: the repository has to
+/// exist before `ted` is started, not eventually.
+#[allow(clippy::disallowed_methods)]
+fn git(directory: &std::path::Path, arguments: &[&str]) -> anyhow::Result<()> {
+    let output = util::command::new_std_command("git")
+        .args(arguments)
+        .current_dir(directory)
+        .env("GIT_CONFIG_GLOBAL", "")
+        .env("GIT_CONFIG_SYSTEM", "")
+        .env("GIT_AUTHOR_NAME", "ted")
+        .env("GIT_AUTHOR_EMAIL", "ted@example.com")
+        .env("GIT_COMMITTER_NAME", "ted")
+        .env("GIT_COMMITTER_EMAIL", "ted@example.com")
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+/// SPEC §11 step 1: what git says about the file reaches the gutter. Needs a
+/// real repository, so it lives here rather than in the in-process tests.
+#[test]
+fn the_gutter_marks_what_git_says_changed() -> anyhow::Result<()> {
+    let fixture = Fixture::new("diff", "alpha\nbeta\ngamma\ndelta\nepsilon\n")?;
+    let git = |arguments: &[&str]| git(&fixture.directory, arguments);
+    git(&["init", "-b", "main"])?;
+    git(&["add", "main.rs"])?;
+    git(&["commit", "-m", "initial"])?;
+    // `beta` modified into a line long enough to soft-wrap, `delta` deleted
+    // outright, `omega` added at the end.
+    let changed = format!("CHANGED{}", "x".repeat(100));
+    std::fs::write(
+        fixture.file(),
+        format!("alpha\n{changed}\ngamma\nepsilon\nomega\n"),
+    )?;
+
+    let mut terminal = Terminal::open(&fixture.file(), &fixture.data_dir(), &["."])?;
+    terminal.settle(STARTUP);
+    // The diff is loaded on a background task after the first frame, so the
+    // markers arrive on a later one. A keystroke gives that frame something to
+    // be, and `send_until` waits for it rather than for the first quiet screen.
+    terminal.send_until("j", |screen| screen.row(1).trim_start().starts_with('~'));
+
+    let marker = |row: u16| terminal.row(row).chars().next().unwrap_or(' ');
+    assert_eq!(marker(1), '~', "modified row: {:?}", terminal.row(1));
+    // The wrapped remainder of that same row: one hunk, so the marker covers
+    // every display row it occupies rather than only the first.
+    assert_eq!(marker(2), '~', "wrapped continuation: {:?}", terminal.row(2));
+    assert_eq!(marker(5), '+', "added row: {:?}", terminal.row(5));
+    // A deletion leaves no row of its own, so its marker goes on the row that
+    // closed over it — `epsilon`, which followed the deleted `delta`.
+    assert_eq!(marker(4), '-', "row after the deletion: {:?}", terminal.row(4));
+    // An untouched row keeps a blank gutter.
+    assert_eq!(marker(0), ' ', "unchanged row: {:?}", terminal.row(0));
+    assert_eq!(marker(3), ' ', "unchanged row: {:?}", terminal.row(3));
+    Ok(())
+}
+
+/// SPEC §11 step 1: a collapsed hunk colours its marker and nothing else, and
+/// staging is the difference between the marker being coloured and not. This
+/// asserts on colour where the test above asserts on text.
+#[test]
+fn a_collapsed_hunk_colours_its_marker_and_leaves_the_line_alone() -> anyhow::Result<()> {
+    let fixture = Fixture::new("staged", "alpha\nbeta\ngamma\ndelta\n")?;
+    let git = |arguments: &[&str]| git(&fixture.directory, arguments);
+    git(&["init", "-b", "main"])?;
+    git(&["add", "main.rs"])?;
+    git(&["commit", "-m", "initial"])?;
+    // `beta` changed and staged; `delta` changed afterwards and left unstaged.
+    std::fs::write(fixture.file(), "alpha\nSTAGED\ngamma\ndelta\n")?;
+    git(&["add", "main.rs"])?;
+    std::fs::write(fixture.file(), "alpha\nSTAGED\ngamma\nUNSTAGED\n")?;
+
+    let mut terminal = Terminal::open(&fixture.file(), &fixture.data_dir(), &["."])?;
+    terminal.settle(STARTUP);
+    terminal.send_until("j", |screen| screen.row(1).trim_start().starts_with('~'));
+
+    // Both rows are modifications, so any difference between them is the
+    // staging and nothing else.
+    assert_eq!(terminal.row(1).chars().next(), Some('~'));
+    assert_eq!(terminal.row(3).chars().next(), Some('~'));
+    let staged = terminal.screen.background_at(0, 1);
+    let unstaged = terminal.screen.background_at(0, 3);
+
+    // The unstaged marker is the only coloured cell in its row.
+    assert!(
+        unstaged.is_some(),
+        "an unstaged marker should carry the hunk's tint"
+    );
+    assert_ne!(
+        staged, unstaged,
+        "staged and unstaged markers were painted the same"
+    );
+    // Neither row is highlighted across its width: the marker cell says the
+    // line changed, and the line itself is left as it would be unchanged. The
+    // gutter cell beside the marker, a text cell, and the same two cells on a
+    // row git never saw change, all agree.
+    let unchanged_gutter = terminal.screen.background_at(1, 0);
+    let unchanged_text = terminal.screen.background_at(10, 0);
+    for row in [1, 3] {
+        assert_eq!(
+            terminal.screen.background_at(1, row),
+            unchanged_gutter,
+            "row {row}'s gutter was tinted past its marker"
+        );
+        assert_eq!(
+            terminal.screen.background_at(10, row),
+            unchanged_text,
+            "row {row}'s text was tinted"
+        );
+    }
+    Ok(())
+}
+
+/// SPEC §11 step 1: expanding a modified hunk puts its deleted text on rows of
+/// its own, and each side of the change then says which side it is.
+#[test]
+fn an_expanded_modification_is_marked_as_a_deletion_and_an_addition() -> anyhow::Result<()> {
+    let fixture = Fixture::new("expanded", "alpha\nbeta\ngamma\n")?;
+    let git = |arguments: &[&str]| git(&fixture.directory, arguments);
+    git(&["init", "-b", "main"])?;
+    git(&["add", "main.rs"])?;
+    git(&["commit", "-m", "initial"])?;
+    std::fs::write(fixture.file(), "alpha\nCHANGED\ngamma\n")?;
+
+    let mut terminal = Terminal::open(&fixture.file(), &fixture.data_dir(), &["."])?;
+    terminal.settle(STARTUP);
+    terminal.send_until("j", |screen| screen.row(1).trim_start().starts_with('~'));
+    // Collapsed, one row stands for both sides of the change, and its text is
+    // no more highlighted than an unchanged row's.
+    assert_eq!(terminal.row(1).chars().next(), Some('~'));
+    assert_eq!(
+        terminal.screen.background_at(10, 1),
+        terminal.screen.background_at(10, 0)
+    );
+
+    // Through the `:` line's action-name fallback, since `ted` binds no key of
+    // its own to this (SPEC §24.3).
+    terminal.send_until(":expand all diff hunks\r", |screen| {
+        screen.row(1).trim_start().starts_with('-')
+    });
+
+    // The committed `beta` above the working tree's `CHANGED`, each marked for
+    // what it is rather than both marked `~`.
+    assert!(
+        terminal.row(1).starts_with('-') && terminal.row(1).contains("beta"),
+        "deleted side: {:?}",
+        terminal.row(1)
+    );
+    assert!(
+        terminal.row(2).starts_with('+') && terminal.row(2).contains("CHANGED"),
+        "added side: {:?}",
+        terminal.row(2)
+    );
+    // Expanded, the rows *are* the changed text, so each is tinted across its
+    // width — the highlight a collapsed hunk deliberately does not paint. The
+    // two sides carry different tints because they are different changes.
+    let deleted = terminal.screen.background_at(10, 1);
+    let added = terminal.screen.background_at(10, 2);
+    assert!(deleted.is_some(), "the deleted row should be tinted");
+    assert!(added.is_some(), "the added row should be tinted");
+    assert_ne!(deleted, added, "both sides were tinted the same");
+    assert_ne!(
+        deleted,
+        terminal.screen.background_at(10, 0),
+        "an expanded row should not look like an unchanged one"
+    );
     Ok(())
 }
 

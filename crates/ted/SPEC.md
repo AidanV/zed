@@ -892,7 +892,7 @@ when the pass completes.
 | Field | Source |
 |---|---|
 | `rows[].spans` | `EditorSnapshot::display_snapshot.highlighted_chunks(rows, LanguageAwareStyling::Enabled, &editor_style)` (`crates/editor/src/display_map.rs:1863`) |
-| `rows[].gutter` | `DisplaySnapshot::row_infos(start_row)` → `RowInfo { buffer_row, diff_status, expand_info, .. }` (`crates/multi_buffer/src/multi_buffer.rs:813`) |
+| `rows[].gutter` | `DisplaySnapshot::row_infos(start_row)` → `RowInfo { buffer_row, expand_info, .. }` (`crates/multi_buffer/src/multi_buffer.rs:813`) for the line number, and `MultiBufferSnapshot::diff_hunks_in_range` for the diff marker — **not** `RowInfo::diff_status`, which is `None` for the ordinary edited file whose gutter should still show what changed. `EditorElement` reaches the same hunks through `display_diff_hunks_for_rows` (`editor/src/git.rs`), which is `pub(super)`. `RowInfo::diff_status` is still read, but only for what it alone knows: it is set exactly on the rows of an *expanded* hunk, which is how each side of an expanded modification is marked for what it is (§11 step 1). |
 | `rows[].kind` | `is_block_line`, `is_folded_buffer_header`, `blocks_in_range` (`display_map.rs:2183-2213`) |
 | `soft_wrap_indent` | `DisplaySnapshot::soft_wrap_indent(row)` (`:2218`) |
 | `selections` | `editor.selections.disjoint_anchors()` → `SelectionExt::display_range(&map)` (`editor.rs:11913`) |
@@ -920,8 +920,38 @@ coordinate model is Zed's, not Ratatui's line-wrapping model.
 Per visible row:
 
 1. Emit gutter: line number (right-aligned in `gutter_rect`), diff marker
-   (`+`/`~`/`-` or a background tint from `RowInfo::diff_status`), fold chevron
-   where `crease_for_buffer_row` reports one.
+   (`+`/`~`/`-`, from the hunks in `diff_hunks_in_range` — a deletion has no
+   row of its own, so its marker goes on the row that closed over it), fold
+   chevron where `crease_for_buffer_row` reports one.
+
+   **A collapsed hunk is drawn in its marker's cell and nowhere else.** The
+   line it summarises is left exactly as an unchanged line, because that line
+   is not the change — the change is the difference between it and something
+   not on screen, and one cell is the honest size of that claim. Only an
+   *expanded* hunk tints a row across its width, and then the row really is the
+   changed text rather than a line standing in for it.
+
+   Two things the marker says beyond "this row changed":
+
+   - **Staged or not**, as the background of the marker's cell alone: the
+     hunk's tint while it is unstaged, and the editor's own background — or
+     nothing at all, wherever nothing else is painted — once it is staged. So
+     staging *removes* colour from under the marker rather than adding it, and
+     a gutter with no tinted markers left in it is a file whose changes are all
+     staged. A staged marker needs a colour of its own only inside an expanded
+     hunk, the one case where emitting nothing would leave it wearing that
+     hunk's tint. Staged means `!has_secondary_hunk()`, the same predicate GUI
+     Zed draws the distinction with, so a half-staged or mid-toggle hunk counts
+     as unstaged here too.
+   - **Which side of an expanded modification a row is.** Collapsed, a
+     modification is one `~` standing for both halves. Expanded, its deleted
+     text is present in the multibuffer as rows of its own, and
+     `RowInfo::diff_status` — which is set for exactly those rows and no others
+     (§10.3) — makes the deleted side `-` and the surviving side `+`. So the
+     row-level status is consulted first and the hunk-level marker is the
+     fallback, not the other way round. It is also what tells the two apart at
+     all: a mark that arrived from the row is expanded by construction, and one
+     that arrived from the hunk map is collapsed by construction.
 2. Walk `spans`, placing graphemes into cells using `byte_to_cell`. A
    double-width grapheme occupies its cell and leaves the next one blank
    (Ratatui expects exactly this).

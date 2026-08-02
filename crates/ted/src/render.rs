@@ -203,6 +203,12 @@ fn render_gutter(
         if let Some(foreground) = row.gutter.diff_foreground {
             marker_style = marker_style.fg(palette.color(foreground));
         }
+        // The marker's own cell carries the staged/unstaged background, which
+        // is why it is set here rather than with the row's tint above: it is
+        // the one cell in the row that says more than "this row changed".
+        if let Some(background) = row.gutter.diff_background {
+            marker_style = marker_style.bg(palette.color(background));
+        }
         cell.set_symbol(&diff.symbol().to_string());
         cell.set_style(marker_style);
     }
@@ -1822,8 +1828,9 @@ mod tests {
         assert_eq!(grid(&snapshot)[0].chars().nth(5), Some(' '));
     }
 
-    /// SPEC §11 step 1: a diff hunk's background reaches across the gutter and
-    /// the text, not just the marker's own cell.
+    /// SPEC §11 step 1: where a row *is* tinted — an expanded hunk, which is
+    /// the only diff row the projection gives a background to — that tint
+    /// reaches across the gutter and the text, not just the marker's own cell.
     #[test]
     fn a_diff_hunk_tints_the_gutter_and_the_text_row() {
         let added = hsla(0.3, 0.5, 0.4, 1.0);
@@ -1840,7 +1847,9 @@ mod tests {
         render(&snapshot, &palette(), &mut buffer);
         let tint = palette().color(added_background);
         // The marker's own cell, a blank gutter cell beside it, and a text
-        // cell all carry the same tint.
+        // cell all carry the same tint. The marker keeps it only because this
+        // row named no staged/unstaged background of its own; when it does,
+        // that background wins the one cell — see the test below.
         assert_eq!(buffer.cell((0, 0)).map(|cell| cell.bg), Some(tint));
         assert_eq!(buffer.cell((1, 0)).map(|cell| cell.bg), Some(tint));
         assert_eq!(buffer.cell((10, 0)).map(|cell| cell.bg), Some(tint));
@@ -1854,5 +1863,49 @@ mod tests {
             buffer.cell((0, 0)).map(|cell| cell.symbol().to_owned()),
             Some("+".to_owned())
         );
+    }
+
+    /// SPEC §11 step 1: staging lifts the marker out of the hunk's tint. A
+    /// staged marker is painted on the background the projection names, an
+    /// unstaged one on the row's tint like every other cell, and neither
+    /// changes anything outside that single cell.
+    #[test]
+    fn only_a_staged_marker_leaves_the_hunks_tint() {
+        let tint = hsla(0.3, 0.3, 0.15, 1.0);
+        let editor_background = hsla(0.6, 0.1, 0.08, 1.0);
+
+        let cell_backgrounds = |marker_background| {
+            let mut snapshot = gutter_snapshot(20, 2, 6, "let x = 1;");
+            if let Some(editor) = snapshot.editor.as_mut() {
+                editor.rows[0].background = Some(tint);
+                editor.rows[0].gutter.diff = Some(DiffMarker::Added);
+                editor.rows[0].gutter.diff_background = marker_background;
+                editor.rows[0].gutter.line_number = Some(3);
+            }
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 2));
+            render(&snapshot, &palette(), &mut buffer);
+            (
+                buffer.cell((0, 0)).map(|cell| cell.bg),
+                buffer.cell((1, 0)).map(|cell| cell.bg),
+            )
+        };
+
+        // Unstaged: the projection names no background, so the marker keeps the
+        // row's tint and is indistinguishable from the cell beside it.
+        let (unstaged_marker, unstaged_beside) = cell_backgrounds(None);
+        assert_eq!(unstaged_marker, Some(palette().color(tint)));
+        assert_eq!(unstaged_marker, unstaged_beside);
+
+        // Staged: the editor's own background, which is what takes the marker
+        // out of the tint the rest of the row keeps.
+        let (staged_marker, staged_beside) = cell_backgrounds(Some(editor_background));
+        assert_eq!(staged_marker, Some(palette().color(editor_background)));
+        assert_ne!(
+            staged_marker, unstaged_marker,
+            "staged and unstaged must not paint the same cell"
+        );
+        // The cell beside it is the row's tint either way: staging says
+        // nothing about the rest of the row.
+        assert_eq!(staged_beside, Some(palette().color(tint)));
     }
 }

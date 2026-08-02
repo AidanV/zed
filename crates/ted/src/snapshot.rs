@@ -6,14 +6,14 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use buffer_diff::DiffHunkStatusKind;
+use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
 use editor::display_map::{
     Block, ChunkRendererId, ChunkReplacement, DisplayRow, DisplaySnapshot, ToDisplayPoint as _,
 };
-use editor::{DisplayPoint, Editor};
+use editor::{Bias, DisplayPoint, Editor};
 use gpui::{App, Entity, FontStyle, FontWeight, Hsla, Pixels, Window};
 use language::LanguageAwareStyling;
-use multi_buffer::{MultiBufferSnapshot, RowInfo};
+use multi_buffer::{MultiBufferPoint, MultiBufferRow, MultiBufferSnapshot, RowInfo};
 use theme::{ActiveTheme as _, ThemeColors};
 use unicode_segmentation::UnicodeSegmentation as _;
 use workspace::{Pane, Workspace};
@@ -245,6 +245,13 @@ pub struct GutterView {
     /// added/modified/deleted — kept apart from `style`'s line-number colour,
     /// which tracks the cursor row instead (SPEC §11 step 1).
     pub diff_foreground: Option<Hsla>,
+    /// The background behind the marker glyph alone, which is where `ted` says
+    /// whether the hunk is staged: the hunk's tint while it is unstaged, and
+    /// `None` — nothing painted at all — once it is staged. The exception is a
+    /// row inside an expanded hunk, which is tinted across its width, so a
+    /// staged marker there needs the editor's own background to escape it
+    /// rather than nothing (SPEC §11 step 1).
+    pub diff_background: Option<Hsla>,
     /// Whether this row's buffer row has a crease, and which way the chevron
     /// should point (SPEC §11 step 1, and SPEC §5.4 on fold placeholders).
     pub crease: Option<CreaseState>,
@@ -276,6 +283,57 @@ impl DiffMarker {
             Self::Modified => '~',
             Self::Deleted => '-',
         }
+    }
+}
+
+/// A row's diff marker, whether the hunk behind it is staged, and whether it
+/// reached this row as content or as a summary.
+///
+/// Staged means `!has_secondary_hunk()` — the same predicate `DiffHunkDelegate`
+/// paints a hunk as staged by (`editor/src/git.rs`), so a hunk half-staged or
+/// mid-toggle counts as unstaged in `ted` exactly as it does in the GUI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HunkMark {
+    marker: DiffMarker,
+    staged: bool,
+    /// Whether this row is part of an *expanded* hunk, and so is the changed
+    /// text itself rather than a line the change merely touched. Only these
+    /// rows are tinted across their whole width.
+    expanded: bool,
+}
+
+impl From<DiffHunkStatus> for HunkMark {
+    /// From `RowInfo::diff_status`, which is set on the rows of an expanded
+    /// hunk and nowhere else (SPEC §10.3) — so a mark built this way is
+    /// expanded by construction.
+    fn from(status: DiffHunkStatus) -> Self {
+        Self {
+            marker: match status.kind {
+                DiffHunkStatusKind::Added => DiffMarker::Added,
+                DiffHunkStatusKind::Modified => DiffMarker::Modified,
+                DiffHunkStatusKind::Deleted => DiffMarker::Deleted,
+            },
+            staged: !status.has_secondary_hunk(),
+            expanded: true,
+        }
+    }
+}
+
+impl HunkMark {
+    /// The background for the marker cell alone: the hunk's tint while it is
+    /// unstaged, and the editor's own background — or nothing at all, where
+    /// nothing else is painted — once it is staged.
+    ///
+    /// So staging *removes* colour from under the marker rather than adding it,
+    /// and a gutter with no tinted markers left in it is a file whose changes
+    /// are all staged. A staged marker only needs a colour of its own when the
+    /// row around it is tinted, which is the one case where emitting nothing
+    /// would leave it wearing that tint.
+    fn background(self, tint: Hsla, colors: &ThemeColors) -> Option<Hsla> {
+        if !self.staged {
+            return Some(tint);
+        }
+        self.expanded.then_some(colors.editor_background)
     }
 }
 
@@ -1006,6 +1064,8 @@ fn build_editor_view(
     // on every iteration just to read the theme.
     let app_cx: &App = cx;
 
+    let diff_markers = diff_markers_for_rows(display, first_row..end_row);
+
     let mut row_infos = display.row_infos(DisplayRow(first_row));
     let mut rows_view = Vec::new();
     for (offset, (text, spans)) in built_rows.into_iter().enumerate() {
@@ -1051,21 +1111,29 @@ fn build_editor_view(
             .unwrap_or(0)
             .min(u32::from(u16::MAX)) as u16;
 
-        let diff = info.diff_status.map(|status| match status.kind {
-            DiffHunkStatusKind::Added => DiffMarker::Added,
-            DiffHunkStatusKind::Modified => DiffMarker::Modified,
-            DiffHunkStatusKind::Deleted => DiffMarker::Deleted,
-        });
+        // An *expanded* hunk is the one case where the row knows more than the
+        // hunk does: its deleted text is present in the multibuffer as rows of
+        // its own, and `RowInfo::diff_status` says which side of the change
+        // each row is. So a modified hunk that has been expanded is drawn as
+        // the `-` and `+` it really is, rather than as `~` over both halves.
+        let diff = info
+            .diff_status
+            .map(HunkMark::from)
+            .or_else(|| diff_markers.get(&display_row).copied());
         // Read from the status colours already threaded through `EditorStyle`
         // (SPEC §11 step 1) rather than the dedicated `editor_diff_hunk_*`
         // theme fields Zed's own gutter uses, so this stays a plain function
         // of what `build_editor_view` already has in scope.
-        let diff_colors = diff.map(|marker| match marker {
+        let diff_colors = diff.map(|mark| match mark.marker {
             DiffMarker::Added => (style.status.created, style.status.created_background),
             DiffMarker::Modified => (style.status.modified, style.status.modified_background),
             DiffMarker::Deleted => (style.status.deleted, style.status.deleted_background),
         });
-        if background.is_none() {
+        // Only an expanded hunk tints the whole row, because only then is the
+        // row itself the changed text. A collapsed hunk stands for a change
+        // that is not on screen as rows of its own, so it says so in the
+        // marker's cell and leaves the line it summarises alone.
+        if background.is_none() && diff.is_some_and(|mark| mark.expanded) {
             background = diff_colors.map(|(_, background)| background);
         }
         row.background = background;
@@ -1099,8 +1167,11 @@ fn build_editor_view(
             line_number: show_line_numbers
                 .then(|| line_number_for(&info, display_row, cursor_display_row, relative_numbers))
                 .flatten(),
-            diff,
+            diff: diff.map(|mark| mark.marker),
             diff_foreground: diff_colors.map(|(foreground, _)| foreground),
+            diff_background: diff
+                .zip(diff_colors)
+                .and_then(|(mark, (_, tint))| mark.background(tint, &colors)),
             crease,
             style: SpanStyle {
                 foreground: Some(if display_row == cursor_display_row {
@@ -1174,6 +1245,57 @@ fn build_editor_view(
         rewrapping: editor.display_map.read(cx).is_rewrapping(cx),
     };
     (built, primary_cursor)
+}
+
+/// The diff marker each visible display row carries, keyed by display row.
+///
+/// Read from the diff itself rather than from `RowInfo::diff_status`, which is
+/// only `Some` where a hunk has been *expanded* into the multibuffer as deleted
+/// text — the project diff view and an expanded hunk, neither of which is the
+/// ordinary case of an edited file whose gutter should still show what changed.
+/// `EditorElement` goes to the same place through `display_diff_hunks_for_rows`
+/// (`editor/src/git.rs`), which is `pub(super)` and so has to be re-derived
+/// here from the two public halves it is built from.
+fn diff_markers_for_rows(display: &DisplaySnapshot, rows: Range<u32>) -> HashMap<u32, HunkMark> {
+    let start = DisplayPoint::new(DisplayRow(rows.start), 0).to_point(display);
+    let end = DisplayPoint::new(DisplayRow(rows.end), 0).to_point(display);
+
+    let mut markers = HashMap::new();
+    for hunk in display.buffer_snapshot().diff_hunks_in_range(start..end) {
+        // Collapsed by construction: a hunk reaching a row through this map is
+        // one whose changed text is not on screen as rows of its own. Where it
+        // is, `RowInfo::diff_status` answers for those rows first.
+        let marker = HunkMark {
+            expanded: false,
+            ..HunkMark::from(hunk.status())
+        };
+        let first = display
+            .point_to_display_point(MultiBufferPoint::new(hunk.row_range.start.0, 0), Bias::Left)
+            .row()
+            .0;
+        // An empty row range is a pure deletion: nothing of it survives in the
+        // buffer, so it marks the one row that closed over it rather than a
+        // span, and it never displaces a marker that row earned itself.
+        if hunk.row_range.is_empty() {
+            markers.entry(first).or_insert(marker);
+            continue;
+        }
+        // The *end* of the hunk's last buffer row, not its start, so a
+        // soft-wrapped row is marked across every display row it occupies —
+        // the same two points `display_diff_hunks_for_rows` resolves.
+        let last_row = MultiBufferRow(hunk.row_range.end.0.saturating_sub(1));
+        let last = display
+            .point_to_display_point(
+                MultiBufferPoint::new(last_row.0, display.buffer_snapshot().line_len(last_row)),
+                Bias::Right,
+            )
+            .row()
+            .0;
+        for row in first..=last {
+            markers.insert(row, marker);
+        }
+    }
+    markers
 }
 
 /// The buffer row a gutter shows, honouring relative line numbers. `None` on
