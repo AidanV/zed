@@ -7,8 +7,18 @@
 //! terminal reported, and `key_char` is set only for characters that would
 //! actually be typed.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use gpui::{Keystroke, Modifiers};
+use std::time::{Duration, Instant};
+
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use gpui::{
+    Keystroke, Modifiers, MouseButton as GpuiMouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchPhase, point,
+    px,
+};
+
+use crate::cell::{CELL_HEIGHT, CELL_WIDTH};
 
 /// Translates a crossterm key event into the keystroke a platform would deliver.
 ///
@@ -81,6 +91,142 @@ pub fn keystroke_for(event: &KeyEvent) -> Option<Keystroke> {
         key,
         key_char,
     })
+}
+
+/// Rows scrolled per wheel notch, the same step GPUI's own platforms take.
+const SCROLL_LINES: f32 = 3.0;
+
+/// How long after a click a second one at the same cell is a double click.
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(300);
+
+/// Terminal mouse reports translated into the input a platform would deliver
+/// (SPEC §17).
+///
+/// The element tree really was laid out at this geometry, so hit testing,
+/// click-to-place-cursor, drag-select and double-click-to-select-word need no
+/// editor-side code — only a position in the window's pixels and a click count,
+/// which is the one thing a terminal does not report and this has to keep.
+#[derive(Default)]
+pub struct Mouse {
+    last_click: Option<Click>,
+    /// What is held down, so a drag can name the button the terminal reports
+    /// without one and a move outside a drag names none.
+    pressed: Option<GpuiMouseButton>,
+}
+
+struct Click {
+    button: GpuiMouseButton,
+    cell: (u16, u16),
+    at: Instant,
+    count: usize,
+}
+
+impl Mouse {
+    /// The input for a terminal mouse report, or `None` when it lands on a row
+    /// `ted` painted itself rather than in the GPUI window.
+    ///
+    /// `top_rows` is how many rows sit above the window's first row: the window
+    /// is sized to the grid minus the rows `ted` owns (SPEC §10.2), so a report
+    /// in terminal coordinates has to be moved into the window's before it is
+    /// scaled into pixels.
+    pub fn translate(&mut self, event: &MouseEvent, top_rows: u16) -> Option<PlatformInput> {
+        let row = event.row.checked_sub(top_rows)?;
+        let column = event.column;
+        // The cell's left edge rather than its middle: a click on cell N means
+        // the cursor goes to column N, which is where that boundary is.
+        let position = point(
+            px(f32::from(column) * f32::from(CELL_WIDTH)),
+            px(f32::from(row) * f32::from(CELL_HEIGHT)),
+        );
+        let modifiers = Modifiers {
+            control: event.modifiers.contains(KeyModifiers::CONTROL),
+            alt: event.modifiers.contains(KeyModifiers::ALT)
+                || event.modifiers.contains(KeyModifiers::META),
+            shift: event.modifiers.contains(KeyModifiers::SHIFT),
+            platform: event.modifiers.contains(KeyModifiers::SUPER),
+            function: false,
+        };
+
+        Some(match event.kind {
+            MouseEventKind::Down(button) => {
+                let button = gpui_button(button);
+                let click_count = self.count_click(button, (column, row));
+                self.pressed = Some(button);
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button,
+                    position,
+                    modifiers,
+                    click_count,
+                    first_mouse: false,
+                })
+            }
+            MouseEventKind::Up(button) => {
+                let button = gpui_button(button);
+                self.pressed = None;
+                PlatformInput::MouseUp(MouseUpEvent {
+                    button,
+                    position,
+                    modifiers,
+                    click_count: self.last_click.as_ref().map_or(1, |click| click.count),
+                })
+            }
+            MouseEventKind::Drag(button) => PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: Some(gpui_button(button)),
+                modifiers,
+            }),
+            MouseEventKind::Moved => PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: self.pressed,
+                modifiers,
+            }),
+            MouseEventKind::ScrollUp => scroll(position, modifiers, point(0.0, SCROLL_LINES)),
+            MouseEventKind::ScrollDown => scroll(position, modifiers, point(0.0, -SCROLL_LINES)),
+            MouseEventKind::ScrollLeft => scroll(position, modifiers, point(SCROLL_LINES, 0.0)),
+            MouseEventKind::ScrollRight => scroll(position, modifiers, point(-SCROLL_LINES, 0.0)),
+        })
+    }
+
+    /// Consecutive clicks of the same button on the same cell, which is what
+    /// double-click-to-select-word is counting. A terminal reports the cell and
+    /// not the pixel, so "the same place" can only mean the same cell.
+    fn count_click(&mut self, button: GpuiMouseButton, cell: (u16, u16)) -> usize {
+        let now = Instant::now();
+        let count = match self.last_click.take() {
+            Some(previous)
+                if previous.button == button
+                    && previous.cell == cell
+                    && now.duration_since(previous.at) < DOUBLE_CLICK_INTERVAL =>
+            {
+                previous.count + 1
+            }
+            _ => 1,
+        };
+        self.last_click = Some(Click {
+            button,
+            cell,
+            at: now,
+            count,
+        });
+        count
+    }
+}
+
+fn scroll(position: Point<Pixels>, modifiers: Modifiers, lines: Point<f32>) -> PlatformInput {
+    PlatformInput::ScrollWheel(ScrollWheelEvent {
+        position,
+        delta: ScrollDelta::Lines(lines),
+        modifiers,
+        touch_phase: TouchPhase::Moved,
+    })
+}
+
+fn gpui_button(button: MouseButton) -> GpuiMouseButton {
+    match button {
+        MouseButton::Left => GpuiMouseButton::Left,
+        MouseButton::Right => GpuiMouseButton::Right,
+        MouseButton::Middle => GpuiMouseButton::Middle,
+    }
 }
 
 #[cfg(test)]
@@ -186,6 +332,87 @@ mod tests {
         let keystroke = key(KeyCode::Char(' '), KeyModifiers::NONE).expect("expected a keystroke");
         assert_eq!(keystroke.key, "space");
         assert_eq!(keystroke.key_char.as_deref(), Some(" "));
+    }
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn a_cell_becomes_the_pixel_at_its_top_left_corner() {
+        let mut mouse = Mouse::default();
+        let input = mouse
+            .translate(
+                &mouse_event(MouseEventKind::Down(MouseButton::Left), 3, 5),
+                0,
+            )
+            .expect("a click inside the window");
+        let PlatformInput::MouseDown(event) = input else {
+            panic!("a button press should arrive as a press");
+        };
+        assert_eq!(event.position.x, CELL_WIDTH * 3.0);
+        assert_eq!(event.position.y, CELL_HEIGHT * 5.0);
+        assert_eq!(event.click_count, 1);
+    }
+
+    /// The window starts below the rows `ted` paints itself, so a report has to
+    /// be moved into the window's coordinates before it is scaled.
+    #[test]
+    fn rows_ted_owns_are_not_the_windows() {
+        let mut mouse = Mouse::default();
+        assert!(
+            mouse
+                .translate(
+                    &mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
+                    1
+                )
+                .is_none(),
+            "a click on the tab strip reached the window"
+        );
+
+        let input = mouse
+            .translate(
+                &mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 1),
+                1,
+            )
+            .expect("a click below the strip");
+        let PlatformInput::MouseDown(event) = input else {
+            panic!("a button press should arrive as a press");
+        };
+        assert_eq!(event.position.y, Pixels::ZERO);
+    }
+
+    #[test]
+    fn a_second_click_on_the_same_cell_counts_up_and_one_elsewhere_does_not() {
+        let mut mouse = Mouse::default();
+        let press = mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 2);
+        let elsewhere = mouse_event(MouseEventKind::Down(MouseButton::Left), 9, 2);
+
+        let counts =
+            [&press, &press, &press, &elsewhere].map(|event| match mouse.translate(event, 0) {
+                Some(PlatformInput::MouseDown(event)) => event.click_count,
+                _ => panic!("a button press should arrive as a press"),
+            });
+        assert_eq!(counts, [1, 2, 3, 1]);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_whole_lines() {
+        let mut mouse = Mouse::default();
+        let Some(PlatformInput::ScrollWheel(event)) =
+            mouse.translate(&mouse_event(MouseEventKind::ScrollDown, 0, 0), 0)
+        else {
+            panic!("the wheel should arrive as a scroll");
+        };
+        let ScrollDelta::Lines(lines) = event.delta else {
+            panic!("the wheel should scroll in lines");
+        };
+        assert_eq!(lines, point(0.0, -SCROLL_LINES));
     }
 
     #[test]

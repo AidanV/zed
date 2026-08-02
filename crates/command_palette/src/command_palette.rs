@@ -20,7 +20,7 @@ use gpui::{
 };
 use persistence::CommandPaletteDB;
 use picker::Direction;
-use picker::{Picker, PickerDelegate};
+use picker::{Picker, PickerDelegate, PickerRowText};
 use postage::{sink::Sink, stream::Stream};
 use settings::Settings;
 use ui::{HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, prelude::*};
@@ -37,6 +37,12 @@ impl ModalView for CommandPalette {}
 
 pub struct CommandPalette {
     picker: Entity<Picker<CommandPaletteDelegate>>,
+}
+
+impl CommandPalette {
+    pub fn picker(&self) -> &Entity<Picker<CommandPaletteDelegate>> {
+        &self.picker
+    }
 }
 
 /// Removes subsequent whitespace characters and double colons from the query, and converts
@@ -652,6 +658,34 @@ impl PickerDelegate for CommandPaletteDelegate {
                             cx,
                         )),
                 ),
+        )
+    }
+
+    fn text_for_match(&self, ix: usize, window: &Window, _cx: &App) -> Option<PickerRowText> {
+        let matching_command = self.matches.get(ix)?;
+        let command = self.commands.get(matching_command.candidate_id)?;
+        let text = PickerRowText::new(command.name.clone())
+            .label_positions(matching_command.positions.clone());
+        // The same binding the rendered row shows on its right, resolved against
+        // the focus the palette was opened from rather than the palette's own.
+        Some(
+            match window
+                .highest_precedence_binding_for_action_in(
+                    &*command.action,
+                    &self.previous_focus_handle,
+                )
+                .or_else(|| window.highest_precedence_binding_for_action(&*command.action))
+            {
+                Some(binding) => text.detail(
+                    binding
+                        .keystrokes()
+                        .iter()
+                        .map(|keystroke| keystroke.inner().unparse())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+                None => text,
+            },
         )
     }
 

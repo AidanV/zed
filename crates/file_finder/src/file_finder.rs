@@ -23,7 +23,7 @@ use open_path_prompt::{
     OpenPathPrompt,
     file_finder_settings::{FileFinderSettings, FileFinderWidth},
 };
-use picker::{Picker, PickerDelegate};
+use picker::{Picker, PickerDelegate, PickerRowText};
 use project::{
     PathMatchCandidateSet, Project, ProjectPath, WorktreeId, worktree_store::WorktreeStore,
 };
@@ -70,6 +70,12 @@ pub struct FileFinder {
     picker: Entity<Picker<FileFinderDelegate>>,
     picker_focus_handle: FocusHandle,
     init_modifiers: Option<Modifiers>,
+}
+
+impl FileFinder {
+    pub fn picker(&self) -> &Entity<Picker<FileFinderDelegate>> {
+        &self.picker
+    }
 }
 
 pub fn init(cx: &mut App) {
@@ -1270,6 +1276,69 @@ impl FileFinderDelegate {
         window: &mut Window,
         cx: &App,
     ) -> (HighlightedLabel, HighlightedLabel) {
+        let (file_name, file_name_positions, mut full_path, mut full_path_positions) =
+            self.parts_for_match(path_match, cx);
+
+        if full_path.is_ascii() {
+            let file_finder_settings = FileFinderSettings::get_global(cx);
+            let max_width =
+                FileFinder::modal_max_width(file_finder_settings.modal_max_width, window);
+            let (normal_em, small_em) = {
+                let style = window.text_style();
+                let font_id = window.text_system().resolve_font(&style.font());
+                let font_size = TextSize::Default.rems(cx).to_pixels(window.rem_size());
+                let normal = cx
+                    .text_system()
+                    .em_width(font_id, font_size)
+                    .unwrap_or(px(16.));
+                let font_size = TextSize::Small.rems(cx).to_pixels(window.rem_size());
+                let small = cx
+                    .text_system()
+                    .em_width(font_id, font_size)
+                    .unwrap_or(px(10.));
+                (normal, small)
+            };
+            let budget = full_path_budget(&file_name, normal_em, small_em, max_width);
+            // If the computed budget is zero, we certainly won't be able to achieve it,
+            // so no point trying to elide the path.
+            if budget > 0 && full_path.len() > budget {
+                let components = PathComponentSlice::new(&full_path);
+                if let Some(elided_range) =
+                    components.elision_range(budget - 1, &full_path_positions)
+                {
+                    let elided_len = elided_range.end - elided_range.start;
+                    let placeholder = "…";
+                    full_path_positions.retain_mut(|mat| {
+                        if *mat >= elided_range.end {
+                            *mat -= elided_len;
+                            *mat += placeholder.len();
+                        } else if *mat >= elided_range.start {
+                            return false;
+                        }
+                        true
+                    });
+                    full_path.replace_range(elided_range, placeholder);
+                }
+            }
+        }
+
+        (
+            HighlightedLabel::new(file_name, file_name_positions),
+            HighlightedLabel::new(full_path, full_path_positions)
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+    }
+
+    /// A match's file name and containing directory, each with the query
+    /// positions that matched inside it. Elision is deliberately not applied
+    /// here: it is measured in pixels against a modal's width, which is a
+    /// property of how the match is being drawn rather than of the match.
+    fn parts_for_match(
+        &self,
+        path_match: &Match,
+        cx: &App,
+    ) -> (String, Vec<usize>, String, Vec<usize>) {
         let path_style = self.project.read(cx).path_style(cx);
         let (file_name, file_name_positions, mut full_path, mut full_path_positions) =
             match &path_match {
@@ -1355,54 +1424,11 @@ impl FileFinderDelegate {
             }
         }
 
-        if full_path.is_ascii() {
-            let file_finder_settings = FileFinderSettings::get_global(cx);
-            let max_width =
-                FileFinder::modal_max_width(file_finder_settings.modal_max_width, window);
-            let (normal_em, small_em) = {
-                let style = window.text_style();
-                let font_id = window.text_system().resolve_font(&style.font());
-                let font_size = TextSize::Default.rems(cx).to_pixels(window.rem_size());
-                let normal = cx
-                    .text_system()
-                    .em_width(font_id, font_size)
-                    .unwrap_or(px(16.));
-                let font_size = TextSize::Small.rems(cx).to_pixels(window.rem_size());
-                let small = cx
-                    .text_system()
-                    .em_width(font_id, font_size)
-                    .unwrap_or(px(10.));
-                (normal, small)
-            };
-            let budget = full_path_budget(&file_name, normal_em, small_em, max_width);
-            // If the computed budget is zero, we certainly won't be able to achieve it,
-            // so no point trying to elide the path.
-            if budget > 0 && full_path.len() > budget {
-                let components = PathComponentSlice::new(&full_path);
-                if let Some(elided_range) =
-                    components.elision_range(budget - 1, &full_path_positions)
-                {
-                    let elided_len = elided_range.end - elided_range.start;
-                    let placeholder = "…";
-                    full_path_positions.retain_mut(|mat| {
-                        if *mat >= elided_range.end {
-                            *mat -= elided_len;
-                            *mat += placeholder.len();
-                        } else if *mat >= elided_range.start {
-                            return false;
-                        }
-                        true
-                    });
-                    full_path.replace_range(elided_range, placeholder);
-                }
-            }
-        }
-
         (
-            HighlightedLabel::new(file_name, file_name_positions),
-            HighlightedLabel::new(full_path, full_path_positions)
-                .size(LabelSize::Small)
-                .color(Color::Muted),
+            file_name,
+            file_name_positions,
+            full_path,
+            full_path_positions,
         )
     }
 
@@ -2071,6 +2097,18 @@ impl PickerDelegate for FileFinderDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         self.render_match_impl(ix, selected, Some(checkbox), window, cx)
+    }
+
+    fn text_for_match(&self, ix: usize, _window: &Window, cx: &App) -> Option<PickerRowText> {
+        let path_match = self.matches.get(ix)?;
+        let (file_name, file_name_positions, full_path, full_path_positions) =
+            self.parts_for_match(path_match, cx);
+        Some(
+            PickerRowText::new(file_name)
+                .label_positions(file_name_positions)
+                .detail(full_path)
+                .detail_positions(full_path_positions),
+        )
     }
 
     fn actions_menu(

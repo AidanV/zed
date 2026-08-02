@@ -5,7 +5,7 @@ use gpui::{
     TextStyle, WeakEntity, Window, relative,
 };
 use ordered_float::OrderedFloat;
-use picker::{Picker, PickerDelegate, PreviewUpdate};
+use picker::{Picker, PickerDelegate, PickerRowText, PreviewUpdate};
 use project::{Project, Symbol, lsp_store::SymbolLocation};
 use settings::Settings;
 use std::{cmp::Reverse, sync::Arc};
@@ -50,6 +50,25 @@ pub struct ProjectSymbolsDelegate {
 }
 
 impl ProjectSymbolsDelegate {
+    fn path_for_symbol(&self, symbol: &Symbol, cx: &App) -> String {
+        match &symbol.path {
+            SymbolLocation::InProject(project_path) => {
+                let project = self.project.read(cx);
+                let mut path = project_path.path.to_rel_path_buf();
+                if self.show_worktree_root_name
+                    && let Some(worktree) = project.worktree_for_id(project_path.worktree_id, cx)
+                {
+                    path = worktree.read(cx).root_name().join(&path);
+                }
+                path.display(project.path_style(cx)).into_owned()
+            }
+            SymbolLocation::OutsideProject {
+                abs_path,
+                signature: _,
+            } => abs_path.to_string_lossy().into_owned(),
+        }
+    }
+
     fn new(workspace: WeakEntity<Workspace>, project: Entity<Project>) -> Self {
         Self {
             workspace,
@@ -245,6 +264,17 @@ impl PickerDelegate for ProjectSymbolsDelegate {
         })
     }
 
+    fn text_for_match(&self, ix: usize, _window: &Window, cx: &App) -> Option<PickerRowText> {
+        let string_match = self.matches.get(ix)?;
+        let symbol = self.symbols.get(string_match.candidate_id)?;
+        let path = self.path_for_symbol(symbol, cx);
+        Some(
+            PickerRowText::new(symbol.label.text.clone())
+                .label_positions(string_match.positions.clone())
+                .detail(format!("{path}:{}", symbol.range.start.0.row + 1)),
+        )
+    }
+
     fn render_match(
         &self,
         ix: usize,
@@ -252,32 +282,15 @@ impl PickerDelegate for ProjectSymbolsDelegate {
         _window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
-        let path_style = self.project.read(cx).path_style(cx);
         let string_match = &self.matches.get(ix)?;
         let symbol = &self.symbols.get(string_match.candidate_id)?;
+        let path = self.path_for_symbol(symbol, cx);
         let theme = cx.theme();
         let local_player = theme.players().local();
         let syntax_runs = styled_runs_for_code_label(&symbol.label, theme.syntax(), &local_player);
 
-        let path = match &symbol.path {
-            SymbolLocation::InProject(project_path) => {
-                let project = self.project.read(cx);
-                let mut path = project_path.path.to_rel_path_buf();
-                if self.show_worktree_root_name
-                    && let Some(worktree) = project.worktree_for_id(project_path.worktree_id, cx)
-                {
-                    path = worktree.read(cx).root_name().join(&path);
-                }
-                path.display(path_style).into_owned().into()
-            }
-            SymbolLocation::OutsideProject {
-                abs_path,
-                signature: _,
-            } => abs_path.to_string_lossy(),
-        };
         let label = symbol.label.text.clone();
         let line_number = symbol.range.start.0.row + 1;
-        let path = path.into_owned();
 
         let settings = ThemeSettings::get_global(cx);
 

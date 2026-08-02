@@ -7968,6 +7968,12 @@ impl Workspace {
         self.modal_layer.read(cx).active_modal()
     }
 
+    /// The active modal's Rust type name, for a frontend that has to say which
+    /// modal it is that it cannot render.
+    pub fn active_modal_type_name(&self, cx: &App) -> Option<&'static str> {
+        self.modal_layer.read(cx).active_modal_type_name()
+    }
+
     /// Toggles a modal of type `V`. If a modal of the same type is currently active,
     /// it will be hidden. If a different modal is active, it will be replaced with the new one.
     /// If no modal is active, the new modal will be shown.

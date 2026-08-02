@@ -1,6 +1,6 @@
 # `ted` — a terminal UI for Zed
 
-**Status:** M0, M1 and M2 implemented (§21). M3 is next
+**Status:** M0 through M3 implemented (§21). M3.5 is next
 **Scope:** a new crate + binary in this repository that presents Zed's editor as a
 full-screen terminal application, using Ratatui for presentation and Zed's own
 `editor` + `vim` + `workspace` + `project` crates for all behaviour.
@@ -760,7 +760,7 @@ applies a non-persisted override layer:
 - `vim_mode: true` unless `--no-vim`.
 
 **`ted`'s own settings.** The settings that exist only because `ted` is a
-terminal host — `file_manager` (§13.4) so far — live in **`ted.json`**, beside
+terminal host — `file_manager` (§13.4) and `mouse` (§17) — live in **`ted.json`**, beside
 `settings.json` and `keymap.json` in the same config directory, read by `ted`
 alone. The shared file is shared on purpose: language config, tab size,
 formatters and LSP settings should mean the same thing in both. A key only one
@@ -997,15 +997,31 @@ Two honest options:
   (`cx.all_action_names()` + `CommandPaletteFilter`, `project` file scan +
   `fuzzy`). No upstream change; duplicated behaviour that will drift.
 
-**Recommendation:** Own for M2 (fast, unblocks `:` and file open), Mirror from
-M3 onward as the general mechanism, because it is the only approach that scales
-to the dozens of pickers Zed has. Own is also, for now, the only option that
-needs no upstream change first: `FileFinderDelegate` is a public struct whose
-constructor and every field are private (`crates/file_finder/src/file_finder.rs:368-390`),
-so there is nothing to read even before the rendering question arises (§24.4). `ted` keeps a registry mapping modal `TypeId`
-→ projection adapter, with a generic fallback that renders
-`[modal: <type name> — not yet supported in ted]` so an unmirrored palette
-degrades visibly instead of invisibly swallowing keys.
+**Decided:** Own for M2 (fast, unblocks `:` and file open), Mirror from M3
+onward as the general mechanism, because it is the only approach that scales to
+the dozens of pickers Zed has.
+
+Mirror is `src/mirror.rs`. `PickerDelegate::text_for_match(ix, window, cx) ->
+Option<PickerRowText>` is the seam (§20.1); the registry is a short chain of
+`Workspace::active_modal::<V>()` probes, one per modal `ted` knows, each yielding
+that modal's `Picker` and reading `match_count`, `selected_index`, `query` and
+that method out of it. Nothing there handles a key: the modal holds GPUI's focus,
+so its keystrokes reach it down the dispatch tree exactly as in the GUI, and
+`ted` only reads what to draw. A modal no probe matches renders
+`modal: <type name> — not yet supported in ted`, from
+`Workspace::active_modal_type_name`, so an unmirrored palette degrades visibly
+instead of invisibly swallowing keys.
+
+Only the modals `ted` answers *differently* stay replaced (§24.2's table): the
+buffer switcher, go-to-line and hover, each of which is a different interaction
+rather than the same list in cells. Everything else is projected as it is.
+
+Projection is bounded: the rows around the selection are turned into text, not
+the whole match list, because every row costs the delegate real work — the
+command palette resolves a keybinding per row — and this runs every frame while
+the list on screen is at most half the grid tall. The footer reports the true
+position in the full match list, so the bound is a drawing decision and never a
+claim about how many matches there are.
 
 ### 13.2 The `:` command line
 
@@ -1219,7 +1235,7 @@ Vim registers are internal to `vim` and unaffected; only `"+` / `"*` and
 
 ---
 
-## 17. Mouse (stretch)
+## 17. Mouse
 
 Enabling mouse reporting gives click, drag and wheel. Translation is
 mechanical: cell `(col, row)` → `Point<Pixels>` by multiplying by `CELL`, then
@@ -1230,8 +1246,25 @@ double-click-to-select-word all work with no editor-side code. This is a
 strong argument for the layout-mirroring model in §4.2 and a good early
 validation that the cell contract holds.
 
-Caveat: mouse reporting steals the terminal's own selection. Gate it behind a
-setting and a toggle binding.
+Three things do not fall out of the multiplication:
+
+- **The window is not the grid.** A report is in terminal rows; the window
+  starts below the rows `ted` paints itself (§10.2). Subtracting them is what
+  keeps a click on the tab strip out of the buffer, and a report above the
+  window is dropped rather than clamped into it.
+- **A terminal reports no click count.** Double-click-to-select-word needs one,
+  so `ted` counts consecutive presses of the same button on the same *cell* —
+  the finest "same place" a terminal report can express — inside a fixed
+  interval.
+- **The cell's left edge, not its middle.** A click on cell `N` means the cursor
+  goes to column `N`, and that boundary is the edge.
+
+Mouse reporting steals the terminal's own selection, so it is off by default,
+turned on by `ted.json`'s `mouse` key and toggled by `ted::ToggleMouse`. It is
+also terminal *mode*, which means suspending gives it back to the child and
+resuming re-asserts it (§7.1) rather than assuming the child left it alone.
+While one of `ted`'s own surfaces owns the keyboard it owns the mouse too:
+nothing behind an open list or `:` line is clickable.
 
 ---
 
@@ -1290,12 +1323,14 @@ Kept deliberately small, additive, and defaulted.
 | `editor` | Make `PositionMap` (`element.rs:10100`, currently `pub(crate)`) readable, **or** confirm `ted` can compute everything from `DisplaySnapshot`. Prefer the latter; only escalate if a real gap appears. |
 | workspace root `Cargo.toml` | add `crates/ted` to `members`; add `ratatui`, `crossterm`, `unicode-width`, `unicode-segmentation`, `arboard` to `[workspace.dependencies]`. |
 | workspace root `Cargo.toml` | add `underline-color` to `ratatui`'s feature list. It is in Ratatui's defaults, and the workspace takes `default-features = false`, so severity-coloured underlines (§24.8) are otherwise unreachable. |
+| `picker` | `PickerRowText` and a defaulted `PickerDelegate::text_for_match(ix, window, cx) -> Option<PickerRowText>`, for §13.1's Mirror strategy. The trait already had the precedent — `render_match_with_checkbox` defaults to `None`. |
+| `command_palette`, `file_finder`, `outline` | `pub fn picker(&self)` on each modal's wrapper view, and `text_for_match` on each delegate. `project_symbols`' modal *is* its `Picker`, so it needs only the delegate half. |
+| `workspace` | `Workspace::active_modal_type_name` (and the `ModalLayer` method behind it). `active_modal::<V>` can only answer about a type the caller already names, so it cannot say *which* modal is up when none of the names match — which is exactly what the unmirrored-modal row has to say. |
 
 ### 20.2 Likely, as milestones land
 
 | Crate | Change |
 |---|---|
-| `picker` | Defaulted `PickerDelegate::text_for_match(&self, ix) -> Option<PickerRowText>`, for §13.1's Mirror strategy. The trait already has the precedent — `render_match_with_checkbox` defaults to `None` (`crates/picker/src/picker.rs:377-386`) — but note that `set_selected_index`, `update_matches`, `confirm` and `dismissed` all take `&mut Window`, so Mirror drives a picker through a window rather than beside one. |
 | `editor` | A public reader for the completions menu — `context_menu` is private (`editor.rs:1006`) and `context_menu_visible()` / `context_menu_origin()` are the only public readers, so nothing outside the crate can see an entry, a label or the selection. Prefer a method returning plain data over `&CompletionsMenu`, which keeps §10's no-handles rule intact. One reader also unblocks signature help and code actions (§24.9). |
 | `vim` | `pub fn status_label(editor, cx)`, in the shape of the `vim::mode` and `vim::take_command_line_prefix` helpers that already exist for embedders (`crates/vim/src/vim.rs:507`, `:517`). `Vim::status_label` is a public field (`:553`) but `VimAddon` is `pub(crate)`, so `ctrl-g` (`vim::ShowLocation`) shows nothing in `ted` (§24.5). |
 | `gpui` | **Nothing required.** `Window::draw`, `dispatch_keystroke`, `dispatch_event` and `pending_input_keystrokes` are public; `Platform`, `PlatformWindow` and `PlatformTextSystem` are public traits. |
@@ -1366,10 +1401,14 @@ suspend primitive (§7.1) with its reader-thread handshake, plus `:!` and
 (§20.3) — no input stolen, no stale grid, no altered terminal mode.
 
 **M3 — Fidelity.** Mirror-strategy modal projection with the `PickerDelegate`
-hook. Blocks, folds, inlay hints, git diff gutter, multi-cursor, visual block.
-Mouse. 256/16-colour fallbacks. *Acceptance:* the modal registry covers command
-palette, file finder, outline, project symbols, and the generic fallback is
-never hit in normal use.
+hook (§13.1), covering the command palette, the file finder, the outline and
+project symbols — the file finder ceasing to be `ted`'s own with it. Blocks,
+folds, inlay hints, git diff gutter, multi-cursor, visual block. Mouse (§17).
+The 256- and 16-colour tiers are `palette.rs`'s from M1, kept rather than
+dropped: they cost nothing to keep now that they exist, and §23's decision was
+only that no *further* work goes into terminals `ted` no longer aims at.
+*Acceptance:* the modal registry covers command palette, file finder, outline,
+project symbols, and the generic fallback is never hit in normal use.
 
 **M3.5 — The status line, and completions.** Two things M2 deliberately set
 aside, grouped because each is a design of its own rather than a feature to
@@ -1434,7 +1473,8 @@ connection (§13.4). Optionally move the frontend out of process across the
 | Chrome policy | **Hide all Zed chrome.** The editor owns the whole grid; `ted` draws its own status line. Reported-bounds mirroring (§10.2) keeps re-enabling chrome additive. §9, §21/M1. |
 | Platform coverage for M1 | **Linux and macOS together.** M0 validates the cell contract and the reader-thread bridge on both before M1 starts. §6, §7, §21. |
 | Vim default | **Vim on by default**, `--no-vim` for plain Zed bindings. A nano-style keymap is deferred past M2 if wanted at all. §14.1. |
-| Overlay strategy | **Own implementations for M2, Mirror from M3** via a defaulted `PickerDelegate::text_for_match` hook. §13.1, §20.2. |
+| Overlay strategy | **Own implementations for M2, Mirror from M3** via a defaulted `PickerDelegate::text_for_match` hook. Only the surfaces `ted` answers *differently* stay its own — the switcher, go-to-line, hover. §13.1, §20.1. |
+| Mouse | **Off by default**, `ted.json`'s `mouse` key and `ted::ToggleMouse` turn it on, because reporting takes the mouse away from the terminal's own selection. §17. |
 | `:` command line | **`ted`'s own bottom line**, resolved through vim's existing interceptor rather than projecting Zed's palette modal. §13.2. |
 | File browsing and management | **Suspend to an external file manager**, Yazi by default, instead of building a project panel. Better at file management than anything `ted` would write, and its disk mutations propagate through the real `Project`'s fs watching for free. The fuzzy finder stays native. §7.1, §13.4, §21/M4. |
 | Terminal-host `:` commands | **A `ted`-local host-command table checked before the interceptor**, for commands that exist only because `ted` owns a tty. Not a second vim command parser; anything expressible as an action stays with the interceptor. §13.4. |
@@ -1646,7 +1686,12 @@ Three ways to get in front of that, in descending order of preference:
    two-key binding resolved inside GPUI, and duplicating the keymap to find it
    would be exactly the drift §13.1 is trying to avoid.
 3. **Let the modal open and mirror it.** The right long-run answer, and it is
-   M3's Mirror strategy (§13.1, §20.2). Not M2.
+   M3's Mirror strategy (§13.1, §20.1). Not M2 — and from M3 it is what happens
+   to every modal except the three whose interaction `ted` deliberately answers
+   differently, so the retargeting table below now holds only
+   `ted::OpenBufferSwitcher`, `ted::GoToLine` and `ted::Hover`. The keys in the
+   table further down are the ones `ted`'s own surfaces answer; a mirrored modal
+   answers Zed's, because they are Zed's keys reaching Zed's picker.
 
 **The table is consulted in two places, not one.** Rewriting the keymap catches
 every *keystroke*, and nothing else. A `:` command reaches the same modal by a
@@ -1747,6 +1792,14 @@ does not, and it is not on the roadmap — so `up`/`down` stay unbound on the `:
 line rather than being reserved for it.
 
 ### 24.4 The file finder
+
+> **M3 superseded the "where the state comes from" half of this section.** The
+> finder is now Zed's own `FileFinder` modal, projected by §13.1's Mirror
+> strategy, so the ranking, the recents merge and the opening are Zed's rather
+> than `ted`'s — which is the point of Mirror, and settles the comparator
+> question raised below by not having it. The *shape* below is unchanged: the
+> box, the two columns and the footer are what `ted` still paints. The upstream
+> change that made it possible is `PickerDelegate::text_for_match` (§20.1).
 
 **What it is.** Type a few characters, get the project's files ranked, press
 `enter`, the file opens in the active pane. It is the only navigation surface

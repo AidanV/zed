@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -34,7 +34,7 @@ use crate::command_line::{CommandLine, Effect, HostCommand, Update};
 use crate::config::{self, Config};
 use crate::explore;
 use crate::hover;
-use crate::input::keystroke_for;
+use crate::input::{Mouse, keystroke_for};
 use crate::overlay::{self, Overlay};
 use crate::palette::{ColorDepth, Palette};
 use crate::platform::{TerminalPlatform, TerminalWindowState, set_window_grid};
@@ -60,6 +60,11 @@ const BUSY_FRAMES_AFTER_INPUT: u32 = 24;
 /// Set once the terminal has been put into raw mode, so the panic hook and the
 /// normal shutdown path can both restore it and neither does so twice.
 static TERMINAL_IS_RAW: AtomicBool = AtomicBool::new(false);
+
+/// Whether `ted` wants the terminal to report the mouse (SPEC §17). Separate
+/// from whether it is reporting right now: a suspension gives reporting back to
+/// the child and this is what says to take it again afterwards.
+static MOUSE_IS_WANTED: AtomicBool = AtomicBool::new(false);
 
 pub struct Options {
     pub paths: Vec<PathBuf>,
@@ -160,6 +165,9 @@ struct Session {
     overlay: Option<Overlay>,
     /// What `shift-k` asked for, until the next key dismisses it (SPEC §24.8).
     hover: Option<hover::Panel>,
+    /// The click count a terminal does not report, kept across events
+    /// (SPEC §17).
+    mouse: Mouse,
     /// Messages `ted` itself raised, cleared on the next keystroke so they stay
     /// transient (SPEC §13.3). Notifications the *backend* raised are read fresh
     /// each frame by `snapshot::backend_notifications`.
@@ -195,6 +203,7 @@ async fn drive(
     // Read here rather than during bootstrap so a malformed `ted.json` has a
     // notification line to be reported on (SPEC §9).
     let (config, complaint) = config::load();
+    set_mouse_capture(config.mouse);
     let mut session = Session {
         backend,
         config,
@@ -204,6 +213,7 @@ async fn drive(
         command_line: None,
         overlay: None,
         hover: None,
+        mouse: Mouse::default(),
         messages: complaint.into_iter().collect(),
         busy_frames: BUSY_FRAMES_AFTER_INPUT,
     };
@@ -222,8 +232,17 @@ async fn drive(
         if let Some(surface) = cx.update(crate::actions::take_request) {
             open_surface(&mut session, surface, cx).await;
         }
-        if let Some(overlay) = session.overlay.as_mut() {
-            overlay.poll();
+        if cx.update(crate::actions::take_mouse_toggle) {
+            let wanted = !MOUSE_IS_WANTED.load(Ordering::SeqCst);
+            set_mouse_capture(wanted);
+            session.messages.push(
+                if wanted {
+                    "mouse reporting on — the terminal's own selection is off"
+                } else {
+                    "mouse reporting off"
+                }
+                .to_owned(),
+            );
         }
         if let Some(hover) = session.hover.as_mut() {
             hover.poll();
@@ -231,7 +250,16 @@ async fn drive(
 
         let command_line = command_line_view(&session, cx).or_else(|| search_line(&session, cx));
         let prompt = window_state.pending_prompt();
-        let overlay = session.overlay.as_ref().map(Overlay::view);
+        // `ted`'s own list first: it owns the keyboard while it is open, so a
+        // modal behind it could not be driven even if it were painted.
+        let overlay = session
+            .overlay
+            .as_ref()
+            .map(Overlay::view)
+            .or_else(|| mirrored_overlay(&session, cx));
+        // A modal is on screen and answering keys, so `ctrl-c` belongs to it —
+        // it is `esc` by another name there, not a way out of `ted`.
+        let modal_is_open = session.overlay.is_none() && overlay.is_some();
 
         let mut notifications = session.messages.clone();
         notifications.extend(backend_notifications(&session, cx));
@@ -312,7 +340,10 @@ async fn drive(
             // vim does and what stops a stray `:` or `ctrl-p` from stranding the
             // user.
             Event::Key(key)
-                if is_quit(&key) && session.command_line.is_none() && session.overlay.is_none() =>
+                if is_quit(&key)
+                    && session.command_line.is_none()
+                    && session.overlay.is_none()
+                    && !modal_is_open =>
             {
                 return Ok(());
             }
@@ -363,6 +394,27 @@ async fn drive(
                 resize_window(&session, reserved, &window_state);
                 force_full_repaint(&mut tty.terminal);
                 tty.painted = None;
+            }
+            // Straight into the window: the element tree really was laid out at
+            // this geometry, so hit testing, click-to-place-cursor, drag-select
+            // and double-click-to-select-word need no code here (SPEC §17).
+            //
+            // Nothing on screen over the editor is clickable, and a mirrored
+            // modal least of all: GPUI laid it out wherever a GUI modal goes,
+            // which is not where `ted` painted its list, so a click on a row
+            // would land somewhere else entirely.
+            Event::Mouse(mouse)
+                if session.overlay.is_none()
+                    && session.command_line.is_none()
+                    && !modal_is_open =>
+            {
+                let Some(input) = session.mouse.translate(&mouse, top_rows) else {
+                    continue;
+                };
+                cx.update_window(session.backend.window.into(), |_, window, cx| {
+                    window.dispatch_event(input, cx);
+                })
+                .ok();
             }
             Event::FocusGained | Event::FocusLost | Event::Mouse(_) => {}
         }
@@ -480,16 +532,13 @@ async fn handle_overlay_key(session: &mut Session, key: KeyEvent, cx: &mut Async
 
     match overlay.handle_key(&key) {
         overlay::Update::Unchanged => {}
-        overlay::Update::QueryChanged => {
-            cx.update(|cx| overlay.refresh(&session.backend, cx));
-        }
         // Leaving the editor exactly as it was, which is what makes `esc` a
         // no-op rather than a state change (SPEC §24.6).
         overlay::Update::Cancel => session.overlay = None,
-        overlay::Update::Confirm(split) => {
-            let opening = overlay.confirm(split, &session.backend, cx);
+        overlay::Update::Confirm => {
+            let confirmed = overlay.confirm(&session.backend, cx);
             session.overlay = None;
-            if let Err(error) = opening.await {
+            if let Err(error) = confirmed {
                 session.messages.push(format!("could not open: {error}"));
             }
         }
@@ -781,7 +830,7 @@ fn command_line_view(session: &Session, cx: &mut AsyncApp) -> Option<CommandLine
 /// Opens whichever of `ted`'s own surfaces an action asked for (SPEC §24.2).
 async fn open_surface(session: &mut Session, surface: Surface, cx: &mut AsyncApp) {
     match surface {
-        Surface::Finder | Surface::Switcher => {
+        Surface::Switcher => {
             session.overlay = cx.update(|cx| Overlay::open(surface, &session.backend, cx));
         }
         Surface::GoToLine => session.command_line = Some(CommandLine::go_to_line()),
@@ -796,6 +845,17 @@ async fn open_surface(session: &mut Session, surface: Surface, cx: &mut AsyncApp
                 .filter(|panel| !panel.is_empty());
         }
     }
+}
+
+/// The list for whatever modal the workspace has open (SPEC §13.1). Nothing is
+/// routed to it: the modal holds GPUI's focus, so its keys reach it down the
+/// dispatch tree like any other, and `ted` only paints what it reads.
+fn mirrored_overlay(session: &Session, cx: &mut AsyncApp) -> Option<crate::snapshot::OverlayView> {
+    cx.update_window(session.backend.window.into(), |_, window, cx| {
+        crate::mirror::view(&session.backend.workspace, window, cx)
+    })
+    .ok()
+    .flatten()
 }
 
 /// Projects the pane's `BufferSearchBar` into `ted`'s bottom line. Vim's `/`
@@ -853,8 +913,24 @@ pub(crate) fn enter_terminal_mode() -> Result<()> {
         )
     )
     .ok();
+    if MOUSE_IS_WANTED.load(Ordering::SeqCst) {
+        queue!(out, EnableMouseCapture).ok();
+    }
     out.flush().ok();
     Ok(())
+}
+
+/// Turns terminal mouse reporting on or off, and records the answer so that a
+/// suspension can put it back on the way out of the child (SPEC §7.1, §17).
+fn set_mouse_capture(wanted: bool) {
+    MOUSE_IS_WANTED.store(wanted, Ordering::SeqCst);
+    let mut out = stdout();
+    if wanted {
+        queue!(out, EnableMouseCapture).ok();
+    } else {
+        queue!(out, DisableMouseCapture).ok();
+    }
+    out.flush().ok();
 }
 
 /// Idempotent, because it runs from the panic hook, from normal shutdown and
@@ -866,6 +942,12 @@ pub(crate) fn restore_terminal_mode() {
     }
     let mut out = stdout();
     queue!(out, PopKeyboardEnhancementFlags).ok();
+    // The flag is left set: the child, or the shell `ted` is exiting to, must
+    // have its mouse back, and `enter_terminal_mode` is what puts `ted`'s
+    // reporting on again.
+    if MOUSE_IS_WANTED.load(Ordering::SeqCst) {
+        queue!(out, DisableMouseCapture).ok();
+    }
     execute!(
         out,
         crossterm::cursor::SetCursorStyle::DefaultUserShape,

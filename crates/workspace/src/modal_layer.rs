@@ -67,6 +67,7 @@ pub trait ModalView: ManagedView {
 trait ModalViewHandle {
     fn on_before_dismiss(&mut self, window: &mut Window, cx: &mut App) -> DismissDecision;
     fn view(&self) -> AnyView;
+    fn type_name(&self) -> &'static str;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
     fn subscribe_dismiss(&self, window: &mut Window, cx: &mut Context<ModalLayer>) -> Subscription;
     fn fade_out_background(&self, cx: &mut App) -> bool;
@@ -80,6 +81,10 @@ impl<V: ModalView> ModalViewHandle for Entity<V> {
 
     fn view(&self) -> AnyView {
         self.clone().into()
+    }
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<V>()
     }
 
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -278,6 +283,12 @@ impl ModalLayer {
 
     pub fn has_active_modal(&self) -> bool {
         self.active_modal.is_some()
+    }
+
+    /// The active modal's Rust type name. The only thing a frontend that cannot
+    /// render an arbitrary modal can honestly say about one it does not know.
+    pub fn active_modal_type_name(&self) -> Option<&'static str> {
+        Some(self.active_modal.as_ref()?.modal.type_name())
     }
 }
 

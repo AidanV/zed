@@ -366,6 +366,67 @@ fn visual_line_mode_selects_whole_rows() {
     assert_eq!(editor.selections[1].end_cell, 4);
 }
 
+/// SPEC §11: a visual-block selection is the same column range on every row it
+/// covers, so the rectangle falls out of the projection with no special case —
+/// and each row gets a cursor, of which only the newest owns the hardware one.
+#[test]
+fn visual_block_selects_a_rectangle_and_puts_a_cursor_on_each_row() {
+    let mut session = Session::open(24, 8, "alphabet\nbetagamma\ngammadelta\n");
+
+    session.keys("l ctrl-v j j l");
+    assert_eq!(session.mode().as_deref(), Some("VISUAL BLOCK"));
+
+    let snapshot = session.snapshot();
+    let editor = snapshot.editor.clone().expect("no editor view");
+    let spans: Vec<(u32, u16, u16)> = editor
+        .selections
+        .iter()
+        .map(|selection| {
+            (
+                selection.display_row,
+                selection.start_cell,
+                selection.end_cell,
+            )
+        })
+        .collect();
+    assert_eq!(
+        spans,
+        vec![(0, 1, 3), (1, 1, 3), (2, 1, 3)],
+        "the block is not the same columns on every row"
+    );
+
+    // Three cursors, one per row, and the terminal's own is on the last of them
+    // because that is where the block was dragged to (SPEC §11).
+    let mut rows: Vec<u16> = editor
+        .secondary_cursors
+        .iter()
+        .map(|cursor| cursor.row)
+        .collect();
+    rows.push(snapshot.cursor.expect("no cursor").row);
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        vec![
+            editor.text_rect.y,
+            editor.text_rect.y + 1,
+            editor.text_rect.y + 2
+        ]
+    );
+}
+
+/// A block edit is one edit per row, which is the whole reason for the mode —
+/// and the projection has to keep up with all of them at once.
+#[test]
+fn a_visual_block_insert_reaches_every_row_it_covered() {
+    let mut session = Session::open(24, 8, "one\ntwo\nsix\n");
+
+    session.keys("ctrl-v j j shift-i - escape");
+    assert_eq!(session.text(), "-one\n-two\n-six\n");
+    assert_eq!(session.row_text(0), "-one");
+    assert_eq!(session.row_text(1), "-two");
+    assert_eq!(session.row_text(2), "-six");
+}
+
 /// A forward selection's head is its *exclusive* end, one position past the
 /// block cursor vim paints — so a projection that placed the cursor on the head
 /// would move it one cell right on `v` and back again on the `v` that leaves.

@@ -11,7 +11,7 @@ use gpui::{
     div, rems,
 };
 use language::{OffsetRangeExt, Outline, OutlineItem, OutlineSearchEntry};
-use picker::{MatchLocation, Picker, PickerDelegate, PreviewUpdate};
+use picker::{MatchLocation, Picker, PickerDelegate, PickerRowText, PreviewUpdate};
 use settings::Settings;
 use theme::ActiveTheme;
 use theme_settings::ThemeSettings;
@@ -120,6 +120,12 @@ pub struct OutlineView {
     picker: Entity<Picker<OutlineViewDelegate>>,
 }
 
+impl OutlineView {
+    pub fn picker(&self) -> &Entity<Picker<OutlineViewDelegate>> {
+        &self.picker
+    }
+}
+
 impl Focusable for OutlineView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.picker.focus_handle(cx)
@@ -196,7 +202,7 @@ impl OutlineView {
     }
 }
 
-struct OutlineViewDelegate {
+pub struct OutlineViewDelegate {
     outline_view: WeakEntity<OutlineView>,
     active_editor: Entity<Editor>,
     outline: Arc<Outline<Anchor>>,
@@ -460,6 +466,28 @@ impl PickerDelegate for OutlineViewDelegate {
                         .pl(rems(outline_item.depth as f32))
                         .child(render_item(outline_item, ranges, cx)),
                 ),
+        )
+    }
+
+    fn text_for_match(&self, ix: usize, _window: &Window, _cx: &App) -> Option<PickerRowText> {
+        let entry = self.matches.get(ix)?;
+        let outline_item = self.outline.items.get(entry.candidate_id())?;
+        // Depth is nesting, which the element tree carries as left padding and
+        // plain text can only carry as leading spaces — so the match positions
+        // move with the text they point into.
+        let indent = "  ".repeat(outline_item.depth);
+        let positions = entry
+            .as_match()
+            .map(|string_match| {
+                string_match
+                    .positions
+                    .iter()
+                    .map(|position| position + indent.len())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(
+            PickerRowText::new(format!("{indent}{}", outline_item.text)).label_positions(positions),
         )
     }
 }

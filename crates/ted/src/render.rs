@@ -13,9 +13,9 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use crate::cell::{cluster_cells, text_cells};
 use crate::palette::Palette;
 use crate::snapshot::{
-    CellPoint, CellRect, CommandLineView, CursorShape, EditorView, HoverView, MatchedText,
-    OverlayPlacement, OverlayView, PromptView, RowView, SpanStyle, StatusView, TabStripView,
-    ViewSnapshot, tab_cells,
+    CellPoint, CellRect, CommandLineView, CreaseState, CursorShape, EditorView, HoverView,
+    MatchedText, OverlayPlacement, OverlayView, PromptView, RowView, SpanStyle, StatusView,
+    TabStripView, ViewSnapshot, tab_cells,
 };
 
 /// A prompt is always exactly this tall — the question on one row, the numbered
@@ -135,7 +135,14 @@ fn render_editor(editor: &EditorView, palette: &Palette, buffer: &mut Buffer) {
             break;
         }
 
-        render_gutter(row, gutter_area, offset, palette, buffer);
+        render_gutter(
+            row,
+            gutter_area,
+            offset,
+            editor.fold_gutter_cells,
+            palette,
+            buffer,
+        );
         render_row(
             row,
             editor.scroll_columns,
@@ -163,6 +170,7 @@ fn render_gutter(
     row: &RowView,
     area: Rect,
     row_offset: u16,
+    fold_gutter_cells: u16,
     palette: &Palette,
     buffer: &mut Buffer,
 ) {
@@ -170,12 +178,47 @@ fn render_gutter(
         return;
     }
     let y = area.y + row_offset;
-    let style = terminal_style(&row.gutter.style, palette);
+    let background = row.background.map(|color| palette.color(color));
+    if let Some(background) = background {
+        // The diff hunk's (or block's) tint across the whole gutter row (SPEC
+        // §11 step 1), painted before anything else in this row so every glyph
+        // below can carry the same background explicitly and survive `write`'s
+        // full-cell reset.
+        fill(
+            Rect::new(area.x, y, area.width, 1),
+            Style::default().bg(background),
+            buffer,
+        );
+    }
+
+    let mut style = terminal_style(&row.gutter.style, palette);
+    if let Some(background) = background {
+        style = style.bg(background);
+    }
 
     if let Some(diff) = row.gutter.diff
         && let Some(cell) = buffer.cell_mut((area.x, y))
     {
+        let mut marker_style = style;
+        if let Some(foreground) = row.gutter.diff_foreground {
+            marker_style = marker_style.fg(palette.color(foreground));
+        }
         cell.set_symbol(&diff.symbol().to_string());
+        cell.set_style(marker_style);
+    }
+
+    // The rightmost gutter column, which line numbers always leave blank
+    // (below) — reserved for the fold chevron whenever Zed's own reported
+    // gutter width left room for one (SPEC §11 step 1).
+    if fold_gutter_cells > 0
+        && area.width > 1
+        && let Some(crease) = row.gutter.crease
+        && let Some(cell) = buffer.cell_mut((area.x + area.width - 1, y))
+    {
+        cell.set_symbol(match crease {
+            CreaseState::Folded => "▸",
+            CreaseState::Foldable => "▾",
+        });
         cell.set_style(style);
     }
 
@@ -209,6 +252,17 @@ fn render_row(
     buffer: &mut Buffer,
 ) {
     let y = area.y + row_offset;
+    if let Some(background) = row.background {
+        // Painted first so every glyph cell below keeps it: `Cell::set_style`
+        // merges rather than replaces (SPEC §11 step 1, and the same reasoning
+        // as `write_cell`'s doc comment), and a span that names no background
+        // of its own — ordinary syntax-highlighted text — leaves this in place.
+        fill(
+            Rect::new(area.x, y, area.width, 1),
+            Style::default().bg(palette.color(background)),
+            buffer,
+        );
+    }
     let mut spans = row.spans.iter().peekable();
     let mut column: u32 = 0;
 
@@ -1003,8 +1057,8 @@ mod tests {
     use super::*;
     use crate::palette::ColorDepth;
     use crate::snapshot::{
-        DiffMarker, GutterView, HoverBlock, OverlayRow, QueryView, SelectionSpan, StyledSpan,
-        TabView, Underline,
+        CreaseState, DiffMarker, GutterView, HoverBlock, OverlayRow, QueryView, RowKind,
+        SelectionSpan, StyledSpan, TabView, Underline,
     };
     use gpui::hsla;
 
@@ -1694,5 +1748,111 @@ mod tests {
             overlay.placement = OverlayPlacement::TopCentre;
         }
         assert_eq!(cursor(&snapshot).0, None);
+    }
+
+    /// SPEC's M3 slice: a block row `highlighted_chunks` gave no text of its
+    /// own must still read as *something*, not the blank line an empty-text
+    /// row shares with a genuinely empty buffer line.
+    #[test]
+    fn a_block_row_shows_a_dimmed_placeholder_instead_of_blank_text() {
+        let placeholder = hsla(0.0, 0.0, 0.6, 1.0);
+        let placeholder_background = hsla(0.0, 0.0, 0.2, 1.0);
+        let mut snapshot = snapshot_of(30, 3, &["‹block ted cannot render›"]);
+        if let Some(editor) = snapshot.editor.as_mut() {
+            editor.rows[0].kind = RowKind::Block;
+            editor.rows[0].background = Some(placeholder_background);
+            editor.rows[0].spans = vec![StyledSpan {
+                range: 0..editor.rows[0].text.len(),
+                style: SpanStyle {
+                    foreground: Some(placeholder),
+                    background: Some(placeholder_background),
+                    ..Default::default()
+                },
+            }];
+        }
+        assert!(grid(&snapshot)[0].starts_with("‹block ted cannot render›"));
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 3));
+        render(&snapshot, &palette(), &mut buffer);
+        let tint = palette().color(placeholder_background);
+        // The tint reaches past the label too, so the row reads as one block
+        // rather than text followed by the editor's ordinary background.
+        assert_eq!(buffer.cell((0, 0)).map(|cell| cell.bg), Some(tint));
+        assert_eq!(buffer.cell((29, 0)).map(|cell| cell.bg), Some(tint));
+    }
+
+    fn gutter_snapshot(columns: u16, rows: u16, gutter_width: u16, line: &str) -> ViewSnapshot {
+        let mut snapshot = snapshot_of(columns, rows, &[line]);
+        if let Some(editor) = snapshot.editor.as_mut() {
+            editor.gutter_rect = CellRect::new(0, 0, gutter_width, rows.saturating_sub(1));
+            editor.text_rect = CellRect::new(
+                gutter_width,
+                0,
+                columns - gutter_width,
+                rows.saturating_sub(1),
+            );
+        }
+        snapshot
+    }
+
+    #[test]
+    fn a_fold_chevron_points_right_when_folded_and_down_when_foldable() {
+        let mut snapshot = gutter_snapshot(20, 2, 6, "x");
+        if let Some(editor) = snapshot.editor.as_mut() {
+            editor.fold_gutter_cells = 2;
+            editor.rows[0].gutter.crease = Some(CreaseState::Folded);
+        }
+        assert_eq!(grid(&snapshot)[0].chars().nth(5), Some('▸'));
+
+        if let Some(editor) = snapshot.editor.as_mut() {
+            editor.rows[0].gutter.crease = Some(CreaseState::Foldable);
+        }
+        assert_eq!(grid(&snapshot)[0].chars().nth(5), Some('▾'));
+    }
+
+    /// SPEC's M3 slice: the chevron is conditional on the room Zed's own
+    /// gutter layout reported, not painted just because a crease exists.
+    #[test]
+    fn no_chevron_is_painted_when_the_gutter_reserved_no_room_for_one() {
+        let mut snapshot = gutter_snapshot(20, 2, 6, "x");
+        if let Some(editor) = snapshot.editor.as_mut() {
+            editor.fold_gutter_cells = 0;
+            editor.rows[0].gutter.crease = Some(CreaseState::Folded);
+        }
+        assert_eq!(grid(&snapshot)[0].chars().nth(5), Some(' '));
+    }
+
+    /// SPEC §11 step 1: a diff hunk's background reaches across the gutter and
+    /// the text, not just the marker's own cell.
+    #[test]
+    fn a_diff_hunk_tints_the_gutter_and_the_text_row() {
+        let added = hsla(0.3, 0.5, 0.4, 1.0);
+        let added_background = hsla(0.3, 0.3, 0.15, 1.0);
+        let mut snapshot = gutter_snapshot(20, 2, 6, "let x = 1;");
+        if let Some(editor) = snapshot.editor.as_mut() {
+            editor.rows[0].background = Some(added_background);
+            editor.rows[0].gutter.diff = Some(DiffMarker::Added);
+            editor.rows[0].gutter.diff_foreground = Some(added);
+            editor.rows[0].gutter.line_number = Some(3);
+        }
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 2));
+        render(&snapshot, &palette(), &mut buffer);
+        let tint = palette().color(added_background);
+        // The marker's own cell, a blank gutter cell beside it, and a text
+        // cell all carry the same tint.
+        assert_eq!(buffer.cell((0, 0)).map(|cell| cell.bg), Some(tint));
+        assert_eq!(buffer.cell((1, 0)).map(|cell| cell.bg), Some(tint));
+        assert_eq!(buffer.cell((10, 0)).map(|cell| cell.bg), Some(tint));
+        // The marker itself takes the diff's own colour rather than the line
+        // number's active/muted one.
+        assert_eq!(
+            buffer.cell((0, 0)).map(|cell| cell.fg),
+            Some(palette().color(added))
+        );
+        assert_eq!(
+            buffer.cell((0, 0)).map(|cell| cell.symbol().to_owned()),
+            Some("+".to_owned())
+        );
     }
 }

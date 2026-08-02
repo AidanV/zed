@@ -27,6 +27,13 @@ pub struct Config {
     /// file `ted` reads the selection back from, one path per line, and
     /// `{directory}` with the directory to start browsing in.
     pub file_manager: Vec<String>,
+    /// Whether the terminal reports the mouse to `ted` (SPEC §17).
+    ///
+    /// Off by default, and that is not timidity: reporting takes the mouse away
+    /// from the terminal itself, so selecting text with the mouse and the
+    /// terminal's own copy stop working for as long as it is on. `ted:
+    /// ToggleMouse` turns it on for as long as it is wanted.
+    pub mouse: bool,
 }
 
 impl Default for Config {
@@ -35,6 +42,7 @@ impl Default for Config {
             file_manager: ["yazi", "--chooser-file={chooser}", "{directory}"]
                 .map(str::to_owned)
                 .to_vec(),
+            mouse: false,
         }
     }
 }
@@ -50,6 +58,7 @@ impl Default for Config {
 #[serde(deny_unknown_fields)]
 struct File {
     file_manager: Option<Vec<String>>,
+    mouse: Option<bool>,
 }
 
 /// Reads `ted.json`, and says what went wrong rather than quietly falling back.
@@ -96,6 +105,7 @@ fn parse(contents: &str) -> Result<Config> {
     let defaults = Config::default();
     Ok(Config {
         file_manager: file.file_manager.unwrap_or(defaults.file_manager),
+        mouse: file.mouse.unwrap_or(defaults.mouse),
     })
 }
 
@@ -128,6 +138,13 @@ mod tests {
         )
         .expect("ted.json is written by hand, like every other JSON file Zed reads");
         assert_eq!(parsed.file_manager, ["nnn", "-p", "{chooser}"]);
+    }
+
+    #[test]
+    fn the_mouse_is_off_until_it_is_asked_for() {
+        assert!(!Config::default().mouse);
+        let parsed = parse(r#"{ "mouse": true }"#).expect("mouse should parse");
+        assert!(parsed.mouse);
     }
 
     #[test]

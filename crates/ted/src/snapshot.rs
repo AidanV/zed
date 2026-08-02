@@ -3,15 +3,18 @@
 //! That constraint is what keeps an out-of-process frontend possible later, and
 //! it makes the renderer testable without a terminal.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use buffer_diff::DiffHunkStatusKind;
-use editor::display_map::{DisplayRow, DisplaySnapshot, ToDisplayPoint as _};
+use editor::display_map::{
+    Block, ChunkRendererId, ChunkReplacement, DisplayRow, DisplaySnapshot, ToDisplayPoint as _,
+};
 use editor::{DisplayPoint, Editor};
 use gpui::{App, Entity, FontStyle, FontWeight, Hsla, Pixels, Window};
 use language::LanguageAwareStyling;
-use multi_buffer::RowInfo;
-use theme::ActiveTheme as _;
+use multi_buffer::{MultiBufferSnapshot, RowInfo};
+use theme::{ActiveTheme as _, ThemeColors};
 use unicode_segmentation::UnicodeSegmentation as _;
 use workspace::{Pane, Workspace};
 
@@ -89,6 +92,11 @@ pub struct EditorView {
     /// Zero-width when the gutter is hidden, in which case nothing is painted
     /// there and `text_rect` starts at the editor's left edge.
     pub gutter_rect: CellRect,
+    /// Cells at the gutter's right edge Zed reserves for a fold indicator
+    /// (`GutterDimensions::fold_area_width`, SPEC §11 step 1). The renderer
+    /// paints a fold chevron only when this is nonzero, so a gutter Zed itself
+    /// left no room in never gets one either.
+    pub fold_gutter_cells: u16,
     /// Horizontal scroll in cells. Vertical scroll is already applied: `rows`
     /// is the window into the display map, so `ted` never keeps its own
     /// vertical offset (SPEC §15).
@@ -114,9 +122,29 @@ pub struct EditorView {
 pub enum RowKind {
     #[default]
     Text,
-    /// A block decoration (diagnostics, git blame, excerpt headers). M1 paints
-    /// the row's plain text; M3 gives blocks their own rendering.
+    /// The header above a buffer that starts a new file in the multibuffer,
+    /// folded or not (`Block::BufferHeader`, `Block::FoldedBuffer`). Labelled
+    /// with the buffer's path, since `highlighted_chunks` gives block rows no
+    /// text of their own (SPEC §11 point 6).
+    BufferHeader,
+    /// A boundary between two excerpts of the same buffer (`Block::ExcerptBoundary`).
+    ExcerptHeader,
+    /// A block `ted` has no projection for: diagnostics, git blame, code lens,
+    /// and anything else built from `Block::Custom`'s opaque `render` closure.
+    /// Degrades to a dimmed placeholder naming it, rather than the blank line
+    /// `highlighted_chunks` gives every block row regardless of what it is.
     Block,
+}
+
+impl RowKind {
+    /// Whether a cursor or selection may visibly land on this row. Every kind
+    /// but `Text` is a decoration the display map only produces between real
+    /// buffer positions, so a selection whose display range happens to span
+    /// one must not paint over it (SPEC's M3 slice: blocks must not look
+    /// selectable).
+    pub fn is_selectable(self) -> bool {
+        matches!(self, RowKind::Text)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -135,6 +163,11 @@ pub struct RowView {
     /// ad hoc (SPEC §5.4, and the §22 risk row on byte/grapheme confusion).
     pub byte_to_cell: Vec<u16>,
     pub soft_wrap_indent: u16,
+    /// The background this row paints across both the gutter and the text,
+    /// before anything else: a diff hunk's tint, or a block/header's own
+    /// surface (SPEC §11 step 1). `None` keeps the editor's own background
+    /// from the initial fill.
+    pub background: Option<Hsla>,
 }
 
 impl RowView {
@@ -152,6 +185,7 @@ impl RowView {
             spans,
             byte_to_cell,
             soft_wrap_indent: 0,
+            background: None,
         }
     }
 
@@ -207,9 +241,25 @@ pub struct GutterView {
     /// continuation rows and block rows, which carry no line number.
     pub line_number: Option<u32>,
     pub diff: Option<DiffMarker>,
+    /// The diff marker's own colour — the theme's status colour for
+    /// added/modified/deleted — kept apart from `style`'s line-number colour,
+    /// which tracks the cursor row instead (SPEC §11 step 1).
+    pub diff_foreground: Option<Hsla>,
+    /// Whether this row's buffer row has a crease, and which way the chevron
+    /// should point (SPEC §11 step 1, and SPEC §5.4 on fold placeholders).
+    pub crease: Option<CreaseState>,
     /// Resolved here rather than in the renderer, so the active line number's
     /// brighter colour is a theme decision like every other colour.
     pub style: SpanStyle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreaseState {
+    /// Collapsed: the buffer content behind it is a fold placeholder.
+    Folded,
+    /// Not collapsed, but `DisplaySnapshot::crease_for_buffer_row` reports the
+    /// row could be.
+    Foldable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -871,6 +921,10 @@ fn build_editor_view(
     // a cell (SPEC §5.4), and rounding it down would put the first column of
     // text on top of the last column of the gutter.
     let gutter_cells = cells_ceil(gutter.full_width(), CELL_WIDTH);
+    // Gates the fold chevron (SPEC §11 step 1): Zed's own reported width for
+    // the fold column, rather than a `ted`-side guess, so a gutter Zed left no
+    // room in (e.g. `gutter.folds = false`, SPEC's M3 slice) never gets one.
+    let fold_gutter_cells = cells_ceil(gutter.fold_area_width(), CELL_WIDTH);
     // The floored column count is authoritative wherever it and a rect could
     // disagree (SPEC §5.3): it is exactly the count `calculate_wrap_width`
     // wrapped against.
@@ -917,7 +971,40 @@ fn build_editor_view(
     let end_row = first_row
         .saturating_add(visible)
         .min(last_display_row.saturating_add(1));
-    let built_rows = rows_from_chunks(&editor_snapshot, first_row..end_row, &style);
+
+    let colors = cx.theme().colors().clone();
+    // The default fold widget's own colours (`FoldPlaceholder::fold_element`,
+    // `display_map/fold_map.rs`), reused for every placeholder `ted` draws in
+    // text rather than a widget, so a fold and an unrenderable block read as
+    // the same kind of "there is something here `ted` collapsed" marker.
+    let placeholder_style = SpanStyle {
+        foreground: Some(colors.text_placeholder),
+        background: Some(colors.ghost_element_background),
+        ..Default::default()
+    };
+    let built_rows = rows_from_chunks(
+        &editor_snapshot,
+        first_row..end_row,
+        &style,
+        placeholder_style,
+    );
+
+    // `blocks_in_range` only reports a block's *first* row, so the query has to
+    // start well before the visible window to still find the block a
+    // continuation row belongs to. `BLOCK_LOOKBACK_ROWS` comfortably covers
+    // known header heights (`FILE_HEADER_HEIGHT`, `MULTI_BUFFER_EXCERPT_HEADER_HEIGHT`)
+    // and ordinary custom blocks without scanning the whole file.
+    const BLOCK_LOOKBACK_ROWS: u32 = 32;
+    let blocks: HashMap<u32, &Block> = display
+        .blocks_in_range(
+            DisplayRow(first_row.saturating_sub(BLOCK_LOOKBACK_ROWS))..DisplayRow(end_row),
+        )
+        .map(|(row, block)| (row.0, block))
+        .collect();
+    let buffer_snapshot = display.buffer_snapshot();
+    // A plain reborrow, so the loop below never needs to reborrow `cx` itself
+    // on every iteration just to read the theme.
+    let app_cx: &App = cx;
 
     let mut row_infos = display.row_infos(DisplayRow(first_row));
     let mut rows_view = Vec::new();
@@ -926,24 +1013,95 @@ fn build_editor_view(
         let info = row_infos.next().unwrap_or_default();
         let mut row = RowView::new(display_row, text);
         row.spans = spans;
-        row.kind = if display.is_block_line(DisplayRow(display_row)) {
-            RowKind::Block
+
+        let is_block_line = display.is_block_line(DisplayRow(display_row));
+        let mut background = None;
+        if is_block_line {
+            match blocks.get(&display_row) {
+                Some(block) => match block_label(block, buffer_snapshot, app_cx, &colors) {
+                    Some((kind, label, block_style)) => {
+                        row.kind = kind;
+                        row.byte_to_cell = byte_to_cell_table(&label);
+                        row.spans = vec![StyledSpan {
+                            range: 0..label.len(),
+                            style: block_style,
+                        }];
+                        row.text = label;
+                        background = block_style.background;
+                    }
+                    // A `Block::Spacer`: genuinely blank vertical space, not a
+                    // degraded projection, so it gets no label and no tint.
+                    None => row.kind = RowKind::Block,
+                },
+                // A continuation row of a block whose first row is further
+                // back than `BLOCK_LOOKBACK_ROWS`, or taller than it. Still
+                // tinted, so it never reads as an ordinary blank buffer line
+                // even without a label to put on it.
+                None => {
+                    row.kind = RowKind::Block;
+                    background = Some(colors.ghost_element_background);
+                }
+            }
         } else {
-            RowKind::Text
-        };
+            row.kind = RowKind::Text;
+        }
+
         row.soft_wrap_indent = display
             .soft_wrap_indent(DisplayRow(display_row))
             .unwrap_or(0)
             .min(u32::from(u16::MAX)) as u16;
+
+        let diff = info.diff_status.map(|status| match status.kind {
+            DiffHunkStatusKind::Added => DiffMarker::Added,
+            DiffHunkStatusKind::Modified => DiffMarker::Modified,
+            DiffHunkStatusKind::Deleted => DiffMarker::Deleted,
+        });
+        // Read from the status colours already threaded through `EditorStyle`
+        // (SPEC §11 step 1) rather than the dedicated `editor_diff_hunk_*`
+        // theme fields Zed's own gutter uses, so this stays a plain function
+        // of what `build_editor_view` already has in scope.
+        let diff_colors = diff.map(|marker| match marker {
+            DiffMarker::Added => (style.status.created, style.status.created_background),
+            DiffMarker::Modified => (style.status.modified, style.status.modified_background),
+            DiffMarker::Deleted => (style.status.deleted, style.status.deleted_background),
+        });
+        if background.is_none() {
+            background = diff_colors.map(|(_, background)| background);
+        }
+        row.background = background;
+
+        // Only a real buffer row can have a crease, and a block row's
+        // placeholder already says everything `ted` can about it.
+        //
+        // `is_line_folded` has to be checked before falling back to
+        // `crease_for_buffer_row`, not the other way round: for the common
+        // case of an indent-derived crease (no explicit entry in
+        // `crease_snapshot`), `crease_for_buffer_row`'s own fallback logic
+        // skips itself once the row `is_line_folded` — it has nothing cheap to
+        // re-derive from a buffer row whose content is hidden — so it goes
+        // back to reporting `None` the moment the fold it describes succeeds.
+        // Asking fold state directly is the only way the chevron survives the
+        // fold it is showing.
+        let crease = (!is_block_line)
+            .then(|| info.multibuffer_row)
+            .flatten()
+            .and_then(|buffer_row| {
+                if display.is_line_folded(buffer_row) {
+                    Some(CreaseState::Folded)
+                } else {
+                    display
+                        .crease_for_buffer_row(buffer_row)
+                        .map(|_| CreaseState::Foldable)
+                }
+            });
+
         row.gutter = GutterView {
             line_number: show_line_numbers
                 .then(|| line_number_for(&info, display_row, cursor_display_row, relative_numbers))
                 .flatten(),
-            diff: info.diff_status.map(|status| match status.kind {
-                DiffHunkStatusKind::Added => DiffMarker::Added,
-                DiffHunkStatusKind::Modified => DiffMarker::Modified,
-                DiffHunkStatusKind::Deleted => DiffMarker::Deleted,
-            }),
+            diff,
+            diff_foreground: diff_colors.map(|(foreground, _)| foreground),
+            crease,
             style: SpanStyle {
                 foreground: Some(if display_row == cursor_display_row {
                     style.status.info
@@ -1001,6 +1159,7 @@ fn build_editor_view(
         editor: EditorView {
             text_rect,
             gutter_rect,
+            fold_gutter_cells,
             scroll_columns: scroll.x.max(0.0) as u16,
             rows: rows_view,
             selections,
@@ -1047,6 +1206,12 @@ fn rows_from_chunks(
     snapshot: &editor::EditorSnapshot,
     rows: Range<u32>,
     style: &editor::EditorStyle,
+    // The fold placeholder's own colours: `HighlightedChunk::style` is `None`
+    // for a fold's "⋯" text (`fold_map.rs` pushes the placeholder chunk with
+    // `..Default::default()`), because GUI Zed colours it by rendering
+    // `FoldPlaceholder::render` as a widget instead. `ted` renders the
+    // placeholder as text (SPEC §5.4), so it has to supply that colour itself.
+    placeholder_style: SpanStyle,
 ) -> Vec<(String, Vec<StyledSpan>)> {
     let mut built = vec![(String::new(), Vec::new()); rows.end.saturating_sub(rows.start) as usize];
     let language_aware = LanguageAwareStyling {
@@ -1064,7 +1229,16 @@ fn rows_from_chunks(
         if row >= built.len() {
             break;
         }
-        let chunk_style = span_style(chunk.style, style);
+        let is_fold_placeholder = matches!(
+            &chunk.replacement,
+            Some(ChunkReplacement::Renderer(renderer))
+                if matches!(renderer.id, ChunkRendererId::Fold(_))
+        );
+        let chunk_style = if is_fold_placeholder {
+            placeholder_style
+        } else {
+            span_style(chunk.style, style)
+        };
         // A chunk is not bounded by a row, so its newlines are what advance the
         // row rather than the chunk boundary.
         for (index, segment) in chunk.text.split('\n').enumerate() {
@@ -1122,6 +1296,55 @@ fn span_style(
             color: underline.color,
         }),
         strikethrough: highlight.strikethrough.is_some(),
+    }
+}
+
+/// The label and style `ted` draws for a block row, since `highlighted_chunks`
+/// gives every block row's text as nothing but the newlines that hold its
+/// height (`BlockChunks::next`, `block_map.rs`) — the real content is an
+/// `AnyElement` GUI Zed builds from the block's `render` closure, which `ted`
+/// cannot execute.
+///
+/// `None` only for `Block::Spacer`: genuine blank vertical space rather than
+/// something `ted` failed to project, so it gets no placeholder at all.
+fn block_label(
+    block: &Block,
+    buffer_snapshot: &MultiBufferSnapshot,
+    cx: &App,
+    colors: &ThemeColors,
+) -> Option<(RowKind, String, SpanStyle)> {
+    let header_style = |foreground| SpanStyle {
+        foreground: Some(foreground),
+        background: Some(colors.editor_subheader_background),
+        ..Default::default()
+    };
+    match block {
+        Block::BufferHeader { excerpt, .. }
+        | Block::FoldedBuffer {
+            first_excerpt: excerpt,
+            ..
+        } => {
+            let path = excerpt
+                .buffer(buffer_snapshot)
+                .resolve_file_path(true, cx)
+                .unwrap_or_else(|| "untitled".to_owned());
+            Some((RowKind::BufferHeader, path, header_style(colors.text)))
+        }
+        Block::ExcerptBoundary { .. } => Some((
+            RowKind::ExcerptHeader,
+            "⋯".to_owned(),
+            header_style(colors.text_muted),
+        )),
+        Block::Custom(_) => Some((
+            RowKind::Block,
+            "‹block ted cannot render›".to_owned(),
+            SpanStyle {
+                foreground: Some(colors.text_placeholder),
+                background: Some(colors.ghost_element_background),
+                ..Default::default()
+            },
+        )),
+        Block::Spacer { .. } => None,
     }
 }
 
@@ -1189,6 +1412,14 @@ fn selection_cells(
         let Some(row) = rows.iter().find(|row| row.display_row == display_row) else {
             continue;
         };
+        // A multi-row selection can straddle a block or header row in display
+        // coordinates without the buffer selection ever covering it — the
+        // display map only puts those rows between real buffer positions, not
+        // on one — so painting a selection span there would make an
+        // unrenderable block or a fold's own text look selectable.
+        if !row.kind.is_selectable() {
+            continue;
+        }
         let start = if display_row == range.start.row().0 {
             row.cell_for_byte(range.start.column() as usize)
         } else {
@@ -1214,7 +1445,16 @@ fn cell_for(
     text_rect: &CellRect,
 ) -> Option<CellPoint> {
     let offset = rows.iter().position(|row| row.display_row == display_row)?;
-    let column = rows.get(offset)?.cell_for_byte(byte_column);
+    let row = rows.get(offset)?;
+    // Belt and braces alongside `selection_cells`' guard: a cursor's display
+    // point is always clipped to a real buffer position by the display map, so
+    // this should never actually be a block row, but landing a block cursor
+    // one cell into placeholder text it does not describe would be a worse
+    // failure than simply not drawing one.
+    if !row.kind.is_selectable() {
+        return None;
+    }
+    let column = row.cell_for_byte(byte_column);
     let offset = u16::try_from(offset).ok()?;
     if offset >= text_rect.height {
         return None;
@@ -1252,6 +1492,271 @@ pub fn byte_to_cell_table(text: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use gpui::{AppContext as _, BorrowAppContext as _, HeadlessAppContext, WindowHandle};
+    use language::Buffer;
+    use multi_buffer::{MultiBufferOffset, MultiBufferRow};
+    use settings::SettingsStore;
+
+    use crate::cell::grid_size;
+    use crate::text_system::CellTextSystem;
+
+    /// Enables folds regardless of what `bootstrap.rs` pins for the real
+    /// binary, so this covers the chevron-and-placeholder path SPEC's M3
+    /// slice adds, independent of that unrelated default.
+    const REAL_EDITOR_SETTINGS: &str = r#"{
+        "buffer_font_size": 16,
+        "buffer_line_height": { "custom": 1.0 },
+        "soft_wrap": "editor_width",
+        "gutter": { "folds": true }
+    }"#;
+
+    /// A minimal real `Editor`, for the parts of this slice — fold placeholders,
+    /// inlay hints, cursor placement through both — that only a real display map
+    /// produces. Deliberately smaller than `tests/editing_session.rs`'s `Session`:
+    /// no vim, no keymaps, since nothing here dispatches a keystroke.
+    struct RealEditor {
+        editor: Entity<Editor>,
+        window: WindowHandle<Editor>,
+        cx: HeadlessAppContext,
+    }
+
+    impl RealEditor {
+        fn open(columns: u16, rows: u16, text: &str) -> Self {
+            let mut cx = HeadlessAppContext::with_asset_source(
+                Arc::new(CellTextSystem::new()),
+                Arc::new(assets::Assets),
+            );
+            cx.update(|cx| {
+                let settings_store = SettingsStore::new(cx, &settings::default_settings());
+                cx.set_global(settings_store);
+                theme_settings::init(theme::LoadThemes::JustBase, cx);
+                release_channel::init(semver::Version::new(0, 0, 0), cx);
+                editor::init(cx);
+                cx.update_global::<SettingsStore, _>(|store, cx| {
+                    let result = store.set_user_settings(REAL_EDITOR_SETTINGS, cx);
+                    assert!(
+                        matches!(result.parse_status, settings::ParseStatus::Success),
+                        "settings override did not parse: {:?}",
+                        result.parse_status
+                    );
+                });
+            });
+
+            let text = text.to_owned();
+            let window = cx
+                .open_window(grid_size(columns, rows), move |window, cx| {
+                    let buffer = cx.new(|cx| Buffer::local(text, cx));
+                    cx.new(|cx| {
+                        let mut editor = Editor::for_buffer(buffer, None, window, cx);
+                        editor.set_offset_content(false, cx);
+                        editor.disable_scrollbars_and_minimap(window, cx);
+                        editor
+                    })
+                })
+                .expect("failed to open headless window");
+
+            let editor = window.root(&mut cx).expect("window has no root view");
+            cx.update_window(window.into(), |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    use gpui::Focusable as _;
+                    window.focus(&editor.focus_handle(cx), cx);
+                });
+            })
+            .expect("failed to focus the editor");
+
+            let mut session = Self { editor, window, cx };
+            // Twice: the first draw computes and installs the wrap width, the
+            // second lays out against the rewrapped display map (SPEC §10.2's
+            // "Ordering" — `Editor::style` and `last_bounds` need a real paint).
+            session.draw();
+            session.draw();
+            session
+        }
+
+        fn draw(&mut self) {
+            self.cx
+                .update_window(self.window.into(), |_, window, cx| {
+                    let arena_clear_needed = window.draw(cx);
+                    arena_clear_needed.clear(cx);
+                })
+                .expect("failed to draw window");
+            self.cx.run_until_parked();
+        }
+
+        fn update<R>(
+            &mut self,
+            f: impl FnOnce(&mut Editor, &mut Window, &mut gpui::Context<Editor>) -> R,
+        ) -> R {
+            let editor = self.editor.clone();
+            let result = self
+                .cx
+                .update_window(self.window.into(), |_, window, cx| {
+                    editor.update(cx, |editor, cx| f(editor, window, cx))
+                })
+                .expect("failed to update the editor");
+            self.draw();
+            result
+        }
+
+        fn snapshot(&mut self, columns: u16, rows: u16) -> ViewSnapshot {
+            let editor = self.editor.clone();
+            self.cx
+                .update_window(self.window.into(), |_, window, cx| {
+                    for_editor(&editor, columns, rows, 0, window, cx)
+                })
+                .expect("failed to build a snapshot")
+        }
+    }
+
+    /// SPEC's M3 slice: whether the display map already gives `ted` the fold's
+    /// placeholder text through `highlighted_chunks`, and whether the gutter's
+    /// crease reporting flips from foldable to folded across the fold.
+    #[test]
+    fn folding_a_row_turns_its_chevron_and_swaps_in_the_placeholder() {
+        let mut session = RealEditor::open(40, 8, "fn main() {\n    let x = 1;\n}\n");
+
+        let before = session.snapshot(40, 8);
+        let row0 = &before.editor.as_ref().expect("no editor view").rows[0];
+        assert_eq!(
+            row0.gutter.crease,
+            Some(CreaseState::Foldable),
+            "an indented block under `fn main() {{` should be foldable by default"
+        );
+        assert!(
+            !row0.text.contains('⋯'),
+            "nothing is folded yet: {:?}",
+            row0.text
+        );
+
+        session.update(|editor, window, cx| editor.fold_at(MultiBufferRow(0), window, cx));
+
+        let after = session.snapshot(40, 8);
+        let editor_view = after.editor.as_ref().expect("no editor view");
+        let row0 = &editor_view.rows[0];
+        assert_eq!(row0.gutter.crease, Some(CreaseState::Folded));
+        assert!(row0.text.contains('⋯'), "no placeholder in {:?}", row0.text);
+
+        // The placeholder's own span carries the fold widget's colours
+        // (`FoldPlaceholder::fold_element`'s `text_placeholder` /
+        // `ghost_element_background`), not the plain text colour — this is the
+        // part `highlighted_chunks` leaves to `ted` (`HighlightedChunk::style`
+        // is `None` for a fold's placeholder chunk).
+        let ellipsis_byte = row0.text.find('⋯').expect("no placeholder byte offset");
+        let placeholder_span = row0
+            .spans
+            .iter()
+            .find(|span| span.range.contains(&ellipsis_byte))
+            .expect("no span covers the placeholder");
+        assert!(placeholder_span.style.background.is_some());
+        assert_ne!(
+            placeholder_span.style.foreground,
+            row0.spans
+                .first()
+                .map(|span| span.style.foreground)
+                .unwrap_or_default(),
+            "the placeholder should not read as plain buffer text"
+        );
+    }
+
+    /// SPEC's M3 slice: an inlay's text arrives inline through the same chunk
+    /// stream as everything else, so `byte_to_cell` needs no inlay-specific
+    /// code — and the cursor, placed from `DisplayPoint`s Zed already adjusted
+    /// for the inlay, has to land past it rather than inside or before it.
+    #[test]
+    fn an_inlay_shifts_the_cells_after_it_and_the_cursor_lands_past_it() {
+        let mut session = RealEditor::open(40, 6, "let x = 1;\n");
+
+        // Right after "x" (byte offset 5), same as an LSP type-hint inlay.
+        let anchor = session.update(|editor, _window, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .anchor_before(MultiBufferOffset(5))
+        });
+        session.update(|editor, _window, cx| {
+            editor.splice_inlays(&[], vec![editor::Inlay::mock_hint(0, anchor, ": i32")], cx);
+        });
+
+        let snapshot = session.snapshot(40, 6);
+        let row0 = &snapshot.editor.as_ref().expect("no editor view").rows[0];
+        assert_eq!(row0.text, "let x: i32 = 1;");
+
+        // The inlay's own span is coloured apart from the surrounding buffer
+        // text (SPEC: Zed styles inlays with the theme's `hint` colour).
+        let inlay_byte = row0.text.find(": i32").expect("inlay text missing");
+        let inlay_span = row0
+            .spans
+            .iter()
+            .find(|span| span.range.contains(&inlay_byte))
+            .expect("no span covers the inlay");
+        let plain_span = row0
+            .spans
+            .iter()
+            .find(|span| span.range.contains(&0))
+            .expect("no span covers the row's start");
+        assert_ne!(inlay_span.style.foreground, plain_span.style.foreground);
+
+        // Move the cursor to buffer offset 5 — right after "x", the same
+        // position the inlay is anchored to — and check the display column,
+        // which Zed derives from `DisplayPoint` rather than anything `ted`
+        // computes, lands past the inlay's own cells rather than inside them.
+        session.update(|editor, window, cx| {
+            editor.change_selections(
+                editor::SelectionEffects::default(),
+                window,
+                cx,
+                |selections| {
+                    selections.select_ranges(vec![MultiBufferOffset(5)..MultiBufferOffset(5)]);
+                },
+            );
+        });
+
+        let snapshot = session.snapshot(40, 6);
+        let text_rect = snapshot.editor.as_ref().expect("no editor view").text_rect;
+        let cursor = snapshot.cursor.expect("no cursor in the snapshot");
+        let expected_column =
+            text_rect.x + text_cells("let x: i32").min(u32::from(u16::MAX)) as u16;
+        assert_eq!(cursor.column, expected_column);
+    }
+
+    /// SPEC's M3 slice: a `Block::Custom` — the kind diagnostics, git blame and
+    /// code lens all build — carries only an opaque `render` closure `ted`
+    /// cannot execute, so it has to degrade to a named placeholder rather than
+    /// the blank line `highlighted_chunks` gives every block row.
+    #[test]
+    fn a_custom_block_degrades_to_a_named_placeholder_with_no_line_number() {
+        let mut session = RealEditor::open(40, 8, "one\ntwo\nthree\n");
+        session.update(|editor, _window, cx| {
+            let anchor = editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .anchor_before(MultiBufferOffset(0));
+            let block = editor::display_map::BlockProperties {
+                placement: editor::display_map::BlockPlacement::Below(anchor),
+                height: Some(1),
+                style: editor::display_map::BlockStyle::Fixed,
+                render: Arc::new(|_| {
+                    use gpui::IntoElement as _;
+                    gpui::Empty.into_any_element()
+                }),
+                priority: 0,
+            };
+            editor.insert_blocks(vec![block], None, cx);
+        });
+
+        let snapshot = session.snapshot(40, 8);
+        let rows = &snapshot.editor.as_ref().expect("no editor view").rows;
+        let block_row = rows
+            .iter()
+            .find(|row| row.kind == RowKind::Block)
+            .expect("no block row in the projection");
+        assert!(!block_row.text.is_empty(), "the block row was left blank");
+        assert_eq!(block_row.gutter.line_number, None);
+    }
 
     /// SPEC §24.7: a tab strip moves the editor down the grid, and everything
     /// the projection has already placed in grid coordinates has to move with
@@ -1376,5 +1881,62 @@ mod tests {
         );
         // Cells, not characters: a wide grapheme takes two of them.
         assert_eq!(wrap_to_cells("日本語", 4), vec!["日本", "語"]);
+    }
+
+    fn text_row(display_row: u32, text: &str) -> RowView {
+        RowView::new(display_row, text.to_owned())
+    }
+
+    /// SPEC's M3 slice: a multi-row selection can straddle a block or header
+    /// row in display coordinates without the buffer selection ever covering
+    /// it, so a block row's placeholder must not look selectable even when it
+    /// falls inside a selection's row range.
+    #[test]
+    fn a_selection_spanning_a_block_row_does_not_paint_over_its_placeholder() {
+        let mut header = text_row(1, "src/main.rs");
+        header.kind = RowKind::BufferHeader;
+        let rows = vec![text_row(0, "one"), header, text_row(2, "two")];
+
+        let range = DisplayPoint::new(DisplayRow(0), 0)..DisplayPoint::new(DisplayRow(2), 3);
+        let spans = selection_cells(&rows, &range, 0..3);
+
+        let block_row_spans = spans.iter().filter(|(row, ..)| *row == 1).count();
+        assert_eq!(
+            block_row_spans, 0,
+            "the header row got a selection span: {spans:?}"
+        );
+        // The ordinary text rows either side are untouched by the guard.
+        assert!(spans.iter().any(|(row, ..)| *row == 0));
+        assert!(spans.iter().any(|(row, ..)| *row == 2));
+    }
+
+    /// A fold's placeholder ("⋯") is `RowKind::Text`, not a block — folded
+    /// lines stay selectable and land-able in real Zed, so the guard must not
+    /// catch them too.
+    #[test]
+    fn a_folded_lines_placeholder_stays_selectable() {
+        let rows = vec![text_row(0, "⋯")];
+        let range = DisplayPoint::new(DisplayRow(0), 0)..DisplayPoint::new(DisplayRow(0), 3);
+        let spans = selection_cells(&rows, &range, 0..1);
+        assert_eq!(spans.len(), 1);
+    }
+
+    #[test]
+    fn a_cursor_cannot_land_on_a_block_row() {
+        let mut block = text_row(0, "‹block ted cannot render›");
+        block.kind = RowKind::Block;
+        let rows = vec![block];
+        let text_rect = CellRect::new(0, 0, 40, 5);
+        assert_eq!(cell_for(&rows, 0, 0, &text_rect), None);
+    }
+
+    #[test]
+    fn a_cursor_lands_normally_on_an_ordinary_text_row() {
+        let rows = vec![text_row(0, "abc")];
+        let text_rect = CellRect::new(4, 0, 40, 5);
+        assert_eq!(
+            cell_for(&rows, 0, 1, &text_rect),
+            Some(CellPoint { column: 5, row: 0 })
+        );
     }
 }

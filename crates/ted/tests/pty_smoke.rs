@@ -133,6 +133,23 @@ impl Terminal {
         self.settle(AFTER_KEYS);
     }
 
+    /// Sends `keys` and keeps settling until `ready` holds.
+    ///
+    /// One settle is enough for anything the editor answers synchronously, but
+    /// not for a picker that matches on a background thread: the first quiet
+    /// screen after the keystroke is the query with an empty list under it,
+    /// which is a settled frame and the wrong one to assert on.
+    fn send_until(&mut self, keys: &str, ready: impl Fn(&Screen) -> bool) {
+        self.type_keys(keys);
+        let deadline = Instant::now() + AFTER_KEYS;
+        while Instant::now() < deadline {
+            self.settle(AFTER_KEYS);
+            if ready(&self.screen) {
+                return;
+            }
+        }
+    }
+
     /// Types without waiting for the screen to settle. While a child owns the
     /// terminal `ted` paints nothing, so there is no frame to wait for and the
     /// keys are not `ted`'s to answer.
@@ -495,12 +512,55 @@ fn open_project(name: &str, files: &[(&str, &str)]) -> anyhow::Result<(Fixture, 
     Ok((fixture, terminal))
 }
 
-/// `ctrl-p`, which the keymap binds to `file_finder::Toggle` and SPEC §24.2
-/// retargets onto `ted`'s own action.
+/// `ctrl-p`, which the keymap binds to `file_finder::Toggle` — Zed's own modal,
+/// projected into `ted`'s list by SPEC §13.1's Mirror strategy.
 const CTRL_P: &str = "\u{10}";
 
+/// `f1`, which the keymap binds to `command_palette::Toggle` alongside
+/// `ctrl-shift-p` — and unlike that one, a terminal can express it without the
+/// Kitty protocol's disambiguation (SPEC §8.2).
+const F1: &str = "\u{1b}OP";
+
+/// SPEC §21/M3: the command palette is Zed's own modal, projected rather than
+/// replaced — so the actions in it are the ones Zed really has, filtered by the
+/// filter `ted` really installed.
+#[test]
+fn the_command_palette_is_projected_rather_than_replaced() -> anyhow::Result<()> {
+    let (_fixture, mut terminal) = open("palette", "fn main() {}\n")?;
+
+    terminal.send_until(F1, |screen| screen.row(0).contains("commands"));
+    assert!(
+        terminal.row(0).contains("commands"),
+        "the command palette did not open: {:?}",
+        terminal.row(0)
+    );
+
+    // Every action Zed has, fuzzy-matched on a background thread — much more
+    // work than the finder's scan of one small worktree, so the list arrives a
+    // frame or more after the query does.
+    let has_undo = |screen: &Screen| (2..6).any(|row| screen.row(row).contains("undo"));
+    terminal.send_until("undo", has_undo);
+    assert!(
+        has_undo(&terminal.screen),
+        "the palette's own matches are not in the list: {:?}",
+        (0..6).map(|row| terminal.row(row)).collect::<Vec<_>>()
+    );
+
+    terminal.send("\u{1b}");
+    assert!(
+        !terminal.exited(Duration::from_millis(500)),
+        "dismissing the palette quit ted"
+    );
+    assert!(
+        terminal.row(0).ends_with("fn main() {}"),
+        "the buffer was not repainted under the box: {:?}",
+        terminal.row(0)
+    );
+    Ok(())
+}
+
 /// SPEC §24.4, and the first half of §24.10's acceptance: find a file by name
-/// and open it, in a surface `ted` paints itself.
+/// and open it.
 #[test]
 fn the_finder_opens_a_file_by_name() -> anyhow::Result<()> {
     let (_fixture, mut terminal) = open_project("finder", &[("beta.rs", "fn beta() {}\n")])?;

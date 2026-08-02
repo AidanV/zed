@@ -161,6 +161,48 @@ pub enum PickerEditorPosition {
     End,
 }
 
+/// A match as plain text, for a frontend that cannot render elements.
+///
+/// [`PickerDelegate::render_match`] returns GPUI elements, which is unusable to
+/// anything drawing outside a GPUI window — `ted`, the terminal frontend, is the
+/// caller this exists for. Implementing it keeps one picker's filtering,
+/// ordering and hooks shared between the two frontends instead of duplicated.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PickerRowText {
+    pub label: String,
+    /// Byte offsets into `label` that the query matched, the same form
+    /// `StringMatch::positions` and `PathMatch::positions` already use.
+    pub label_positions: Vec<usize>,
+    /// The dimmer second column: a file's directory, a symbol's path, a
+    /// command's keybinding.
+    pub detail: Option<String>,
+    pub detail_positions: Vec<usize>,
+}
+
+impl PickerRowText {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn label_positions(mut self, positions: Vec<usize>) -> Self {
+        self.label_positions = positions;
+        self
+    }
+
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    pub fn detail_positions(mut self, positions: Vec<usize>) -> Self {
+        self.detail_positions = positions;
+        self
+    }
+}
+
 pub trait PickerDelegate: Sized + 'static {
     type ListItem: IntoElement;
 
@@ -373,6 +415,14 @@ pub trait PickerDelegate: Sized + 'static {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem>;
+
+    /// The same match as plain text, for a frontend that paints characters
+    /// rather than elements. `None` means this picker has no textual
+    /// projection, and such a frontend must say so rather than draw a blank
+    /// list.
+    fn text_for_match(&self, _ix: usize, _window: &Window, _cx: &App) -> Option<PickerRowText> {
+        None
+    }
 
     fn render_match_with_checkbox(
         &self,

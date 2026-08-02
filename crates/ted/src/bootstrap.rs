@@ -196,6 +196,10 @@ pub fn init(vim: bool, cx: &mut App) -> Result<Arc<AppState>> {
     command_palette::init(cx);
     go_to_line::init(cx);
     file_finder::init(cx);
+    // Mirrored rather than replaced (SPEC §13.1): each is a `Picker` whose
+    // delegate answers in plain text, so `ted` paints the real modal's matches.
+    outline::init(cx);
+    project_symbols::init(cx);
     if vim {
         vim::init(cx);
     }
