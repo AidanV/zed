@@ -74,6 +74,28 @@ impl Palette {
         self.opaque_background
     }
 
+    /// Points the palette at the background the next frame will be projected
+    /// over, and forgets every colour resolved against the old one.
+    ///
+    /// The backdrop cannot be captured once at startup. `ted` opens its window
+    /// after the app exists, and `Workspace` re-reads the system appearance
+    /// from that window and reloads the theme when it does
+    /// (`workspace.rs`'s `observe_window_appearance`) — so the theme the first
+    /// frame is projected from is routinely *not* the one that was global when
+    /// the palette was built. `settings.json` is watched too, so the user can
+    /// change it again at any point. Compositing over a stale backdrop is not a
+    /// subtle error: a 10%-alpha tint resolved over a light background when the
+    /// theme is dark comes out near-white, which is a colour the theme never
+    /// specified.
+    pub fn set_backdrop(&mut self, backdrop: Hsla) {
+        let backdrop = opaque(Rgba::from(backdrop));
+        if self.backdrop == backdrop {
+            return;
+        }
+        self.backdrop = backdrop;
+        self.cache.get_mut().clear();
+    }
+
     /// The terminal colour for a theme colour, composited and quantised.
     pub fn color(&self, color: Hsla) -> Color {
         let key = [
@@ -257,6 +279,30 @@ mod tests {
             panic!("expected a truecolor value");
         };
         assert_eq!((red, green, blue), (128, 128, 128));
+    }
+
+    /// A translucent colour resolved before the theme settled must not survive
+    /// the theme changing, which it would if the cache outlived the backdrop.
+    #[test]
+    fn a_new_backdrop_forgets_the_colours_resolved_against_the_old_one() {
+        let mut palette = Palette::new(ColorDepth::TrueColor, hsla(0.0, 0.0, 1.0, 1.0), true);
+        let translucent = hsla(0.0, 0.0, 0.0, 0.5);
+        // Half-opaque black over white, and cached at that value.
+        assert_eq!(palette.color(translucent), Color::Rgb(128, 128, 128));
+
+        palette.set_backdrop(hsla(0.0, 0.0, 0.0, 1.0));
+        assert_eq!(
+            palette.color(translucent),
+            Color::Rgb(0, 0, 0),
+            "the colour was still composited over the old backdrop"
+        );
+
+        // An opaque colour is unaffected by either backdrop, so re-resolving it
+        // costs nothing and says nothing — the point is only that the cache
+        // survives a backdrop that did not actually change.
+        let before = palette.color(hsla(0.5, 0.5, 0.5, 1.0));
+        palette.set_backdrop(hsla(0.0, 0.0, 0.0, 1.0));
+        assert_eq!(palette.color(hsla(0.5, 0.5, 0.5, 1.0)), before);
     }
 
     #[test]

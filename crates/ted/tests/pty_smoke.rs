@@ -914,9 +914,17 @@ fn a_collapsed_hunk_colours_its_marker_and_leaves_the_line_alone() -> anyhow::Re
     let unstaged = terminal.screen.background_at(0, 3);
 
     // The unstaged marker is the only coloured cell in its row.
+    let Some((red, green, blue)) = unstaged else {
+        anyhow::bail!("an unstaged marker should carry the hunk's tint");
+    };
+    // And that tint is a low-alpha colour composited over the editor's
+    // background, so it has to land near it. `ted`'s window reports itself as
+    // dark (`platform.rs`), so the theme here is the default dark one whatever
+    // the host looks like, and a near-white tint would mean the palette was
+    // compositing over a backdrop from some other theme (SPEC §12).
     assert!(
-        unstaged.is_some(),
-        "an unstaged marker should carry the hunk's tint"
+        red < 128 && green < 128 && blue < 128,
+        "the hunk tint {unstaged:?} is not composited over a dark editor background"
     );
     assert_ne!(
         staged, unstaged,

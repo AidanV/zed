@@ -1007,6 +1007,19 @@ of column bugs in hand-rolled TUI editors, avoided for free.
   transparent terminals and doesn't fight the user's colour scheme at the
   edges.
 - Cache every conversion; `Hsla → Color` is called per span per frame.
+- **Composite translucent colours over the theme's background, and re-point
+  that backdrop every frame.** Selections, current-line highlights and diff
+  tints are semi-transparent by design, so a terminal cell needs them resolved
+  against something; resolved against the wrong something they come out as
+  colours the theme never specified — a 10%-alpha tint over a light background
+  when the theme is dark is near-white. The backdrop therefore cannot be read
+  once at startup: `ted` opens its window after the app exists, and `Workspace`
+  re-reads the system appearance from that window and reloads the theme when it
+  does, so the theme the *first* frame is projected from is routinely not the
+  one that was global when the palette was built. `settings.json` is watched on
+  top of that. The palette is pointed at the current theme before each frame is
+  projected, and forgets every colour it resolved against a backdrop that has
+  changed.
 
 ---
 

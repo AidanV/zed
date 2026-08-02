@@ -261,6 +261,14 @@ async fn drive(
         // it is `esc` by another name there, not a way out of `ted`.
         let modal_is_open = session.overlay.is_none() && overlay.is_some();
 
+        // Before anything is projected, so the colours in the snapshot and the
+        // background they are composited over come from the same theme. The
+        // theme can change under a running `ted` (SPEC §12), and a `Palette`
+        // pointed at the wrong one silently resolves every translucent colour
+        // to something the theme never specified.
+        let theme_background = cx.update(|cx| cx.theme().colors().editor_background);
+        session.palette.set_backdrop(theme_background);
+
         let mut notifications = session.messages.clone();
         notifications.extend(backend_notifications(&session, cx));
 
