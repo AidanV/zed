@@ -100,6 +100,11 @@ pub struct EditorView {
     /// drawn as inverted cells instead (SPEC §11).
     pub secondary_cursors: Vec<CellPoint>,
     pub background: Option<Hsla>,
+    /// The editor's default text colour. Rows carry their own colours, so this
+    /// is here for what `ted` paints *over* the editor: a surface that named no
+    /// colour of its own would inherit the syntax colouring of whatever cells it
+    /// covered (SPEC §24.1).
+    pub foreground: Option<Hsla>,
     pub selection_background: Option<Hsla>,
     pub max_display_row: u32,
     pub soft_wrapped: bool,
@@ -333,6 +338,10 @@ pub struct HoverView {
     /// below the cursor when the rows are there and above it when they are not.
     pub rect: CellRect,
     pub background: Option<Hsla>,
+    /// Paired with `background`: the panel is a surface of the theme's rather
+    /// than a window onto the buffer, so its text is the theme's UI colour and
+    /// not the colour of the code underneath it.
+    pub foreground: Option<Hsla>,
     pub blocks: Vec<HoverBlock>,
 }
 
@@ -736,6 +745,7 @@ fn place_hover(
     Some(HoverView {
         rect: CellRect::new(text_rect.x, y, width, height),
         background: Some(cx.theme().colors().elevated_surface_background),
+        foreground: Some(cx.theme().colors().text),
         blocks,
     })
 }
@@ -996,6 +1006,7 @@ fn build_editor_view(
             selections,
             secondary_cursors,
             background: Some(style.background),
+            foreground: Some(style.text.color),
             selection_background: Some(style.local_player.selection),
             max_display_row: last_display_row,
             soft_wrapped: matches!(editor.soft_wrap_mode(cx), editor::SoftWrap::EditorWidth),

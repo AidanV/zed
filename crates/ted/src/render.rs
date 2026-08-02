@@ -364,15 +364,20 @@ fn render_tabs(tabs: &TabStripView, columns: u16, palette: &Palette, buffer: &mu
 /// (SPEC §24.8).
 fn render_hover(hover: &HoverView, palette: &Palette, buffer: &mut Buffer) {
     let area = clamp(hover.rect, buffer.area);
-    let ground = hover
-        .background
-        .map(|color| Style::default().bg(palette.color(color)))
-        .unwrap_or_default();
+    let ground = Style::default()
+        .fg(color_or_default(hover.foreground, palette))
+        .bg(color_or_default(hover.background, palette));
     fill(area, ground, buffer);
 
     let mut y = area.y;
     for block in &hover.blocks {
-        let rail = ground.fg(color_or_default(block.rail, palette));
+        // Only the rail takes the block's colour; a block that named none keeps
+        // the panel's own text colour rather than falling back to the
+        // terminal's.
+        let rail = match block.rail {
+            Some(color) => ground.fg(palette.color(color)),
+            None => ground,
+        };
         for line in &block.lines {
             if y >= area.y + area.height {
                 return;
@@ -491,13 +496,22 @@ fn render_overlay(
         return;
     }
 
-    let ground = snapshot
-        .editor
-        .as_ref()
+    // The theme's text colour always, and its background only when `ted` paints
+    // one at all: a transparent session still lets the terminal's background
+    // through the box, but the box's own text is the theme's rather than
+    // whatever the code underneath happened to be coloured (SPEC §24.1).
+    let editor = snapshot.editor.as_ref();
+    let ground = Style::default().fg(color_or_default(
+        editor.and_then(|editor| editor.foreground),
+        palette,
+    ));
+    let ground = match editor
         .and_then(|editor| editor.background)
         .and_then(|color| palette.surface_background(color))
-        .map(|color| Style::default().bg(color))
-        .unwrap_or_default();
+    {
+        Some(background) => ground.bg(background),
+        None => ground,
+    };
     fill(area, ground, buffer);
     render_border(area, overlay.title.as_deref(), ground, buffer);
 
@@ -532,7 +546,7 @@ fn render_overlay(
         .editor
         .as_ref()
         .and_then(|editor| editor.selection_background)
-        .map(|color| Style::default().bg(palette.color(color)));
+        .map(|color| ground.bg(palette.color(color)));
 
     let detail_column = detail_column(overlay, content.width);
     for offset in 0..layout.visible {
@@ -920,6 +934,10 @@ fn write_right(text: &str, x: u16, width: u16, row: u16, style: Style, buffer: &
 
 /// Writes plain text into `area`, clipping at its right edge and honouring
 /// cell widths the same way [`render_row`] does.
+///
+/// Every cell is [`reset`](write_cell) first, because `Style` carries only what
+/// it names: writing over a cell would otherwise keep the colours and attributes
+/// already on it (SPEC §24.1).
 fn write(text: &str, area: Rect, style: Style, buffer: &mut Buffer) {
     let mut column: u32 = 0;
     for cluster in text.graphemes(true) {
@@ -933,18 +951,12 @@ fn write(text: &str, area: Rect, style: Style, buffer: &mut Buffer) {
         let Ok(x) = u16::try_from(area.x as u32 + column) else {
             break;
         };
-        if let Some(cell) = buffer.cell_mut((x, area.y)) {
-            cell.set_symbol(cluster);
-            cell.set_style(style);
-        }
+        write_cell(cluster, (x, area.y), style, buffer);
         for trailing in 1..width {
             let Ok(trailing) = u16::try_from(x as u32 + trailing) else {
                 break;
             };
-            if let Some(cell) = buffer.cell_mut((trailing, area.y)) {
-                cell.set_symbol("");
-                cell.set_style(style);
-            }
+            write_cell("", (trailing, area.y), style, buffer);
         }
         column += width;
     }
@@ -953,11 +965,25 @@ fn write(text: &str, area: Rect, style: Style, buffer: &mut Buffer) {
 fn fill(area: Rect, style: Style, buffer: &mut Buffer) {
     for y in area.y..area.y.saturating_add(area.height) {
         for x in area.x..area.x.saturating_add(area.width) {
-            if let Some(cell) = buffer.cell_mut((x, y)) {
-                cell.set_symbol(" ");
-                cell.set_style(style);
-            }
+            write_cell(" ", (x, y), style, buffer);
         }
+    }
+}
+
+/// Puts a grapheme in a cell, replacing everything that was there.
+///
+/// `Cell::set_style` *merges*: a colour the style leaves unset stays whatever
+/// the cell already had, and modifiers are only added and removed by name. So
+/// painting a surface over the editor with a partial style — which is every
+/// surface, since a transparent one names no background at all — would leave the
+/// syntax colour, the boldness and the diagnostic underline of the code
+/// underneath on the cells it covered. Resetting first is what makes a style
+/// mean the whole appearance of the cell rather than a patch on it.
+fn write_cell(symbol: &str, (x, y): (u16, u16), style: Style, buffer: &mut Buffer) {
+    if let Some(cell) = buffer.cell_mut((x, y)) {
+        cell.reset();
+        cell.set_symbol(symbol);
+        cell.set_style(style);
     }
 }
 
@@ -1324,6 +1350,44 @@ mod tests {
         assert_eq!(grid[6].trim_end(), "");
     }
 
+    /// A cell's style is replaced by whatever is painted over it, never merged
+    /// into: a box that named no colours of its own used to come out in the
+    /// syntax colouring of the code it covered — the border in the blue of the
+    /// `fn` under it, bold where the code was bold (SPEC §24.1).
+    #[test]
+    fn a_list_paints_its_own_colours_over_the_ones_it_covers() {
+        let syntax = hsla(0.6, 0.7, 0.6, 1.0);
+        let text = hsla(0.0, 0.0, 0.9, 1.0);
+        let mut snapshot = snapshot_of(40, 12, &["fn main() {}"]);
+        if let Some(editor) = snapshot.editor.as_mut() {
+            editor.foreground = Some(text);
+            editor.rows[0].spans = vec![StyledSpan {
+                range: 0..12,
+                style: SpanStyle {
+                    foreground: Some(syntax),
+                    bold: true,
+                    underline: Some(Underline {
+                        color: Some(syntax),
+                    }),
+                    ..Default::default()
+                },
+            }];
+        }
+        snapshot.overlay = Some(finder(
+            "sna",
+            vec![overlay_row("snapshot.rs", "crates/ted/src")],
+            "1/1",
+        ));
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 12));
+        render(&snapshot, &palette(), &mut buffer);
+        // The top border, over the `n` of `fn`.
+        let border = buffer.cell((1, 0)).expect("no cell under the border");
+        assert_eq!(border.fg, palette().color(text));
+        assert!(!border.modifier.contains(Modifier::BOLD));
+        assert!(!border.modifier.contains(Modifier::UNDERLINED));
+    }
+
     #[test]
     fn the_box_grows_to_fit_its_matches_and_paints_no_blank_rows() {
         let mut snapshot = snapshot_of(40, 14, &["x"]);
@@ -1481,9 +1545,11 @@ mod tests {
     fn the_hover_panel_rails_each_block_in_its_own_colour() {
         let mut snapshot = snapshot_of(40, 10, &["let x = f();"]);
         let error = hsla(0.0, 0.8, 0.5, 1.0);
+        let text = hsla(0.0, 0.0, 0.9, 1.0);
         snapshot.hover = Some(HoverView {
             rect: CellRect::new(0, 1, 40, 4),
             background: None,
+            foreground: Some(text),
             blocks: vec![
                 HoverBlock {
                     rail: Some(error),
@@ -1508,6 +1574,12 @@ mod tests {
         assert_eq!(
             buffer.cell((0, 1)).map(|cell| cell.fg),
             Some(palette().color(error))
+        );
+        // Only the rail is the block's colour; the message beside it is the
+        // panel's own text, not the rail's and not the buffer's underneath.
+        assert_eq!(
+            buffer.cell((2, 1)).map(|cell| cell.fg),
+            Some(palette().color(text))
         );
     }
 
