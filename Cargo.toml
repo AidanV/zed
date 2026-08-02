@@ -762,6 +762,16 @@ rand = "0.9"
 ratatui = { version = "0.30", default-features = false, features = [
     "crossterm_0_29",
     "std",
+    # In ratatui's own defaults, but the workspace takes `default-features =
+    # false`, so `Style::underline_color` — and with it `ted`'s severity-coloured
+    # diagnostic underlines — is otherwise unreachable. It is the only way to
+    # reach it: the field is behind `ratatui-core/underline-color` and emitting
+    # `SGR 58` is behind `ratatui-crossterm/underline-color`, and this facade
+    # feature is what turns on both. It names ratatui's termwiz and termina
+    # backends as well, with `?`, so they stay unbuilt — but the resolver has to
+    # version them, which is why enabling one feature adds a screenful to
+    # `Cargo.lock`.
+    "underline-color",
 ] }
 rayon = "1.8"
 raw-window-handle = "0.6"

@@ -2,13 +2,16 @@
 //! headlessly as the state, action and layout engine; Ratatui paints the cell
 //! grid. See `SPEC.md` for the full design.
 
+pub mod actions;
 pub mod bootstrap;
 pub mod cell;
 pub mod command_line;
 pub mod config;
 pub mod explore;
 pub mod frame;
+pub mod hover;
 pub mod input;
+pub mod overlay;
 pub mod palette;
 pub mod platform;
 pub mod render;

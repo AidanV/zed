@@ -11,10 +11,11 @@ use editor::{DisplayPoint, Editor};
 use gpui::{App, Entity, FontStyle, FontWeight, Hsla, Pixels, Window};
 use language::LanguageAwareStyling;
 use multi_buffer::RowInfo;
+use theme::ActiveTheme as _;
 use unicode_segmentation::UnicodeSegmentation as _;
-use workspace::Workspace;
+use workspace::{Pane, Workspace};
 
-use crate::cell::{CELL_HEIGHT, CELL_WIDTH, cluster_cells};
+use crate::cell::{CELL_HEIGHT, CELL_WIDTH, cluster_cells, text_cells};
 
 /// A rectangle in terminal cells.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -58,8 +59,19 @@ pub struct ViewSnapshot {
     pub columns: u16,
     pub rows: u16,
     pub editor: Option<EditorView>,
+    /// The pane's other items, along the top (SPEC §24.7). The only thing `ted`
+    /// paints above the editor, and the reason every rect the editor reports is
+    /// shifted down by a row while it is there.
+    pub tabs: Option<TabStripView>,
     pub status: StatusView,
     pub command_line: Option<CommandLineView>,
+    /// A list painted *over* the editor — the finder or the switcher
+    /// (SPEC §24.1). It reserves no rows, so the buffer behind it never
+    /// relayouts while it is open.
+    pub overlay: Option<OverlayView>,
+    /// The railed panel `shift-k` opens (SPEC §24.8), painted over the editor
+    /// like an overlay and dismissed by the next key.
+    pub hover: Option<HoverView>,
     pub prompt: Option<PromptView>,
     pub notifications: Vec<String>,
     /// Where to park the terminal's hardware cursor. SPEC §7 places the real
@@ -170,8 +182,18 @@ pub struct SpanStyle {
     pub background: Option<Hsla>,
     pub bold: bool,
     pub italic: bool,
-    pub underline: bool,
+    pub underline: Option<Underline>,
     pub strikethrough: bool,
+}
+
+/// An underline and, when the highlight named one, its colour. Diagnostics are
+/// the reason the colour is carried: severity reaches the renderer as the
+/// underline's colour and nothing else, so dropping it would make an error and a
+/// warning look identical (SPEC §24.8).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Underline {
+    /// `None` underlines in the text's own colour.
+    pub color: Option<Hsla>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -214,6 +236,125 @@ pub struct SelectionSpan {
     pub end_cell: u16,
 }
 
+/// A run of text with the byte offsets a query matched in it, emphasised by the
+/// renderer. Both `fuzzy_nucleo`'s matchers and `CommandInterceptItem` already
+/// report their matches in exactly this form, and the offsets map through
+/// `byte_to_cell_table` like every other byte column (SPEC §5.4).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MatchedText {
+    pub text: String,
+    pub matched: Vec<usize>,
+}
+
+impl MatchedText {
+    pub fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            matched: Vec::new(),
+        }
+    }
+}
+
+/// A list painted over the editor: the file finder and the buffer switcher are
+/// the same widget with different content (SPEC §24.1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OverlayView {
+    /// Painted into the top border, Helix-style: "files", "buffers".
+    pub title: Option<String>,
+    /// Absent when the list is not filtered, which is what keeps the switcher
+    /// three rows shorter than the finder (SPEC §24.6).
+    pub query: Option<QueryView>,
+    pub rows: Vec<OverlayRow>,
+    pub selected: Option<usize>,
+    /// "3/412", "no matches". Right-aligned on the query row when there is one,
+    /// and into the bottom border otherwise.
+    pub footer: Option<String>,
+    pub placement: OverlayPlacement,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QueryView {
+    pub text: String,
+    /// Byte offset of the insertion point within `text`.
+    pub cursor: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OverlayRow {
+    pub label: MatchedText,
+    /// The second column: a file's directory, dimmed. Left-aligned at a column
+    /// the renderer computes from the widest label, rather than right-aligned,
+    /// because two files called `snapshot.rs` are told apart by a column that
+    /// starts in the same place on every row (SPEC §24.4).
+    pub detail: Option<MatchedText>,
+    /// Unsaved work, painted as `•` after the label (SPEC §24.6).
+    pub modified: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverlayPlacement {
+    /// The width of the grid, top edge fixed at the first row (SPEC §24.4).
+    #[default]
+    Grid,
+    /// Small and centred near the top, where Zed puts its own switcher
+    /// (SPEC §24.6).
+    TopCentre,
+}
+
+/// The pane's items along the top (SPEC §24.7).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TabStripView {
+    pub tabs: Vec<TabView>,
+    pub active: usize,
+    /// The first tab painted. Overflow scrolls rather than eliding the middle,
+    /// so the active tab is always on screen.
+    pub first: usize,
+    pub active_background: Option<Hsla>,
+    pub background: Option<Hsla>,
+    pub active_foreground: Option<Hsla>,
+    pub foreground: Option<Hsla>,
+    pub separator: Option<Hsla>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TabView {
+    /// From `Pane::tab_details`, so two files called `mod.rs` grow a directory
+    /// in their labels and nothing else does.
+    pub label: String,
+    pub modified: bool,
+}
+
+/// The panel `shift-k` opens over the editor: a tinted block with a coloured bar
+/// down its left edge, carrying the diagnostics under the cursor and the
+/// language server's documentation for it (SPEC §24.8).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HoverView {
+    /// Where the panel goes, already resolved against the editor's text rect —
+    /// below the cursor when the rows are there and above it when they are not.
+    pub rect: CellRect,
+    pub background: Option<Hsla>,
+    pub blocks: Vec<HoverBlock>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HoverBlock {
+    /// What kind of thing is talking: the severity's colour for a diagnostic, a
+    /// neutral accent for documentation. A position with both stacks them in one
+    /// panel, so without this the two would read as one message.
+    pub rail: Option<Hsla>,
+    /// Already wrapped to the panel's width, because wrapping is a decision
+    /// about cells and belongs on this side of the projection.
+    pub lines: Vec<String>,
+}
+
+/// One thing the language server had to say about the cursor's position, before
+/// it is wrapped into a panel.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HoverContent {
+    pub rail: Option<Hsla>,
+    pub text: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StatusView {
     pub mode: Option<String>,
@@ -235,14 +376,24 @@ pub struct StatusView {
 
 /// `ted`'s own `:` or `/` line (SPEC §13.2). The query is `ted`'s to render;
 /// the semantics belong to vim's interceptor and to `BufferSearchBar`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// One row, and never more: completions are ghost text on the line rather than a
+/// list, so nothing ever covers the buffer for a half-typed command (SPEC §24.3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommandLineView {
     pub prefix: char,
     pub query: String,
     /// Byte offset of the insertion point within `query`.
     pub cursor: usize,
-    pub completions: Vec<String>,
-    pub selected_completion: Option<usize>,
+    /// The rest of the selected candidate, dimmed after the cursor. Either the
+    /// tail of a command the query is a prefix of — which `right` accepts — or a
+    /// description of one, which it does not.
+    pub ghost: Option<String>,
+    /// What to right-align on the row, best first: the selected action's
+    /// keybinding when it has one, then how many other candidates the matcher
+    /// found. The renderer paints the first that fits beside the query, which is
+    /// what "when there is room for it" means (SPEC §24.3).
+    pub trailing: Vec<String>,
     /// Match counts for `/`, or an error for `:`.
     pub message: Option<String>,
 }
@@ -265,7 +416,19 @@ pub struct Frame<'a> {
     /// The rows `ted` paints itself, withheld from the GPUI window
     /// (SPEC §10.2). The editor's rect can never reach into them.
     pub reserved_rows: u16,
+    /// How many of those rows sit *above* the editor — the tab strip, and
+    /// nothing else in M2. Withholding them is not enough on its own: every rect
+    /// the editor reports starts at the window's row 0 and has to be shifted
+    /// down by exactly this much (SPEC §24.7).
+    pub top_rows: u16,
     pub command_line: Option<CommandLineView>,
+    /// `ted`'s own list, already built by [`crate::overlay`]. It floats over the
+    /// editor and costs no reserved rows (SPEC §24.1).
+    pub overlay: Option<OverlayView>,
+    /// What [`crate::hover`] read for the cursor's position, unwrapped: the
+    /// panel's rect and line breaks are decisions about cells and are taken
+    /// here, where the editor's rect is known.
+    pub hover: Vec<HoverContent>,
     pub prompt: Option<PromptView>,
     pub notifications: Vec<String>,
     pub workspace: &'a Entity<Workspace>,
@@ -279,6 +442,8 @@ pub struct Frame<'a> {
 /// empty buffer view rather than failing (SPEC §9).
 pub fn build(frame: Frame<'_>, window: &mut Window, cx: &mut App) -> ViewSnapshot {
     let notifications = frame.notifications;
+    let overlay = frame.overlay;
+    let hover = frame.hover;
     let workspace = frame.workspace.read(cx);
     let active_pane = workspace.active_pane().clone();
     let panes = workspace.panes().len();
@@ -288,6 +453,12 @@ pub fn build(frame: Frame<'_>, window: &mut Window, cx: &mut App) -> ViewSnapsho
         .position(|pane| pane == &active_pane)
         .map(|index| index + 1)
         .unwrap_or(1);
+    // Gated on the row already withheld for it rather than on the item count
+    // again: one answer to "is there a strip", so the window's size and the
+    // rects painted inside it cannot disagree (SPEC §24.7).
+    let tabs = (frame.top_rows > 0)
+        .then(|| tab_strip(&active_pane, frame.columns, window, cx))
+        .flatten();
 
     let mut status = StatusView {
         // Surfaced only when there is more than one, because M1 renders just
@@ -310,8 +481,10 @@ pub fn build(frame: Frame<'_>, window: &mut Window, cx: &mut App) -> ViewSnapsho
         return ViewSnapshot {
             columns: frame.columns,
             rows: frame.rows,
+            tabs,
             status,
             command_line: frame.command_line,
+            overlay,
             prompt: frame.prompt,
             notifications,
             ..Default::default()
@@ -327,8 +500,10 @@ pub fn build(frame: Frame<'_>, window: &mut Window, cx: &mut App) -> ViewSnapsho
         return ViewSnapshot {
             columns: frame.columns,
             rows: frame.rows,
+            tabs,
             status,
             command_line: frame.command_line,
+            overlay,
             prompt: frame.prompt,
             notifications,
             ..Default::default()
@@ -347,11 +522,32 @@ pub fn build(frame: Frame<'_>, window: &mut Window, cx: &mut App) -> ViewSnapsho
     status.position = snapshot.status.position;
     status.rewrapping = snapshot.status.rewrapping;
 
+    // The one addition SPEC §24.7 calls for, applied to the text rect, the
+    // gutter rect and the cursor together: applying it to two of the three puts
+    // the cursor a row off its own text.
+    shift_down(&mut snapshot, frame.top_rows);
+
+    snapshot.tabs = tabs;
     snapshot.status = status;
     snapshot.command_line = frame.command_line;
+    snapshot.hover = place_hover(hover, &snapshot, cx);
+    snapshot.overlay = overlay;
     snapshot.prompt = frame.prompt;
     snapshot.notifications = notifications;
     snapshot
+}
+
+fn shift_down(snapshot: &mut ViewSnapshot, rows: u16) {
+    if rows == 0 {
+        return;
+    }
+    if let Some(editor) = snapshot.editor.as_mut() {
+        editor.text_rect.y += rows;
+        editor.gutter_rect.y += rows;
+    }
+    if let Some(cursor) = snapshot.cursor.as_mut() {
+        cursor.row += rows;
+    }
 }
 
 /// The projection of a single editor, without a workspace around it.
@@ -400,12 +596,183 @@ pub fn for_editor(
                 }),
             ..Default::default()
         },
-        command_line: None,
-        prompt: None,
-        notifications: Vec::new(),
         cursor,
         cursor_shape,
+        ..Default::default()
     }
+}
+
+/// The pane's items along the top, and where the strip has to start so the
+/// active tab is on screen (SPEC §24.7).
+fn tab_strip(pane: &Entity<Pane>, columns: u16, window: &Window, cx: &App) -> Option<TabStripView> {
+    let items = pane.read(cx).items().cloned().collect::<Vec<_>>();
+    if items.is_empty() {
+        return None;
+    }
+
+    // `tab_details` computes exactly the detail level each tab needs, so two
+    // files called `mod.rs` grow a directory in their labels and nothing else
+    // does.
+    let details = workspace::pane::tab_details(&items, window, cx);
+    let tabs = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| TabView {
+            label: item
+                .tab_content_text(details.get(index).copied().unwrap_or(0), cx)
+                .to_string(),
+            modified: item.is_dirty(cx),
+        })
+        .collect::<Vec<_>>();
+
+    let active = pane
+        .read(cx)
+        .active_item_index()
+        .min(tabs.len().saturating_sub(1));
+    let colors = cx.theme().colors();
+    Some(TabStripView {
+        first: first_visible_tab(&tabs, active, columns),
+        tabs,
+        active,
+        active_background: Some(colors.tab_active_background),
+        background: Some(colors.tab_inactive_background),
+        active_foreground: Some(colors.text),
+        foreground: Some(colors.text_muted),
+        separator: Some(colors.border),
+    })
+}
+
+/// The cells one tab occupies: a space either side of the label, and two more
+/// for the modified marker. The renderer lays tabs out to exactly this, so the
+/// scroll position computed here and the strip painted there cannot disagree.
+pub fn tab_cells(tab: &TabView) -> u16 {
+    let label = text_cells(&tab.label).min(u32::from(u16::MAX)) as u16;
+    label
+        .saturating_add(2)
+        .saturating_add(if tab.modified { 2 } else { 0 })
+}
+
+/// The leftmost tab that leaves the active one on screen. Eliding the middle
+/// would keep two tabs the user is not looking at and hide the one they are, so
+/// the strip scrolls instead (SPEC §24.7).
+fn first_visible_tab(tabs: &[TabView], active: usize, columns: u16) -> usize {
+    let mut first = 0;
+    while first < active {
+        let width: u16 = tabs
+            .get(first..=active)
+            .unwrap_or_default()
+            .iter()
+            .map(tab_cells)
+            // One separator cell between each pair.
+            .fold(0u16, |total, cells| total.saturating_add(cells))
+            .saturating_add((active - first) as u16);
+        if width <= columns {
+            break;
+        }
+        first += 1;
+    }
+    first
+}
+
+/// Wraps what the language server said into a panel and decides where it goes:
+/// below the cursor when the rows are there, above it when they are not
+/// (SPEC §24.8).
+fn place_hover(
+    contents: Vec<HoverContent>,
+    snapshot: &ViewSnapshot,
+    cx: &App,
+) -> Option<HoverView> {
+    if contents.is_empty() {
+        return None;
+    }
+    let text_rect = snapshot.editor.as_ref()?.text_rect;
+    let cursor = snapshot.cursor?;
+    // The rail and the space after it.
+    let width = text_rect.width.max(3);
+    let inner = usize::from(width - 2);
+
+    let mut blocks = Vec::new();
+    let mut total = 0u16;
+    for (index, content) in contents.into_iter().enumerate() {
+        let mut lines = Vec::new();
+        // A blank railed row between blocks, so a diagnostic and the
+        // documentation under it are never read as one message.
+        if index > 0 {
+            lines.push(String::new());
+        }
+        lines.extend(wrap_to_cells(&content.text, inner));
+        total = total.saturating_add(lines.len().min(usize::from(u16::MAX)) as u16);
+        blocks.push(HoverBlock {
+            rail: content.rail,
+            lines,
+        });
+    }
+    if total == 0 {
+        return None;
+    }
+
+    let bottom = text_rect.y.saturating_add(text_rect.height);
+    let below = bottom.saturating_sub(cursor.row.saturating_add(1));
+    let above = cursor.row.saturating_sub(text_rect.y);
+    let (y, height) = if total <= below {
+        (cursor.row + 1, total)
+    } else if total <= above {
+        (cursor.row - total, total)
+    } else if below >= above {
+        (cursor.row.saturating_add(1), below)
+    } else {
+        (text_rect.y, above)
+    };
+    if height == 0 {
+        return None;
+    }
+
+    Some(HoverView {
+        rect: CellRect::new(text_rect.x, y, width, height),
+        background: Some(cx.theme().colors().elevated_surface_background),
+        blocks,
+    })
+}
+
+/// Breaks text at `width` cells, at a space where there is one and mid-word
+/// where there is not. Explicit newlines are honoured first, so a message that
+/// arrived with its own line structure keeps it.
+fn wrap_to_cells(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut line = String::new();
+        let mut cells = 0usize;
+        for word in paragraph.split(' ') {
+            let word_cells = text_cells(word) as usize;
+            if !line.is_empty() && cells + 1 + word_cells > width {
+                lines.push(std::mem::take(&mut line));
+                cells = 0;
+            }
+            if !line.is_empty() {
+                line.push(' ');
+                cells += 1;
+            }
+            if word_cells > width {
+                for cluster in word.graphemes(true) {
+                    let cluster_cells = cluster_cells(cluster) as usize;
+                    if cells + cluster_cells > width {
+                        lines.push(std::mem::take(&mut line));
+                        cells = 0;
+                    }
+                    line.push_str(cluster);
+                    cells += cluster_cells;
+                }
+                continue;
+            }
+            line.push_str(word);
+            cells += word_cells;
+        }
+        lines.push(line);
+    }
+    lines
 }
 
 /// What the backend wants to tell the user that `ted` has no other place for.
@@ -647,8 +1014,7 @@ fn rows_from_chunks(
     rows: Range<u32>,
     style: &editor::EditorStyle,
 ) -> Vec<(String, Vec<StyledSpan>)> {
-    let mut built =
-        vec![(String::new(), Vec::new()); rows.end.saturating_sub(rows.start) as usize];
+    let mut built = vec![(String::new(), Vec::new()); rows.end.saturating_sub(rows.start) as usize];
     let language_aware = LanguageAwareStyling {
         tree_sitter: true,
         diagnostics: true,
@@ -698,14 +1064,29 @@ fn span_style(
             ..Default::default()
         };
     };
+
+    let mut foreground = highlight.color.unwrap_or(editor_style.text.color);
+    // What Zed does with `Diagnostic::is_unnecessary`: dead code fades rather
+    // than acquiring a marker of its own (SPEC §24.8). The palette composites
+    // alpha against the editor background, so fading the alpha is all a terminal
+    // needs to arrive at the same colour.
+    if let Some(fade) = highlight.fade_out {
+        foreground.fade_out(fade);
+    }
+
     SpanStyle {
-        foreground: Some(highlight.color.unwrap_or(editor_style.text.color)),
+        foreground: Some(foreground),
         background: highlight.background_color,
         bold: highlight
             .font_weight
             .is_some_and(|weight| weight >= FontWeight::BOLD),
         italic: highlight.font_style == Some(FontStyle::Italic),
-        underline: highlight.underline.is_some(),
+        // The colour is the whole point: severity reaches the buffer as the
+        // underline's colour and nothing else, so an error and a warning are
+        // told apart here or nowhere (SPEC §24.8).
+        underline: highlight.underline.map(|underline| Underline {
+            color: underline.color,
+        }),
         strikethrough: highlight.strikethrough.is_some(),
     }
 }
@@ -835,5 +1216,53 @@ mod tests {
         assert_eq!(row.spans.len(), 1);
         assert_eq!(row.spans[0].range, 0..5);
         assert_eq!(row.cell_width(), 5);
+    }
+
+    fn tab(label: &str, modified: bool) -> TabView {
+        TabView {
+            label: label.to_owned(),
+            modified,
+        }
+    }
+
+    #[test]
+    fn a_tab_is_its_label_plus_the_space_around_it_and_its_marker() {
+        assert_eq!(tab_cells(&tab("main.rs", false)), 9);
+        assert_eq!(tab_cells(&tab("main.rs", true)), 11);
+    }
+
+    #[test]
+    fn the_strip_scrolls_only_as_far_as_the_active_tab_needs() {
+        let tabs: Vec<TabView> = (0..5)
+            .map(|index| tab(&format!("f{index}.rs"), false))
+            .collect();
+        // Each tab is 8 cells, and a separator sits between each pair.
+        assert_eq!(first_visible_tab(&tabs, 0, 80), 0);
+        assert_eq!(first_visible_tab(&tabs, 4, 80), 0);
+        // Room for two tabs and the separator between them, and no more.
+        assert_eq!(first_visible_tab(&tabs, 4, 17), 3);
+        assert_eq!(first_visible_tab(&tabs, 2, 17), 1);
+    }
+
+    #[test]
+    fn wrapping_breaks_at_spaces_and_keeps_the_lines_it_was_given() {
+        assert_eq!(
+            wrap_to_cells("this function takes 5 arguments", 20),
+            vec!["this function takes", "5 arguments"]
+        );
+        assert_eq!(
+            wrap_to_cells("error E0061\nrust-analyzer", 40),
+            vec!["error E0061", "rust-analyzer"]
+        );
+    }
+
+    #[test]
+    fn a_word_wider_than_the_panel_is_broken_rather_than_clipped() {
+        assert_eq!(
+            wrap_to_cells("std::collections::HashMap", 10),
+            vec!["std::colle", "ctions::Ha", "shMap"]
+        );
+        // Cells, not characters: a wide grapheme takes two of them.
+        assert_eq!(wrap_to_cells("日本語", 4), vec!["日本", "語"]);
     }
 }

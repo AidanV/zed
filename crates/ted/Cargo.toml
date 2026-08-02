@@ -32,6 +32,7 @@ editor.workspace = true
 file_finder.workspace = true
 fs.workspace = true
 futures.workspace = true
+fuzzy_nucleo.workspace = true
 go_to_line.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
@@ -41,6 +42,7 @@ language.workspace = true
 # registered and every chunk comes back unhighlighted.
 languages = { workspace = true, features = ["load-grammars"] }
 log.workspace = true
+lsp.workspace = true
 menu.workspace = true
 multi_buffer.workspace = true
 node_runtime.workspace = true
@@ -57,6 +59,10 @@ serde.workspace = true
 serde_json_lenient.workspace = true
 session.workspace = true
 settings.workspace = true
+# Not initialized: `ted` paints its own buffer switcher (SPEC §24.6). The
+# dependency is for the action types its bindings and `:ls` resolve to, which
+# SPEC §24.2's table retargets onto `ted`'s own.
+tab_switcher.workspace = true
 tempfile.workspace = true
 theme.workspace = true
 theme_settings.workspace = true

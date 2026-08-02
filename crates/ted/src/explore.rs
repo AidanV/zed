@@ -62,7 +62,8 @@ pub fn prepare(config: &Config, backend: &Backend, cx: &App) -> Result<(Child, E
     let program =
         which::which(program).with_context(|| format!("{program} is not on this machine"))?;
 
-    let directory = tempfile::tempdir().context("could not create a directory for the selection")?;
+    let directory =
+        tempfile::tempdir().context("could not create a directory for the selection")?;
     let chooser = directory.path().join("selection");
     let start = start_directory(&backend.workspace, cx)?;
 
@@ -128,9 +129,10 @@ impl Explore {
             .iter()
             .zip(opened)
             .find_map(|(path, outcome)| match outcome {
-                Some(Err(error)) => {
-                    Some(format!("Explore: could not open {}: {error}", path.display()))
-                }
+                Some(Err(error)) => Some(format!(
+                    "Explore: could not open {}: {error}",
+                    path.display()
+                )),
                 Some(Ok(_)) | None => None,
             })
     }

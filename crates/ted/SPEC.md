@@ -1,8 +1,6 @@
 # `ted` — a terminal UI for Zed
 
-**Status:** M0 and M1 implemented (§21); M2 in progress — the suspend primitive
-(§7.1) and both host commands over it, `:!` and `:Explore` (§13.4), are in; the
-navigation half of M2 is specified in §24 and not started
+**Status:** M0, M1 and M2 implemented (§21). M3 is next
 **Scope:** a new crate + binary in this repository that presents Zed's editor as a
 full-screen terminal application, using Ratatui for presentation and Zed's own
 `editor` + `vim` + `workspace` + `project` crates for all behaviour.
@@ -54,6 +52,9 @@ crates/ted/
     config.rs           # ted.json: the settings that are ted's alone (§9)
     frame.rs            # frame loop, dirty tracking, present (§7)
     input.rs            # terminal event -> gpui::Keystroke / PlatformInput (§8)
+    actions.rs          # ted's own actions, and the surface table (§24.2)
+    overlay.rs          # the file finder and the buffer switcher (§24.1)
+    hover.rs            # diagnostics and documentation on demand (§24.8)
     suspend.rs          # handing the terminal to a child process (§7.1)
     explore.rs          # :Explore over a file manager (§13.4)
     snapshot.rs         # ViewSnapshot: the backend -> frontend projection (§10)
@@ -1336,11 +1337,12 @@ confirming `MacDispatcher`'s foreground wake path under §7's bridge.
 
 **M2 — Navigation.** Own-implementation `:` completions, file finder, go-to-
 line, buffer switching, multiple items in one pane, diagnostics rendered
-inline, LSP completions as a popup — **each specified in §24**, which is where
-the design direction for them lives. The suspend primitive (§7.1) with its
-reader-thread handshake, plus `:!` and `:Explore` over a local worktree (§13.4).
-The primitive, `:!` and `:Explore` are implemented; the navigation half is not.
-*Acceptance:* §24.10, plus the suspend half already asserted by the pty harness
+inline — **each specified in §24**, which is where the design direction for them
+lives. Language-server completions moved out with the status line (§24.9,
+§21/M3.5), and with them the one upstream change M2 would have needed. The
+suspend primitive (§7.1) with its reader-thread handshake, plus `:!` and
+`:Explore` over a local worktree (§13.4).
+*Acceptance:* §24.10, plus the suspend half asserted by the pty harness
 (§20.3) — no input stolen, no stale grid, no altered terminal mode.
 
 **M3 — Fidelity.** Mirror-strategy modal projection with the `PickerDelegate`
@@ -1420,7 +1422,7 @@ connection (§13.4). Optionally move the frontend out of process across the
 | Go to line | **Nothing new.** `:42` through vim's interceptor is the feature; no preview, no `ted`-owned surface. The only code is a bare number prompt for `--no-vim`, where there is no `:` line. §24.5. |
 | Buffer switching | **A small box in the top middle, most recent first**, where Zed puts its own switcher. Cycling only — no query row, no preview, no closing from the list. One surface, one verb. §24.6. |
 | Several items in one pane | **A tab strip along the top, shaped like Zed's**, which costs one rect offset in the projection. No numbers, overflow scrolls to keep the active tab visible, labels from `Pane::tab_details`. `:q` closes a tab and the rest take its place. §24.7. |
-| The `:` line | **Ghost text, not a list.** One row: the rest of the best-matching command dimmed after the cursor, `right` accepts it, a count on the right. Nothing ever covers the buffer for a half-typed command. §24.3. |
+| The `:` line | **Ghost text, not a list.** One row: the rest of the best-matching command dimmed after the cursor, `right` accepts it. Nothing ever covers the buffer for a half-typed command. Its right-hand end takes the first thing that fits — the selected action's keybinding, then the candidate count. §24.3. |
 | Keys in `ted`'s own surfaces | **`ctrl-n` / `ctrl-p` move a selection, and only those** — not `ctrl-j`/`ctrl-k`, not the arrows. Every surface opens with an empty query, and there is no `:` command history. §24.2, §24.3. |
 | Overlay behaviour | **Floats over the editor and never reserves rows**, so the buffer behind it never relayouts — and therefore **grows to fit its matches**, downward from a fixed top edge, up to a cap. The query row never moves; only the bottom border does. The selected row is the theme's selection background and nothing else — no bar, no caret — and the editor behind is left undimmed. §24.1. |
 | Terminals `ted` targets | **kitty and Ghostty, with a complete font.** No ASCII fallback for box drawing and no capability checks around it. This also makes §8.2's legacy keyboard mode and §12's 16-colour tier work for terminals `ted` no longer aims at — both are M3 items and can be dropped rather than built. §24.1. |
@@ -1439,11 +1441,10 @@ connection (§13.4). Optionally move the frontend out of process across the
    disagree on East Asian ambiguous-width. `ted` is self-consistent either way,
    but the *setting* needs a default chosen — narrow (matches most modern
    terminals) is the likely answer, with an override.
-4. **One detail of M2's look.** Everything else is decided (§23's table above).
-   What is left is the right-hand end of the `:` line (§24.3): the candidate
-   count, the selected action's keybinding, or — the likely answer — the
-   keybinding when the selected action has one and there is room for it, and the
-   count otherwise.
+4. **How much of a language server's markdown the hover panel should render.**
+   M2 flattens it to text (§24.8), which is enough to read a type signature and a
+   doc comment. What fences, emphasis and lists should look like in cells is a
+   small renderer of its own and travels with §21/M3.5.
 
 ---
 
@@ -1498,22 +1499,34 @@ pub struct OverlayView {
     pub query: Option<QueryView>,        // absent when the list is not filtered
     pub rows: Vec<OverlayRow>,
     pub selected: Option<usize>,
-    pub footer: Option<String>,          // "12 of 340", "no matches"
-    /// Grid (§24.4) | TopCentre (§24.6) | AtCell(CellPoint) (§24.9, later)
+    pub footer: Option<String>,          // "3/412", "no matches"
+    /// Grid (§24.4) | TopCentre (§24.6) — AtCell arrives with §24.9
     pub placement: OverlayPlacement,
 }
 
 pub struct OverlayRow {
+    pub label: MatchedText,
+    /// The second column, dimmed: a file's directory. Left-aligned at a column
+    /// computed from the widest label rather than right-aligned, because two
+    /// files called `snapshot.rs` are told apart by a column that starts in the
+    /// same place on every row (§24.4).
+    pub detail: Option<MatchedText>,
+    /// `•` after the label: unsaved work (§24.6, §24.7).
+    pub modified: bool,
+}
+
+/// Byte offsets that matched the query, emphasised by the renderer. Both
+/// `fuzzy_nucleo`'s matchers and `CommandInterceptItem` already report their
+/// matches in exactly this form.
+pub struct MatchedText {
     pub text: String,
-    pub spans: Vec<StyledSpan>,          // the editor's span type, reused
-    /// Byte offsets in `text` that matched the query, emphasised by the
-    /// renderer. Both `fuzzy_nucleo::StringMatch` and `CommandInterceptItem`
-    /// already report their matches in exactly this form.
     pub matched: Vec<usize>,
-    /// Right-aligned on the same row: a keybinding, a directory, a count.
-    pub trailing: Option<String>,
 }
 ```
+
+The rows carry no `StyledSpan`s. Neither M2 consumer has anything to put in
+them — the syntax-coloured row belongs to the completions popup (§24.9) — and a
+field nothing fills is a field the renderer has to guess the meaning of.
 
 **It floats; it does not reserve.** This is the one structural decision in
 §24 and it is not cosmetic. `ted`'s bottom lines are *reserved* rows: the GPUI
@@ -1550,10 +1563,11 @@ GPUI window on every keystroke, and the buffer behind it would relayout and
 rewrap each time. Floating over the editor means a changing height costs one more
 row of painting and nothing else.
 
-**Scrolling.** The box grows only to a cap — a fraction of the grid, since a
-finder that covers the file it is about to open is a worse finder. Past that the
-list scrolls to keep the selection visible and the footer reports the position in
-the full list.
+**Scrolling.** The box grows only to a cap — half the grid, since a finder that
+covers the file it is about to open is a worse finder. Past that the list scrolls
+to keep the selection visible, and the finder's footer says how many of the files
+it searched matched. The switcher has no second number to report and carries no
+footer.
 
 **Both consumers are bordered boxes**, differing only in size and where they sit:
 the finder fills the grid (§24.4), the switcher is small and centred at the top
@@ -1696,18 +1710,21 @@ Two smaller gaps go with it:
 when the interceptor is not exclusive. M2 changes the ranking and the rendering,
 not the resolution.
 
-**Direction wanted.**
+**Decided: the right-hand end takes the first thing that fits**, in one order —
+the selected action's keybinding when it has one, and the candidate count
+(`ctrl-n: 4 more`) otherwise. Neither is worth truncating and neither is worth
+displacing the ghost, so when even the count does not fit beside what is already
+on the row, nothing is painted there rather than something misleading.
 
-- **The right-hand end of the line.** The candidate count (`ctrl-n: 4 more`), the
-  selected action's keybinding, or both when they fit and the count when they do
-  not.
+**Decided: a host command's ghost reads like any other.** `:Explore` and `:!` are
+`ted`'s own (§13.4), and a colour saying so would answer a question nobody asks
+at the moment they are typing it — the host table is checked first, so what a
+host command actually gets is the top of the list, which is the answer that
+matters.
 
 **No command history.** vim recalls previous `:` commands on `up`/`down`; `ted`
 does not, and it is not on the roadmap — so `up`/`down` stay unbound on the `:`
 line rather than being reserved for it.
-- **Host commands.** `:Explore` and `:!` are `ted`'s own (§13.4), and their ghost
-  reads like any other. Worth marking as `ted`'s — a distinct colour on the ghost
-  — or not worth the distinction?
 
 ### 24.4 The file finder
 
@@ -1851,9 +1868,6 @@ may never report would make the switcher behave differently on Terminal.app than
 on Ghostty, so the list confirms on `enter` and cancels on `esc` everywhere, and
 `ctrl-tab` while it is open simply moves the selection down.
 
-**On the grid.**
-
-```
 **Decided: a box in the top middle, most recent first.** Where Zed puts its own
 switcher, in the vocabulary §24.4 borrowed from Helix — a bordered box, the label
 column then a dimmed directory column, the selection on the second row because
@@ -2184,7 +2198,7 @@ crate but `ted`**. What remains is one dependency flag and three proposals:
 
 | Crate | Change | Status |
 |---|---|---|
-| `ratatui` feature | enable `underline-color` in the workspace dependency | needed for severity-coloured underlines (§24.8) |
+| `ratatui` feature | enable `underline-color` in the workspace dependency | done; severity-coloured underlines (§24.8) reach the terminal through it |
 | `editor` | a public reader for the completions menu | deferred with §24.9 |
 | `vim` | `pub fn status_label(editor, cx)`, in the shape of `vim::mode` | deferred with the status line (§24.5) |
 | `vim` | `:b <name>` / `:b <n>`, absent from the command table | proposal; expressible as `ActivateItem`, so §13.4 puts it upstream rather than in `ted`'s host table (§24.6) |
@@ -2196,7 +2210,17 @@ jump to a line with `:42`, move between five open buffers and see all five in th
 tab strip, read a rust-analyzer error first as an underline where the code is
 wrong and then as a message on `shift-k`, and reach a command through the `:`
 line's ghost text without typing it out. The pty harness (§20.3) asserts the
-finder's grid, the switcher's order after two switches, the tab strip after a
-`:q`, the ghost text after two characters, and that `shift-k` on a diagnostic
-puts its text on screen. The suspend half of M2 keeps the acceptance it already
-has.
+finder's grid and what `enter` opens, that `esc` leaves the editor as it was, the
+switcher's order and the tab strip around a `:q`, the ghost text after two
+characters and what `right` does with it, and the bare number prompt `ctrl-g`
+opens without vim. The suspend half of M2 keeps the acceptance it already has.
+
+**What the harness cannot assert, and why.** `shift-k` over a *diagnostic* needs
+a language server, which the pty harness has no way to depend on: it runs the
+real binary against a temporary directory, and a test that installed
+rust-analyzer would be measuring the network. So the panel's placement, its
+rails and its wrapping are asserted against a `ViewSnapshot` in the renderer's
+own tests, its text against the diagnostic and markdown it is built from, and
+the pty harness asserts only the half that needs no server — that a position with
+nothing to say puts nothing on screen and leaves the editor holding the keyboard.
+Diagnostics *arriving* is `editor`'s to get right, and it already does.

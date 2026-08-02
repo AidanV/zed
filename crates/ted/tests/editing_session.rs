@@ -93,7 +93,7 @@ impl Session {
 
         // The editor gets the grid minus the one row `ted` reserves for its own
         // status line (SPEC §10.2), which is what the window is sized to.
-        let editor_rows = rows - reserved_rows(false, false, 0);
+        let editor_rows = rows - reserved_rows(false, false, 0, 0);
         let text = text.to_owned();
         let window = cx
             .open_window(grid_size(columns, editor_rows), move |window, cx| {
@@ -167,7 +167,7 @@ impl Session {
                     &editor,
                     columns,
                     rows,
-                    reserved_rows(false, false, 0),
+                    reserved_rows(false, false, 0, 0),
                     window,
                     cx,
                 )

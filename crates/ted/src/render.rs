@@ -13,7 +13,9 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use crate::cell::{cluster_cells, text_cells};
 use crate::palette::Palette;
 use crate::snapshot::{
-    CellRect, CommandLineView, EditorView, PromptView, RowView, SpanStyle, StatusView, ViewSnapshot,
+    CellPoint, CellRect, CommandLineView, CursorShape, EditorView, HoverView, MatchedText,
+    OverlayPlacement, OverlayView, PromptView, RowView, SpanStyle, StatusView, TabStripView,
+    ViewSnapshot, tab_cells,
 };
 
 /// A prompt is always exactly this tall — the question on one row, the numbered
@@ -22,20 +24,47 @@ use crate::snapshot::{
 /// line `ted` paints.
 const PROMPT_ROWS: usize = 2;
 
-/// The rows `ted` paints itself, bottom-up: the status line always, then the
-/// `:` / `/` line when one is open, then a prompt when one is unanswered, then
-/// one row per notification. The GPUI window is sized to the grid minus exactly
-/// this many rows, so the editor's reported rect can never overlap them
-/// (SPEC §10.2).
-pub fn reserved_rows(command_line: bool, prompt: bool, notifications: usize) -> u16 {
+/// How much of the grid a list may cover. A finder that hides the file it is
+/// about to open is a worse finder, so past this the list scrolls (SPEC §24.1).
+const OVERLAY_ROWS_PER_GRID: u16 = 2;
+
+/// The switcher is sized to its content, within these. Narrower than the lower
+/// bound it cannot show a name and a directory; wider than the grid allows it
+/// stops being the small box SPEC §24.6 asked for.
+const SWITCHER_MIN_WIDTH: u16 = 28;
+const SWITCHER_MARGIN: u16 = 4;
+
+/// The rows `ted` paints itself: the status line always, then the `:` / `/` line
+/// when one is open, then a prompt when one is unanswered, then one row per
+/// notification — and the tab strip, which is the only one of them above the
+/// editor. The GPUI window is sized to the grid minus exactly this many rows, so
+/// the editor's reported rect can never overlap them (SPEC §10.2).
+///
+/// An open overlay is deliberately absent: it floats over the editor's cells and
+/// costs no rows at all, so a box whose height follows a query never resizes the
+/// window (SPEC §24.1).
+pub fn reserved_rows(command_line: bool, prompt: bool, notifications: usize, tabs: u16) -> u16 {
     let reserved =
         1 + usize::from(command_line) + usize::from(prompt) * PROMPT_ROWS + notifications;
-    u16::try_from(reserved).unwrap_or(u16::MAX)
+    u16::try_from(reserved)
+        .unwrap_or(u16::MAX)
+        .saturating_add(tabs)
 }
 
 pub fn render(snapshot: &ViewSnapshot, palette: &Palette, buffer: &mut Buffer) {
     if let Some(editor) = &snapshot.editor {
         render_editor(editor, palette, buffer);
+    }
+    if let Some(tabs) = &snapshot.tabs {
+        render_tabs(tabs, snapshot.columns, palette, buffer);
+    }
+    // Over the editor, and under the overlay: a list the user opened is in front
+    // of a panel they left open.
+    if let Some(hover) = &snapshot.hover {
+        render_hover(hover, palette, buffer);
+    }
+    if let Some(overlay) = &snapshot.overlay {
+        render_overlay(overlay, snapshot, palette, buffer);
     }
 
     let Some(status_row) = snapshot.rows.checked_sub(1) else {
@@ -282,6 +311,396 @@ fn paint_selection(
     }
 }
 
+/// The pane's items along the top, shaped like Zed's: the active tab on the
+/// editor's own background, the inactive ones on a darker ground, separated the
+/// way Zed separates them (SPEC §24.7).
+fn render_tabs(tabs: &TabStripView, columns: u16, palette: &Palette, buffer: &mut Buffer) {
+    let ground = tabs
+        .background
+        .map(|color| Style::default().bg(palette.color(color)))
+        .unwrap_or_default();
+    fill(Rect::new(0, 0, columns, 1), ground, buffer);
+
+    let active = Style::default()
+        .fg(color_or_default(tabs.active_foreground, palette))
+        .bg(color_or_default(tabs.active_background, palette));
+    let inactive = ground.fg(color_or_default(tabs.foreground, palette));
+    let separator = ground.fg(color_or_default(tabs.separator, palette));
+
+    let mut x = 0u16;
+    for (index, tab) in tabs.tabs.iter().enumerate().skip(tabs.first) {
+        if index > tabs.first {
+            if x >= columns {
+                return;
+            }
+            write("│", Rect::new(x, 0, 1, 1), separator, buffer);
+            x += 1;
+        }
+
+        let width = tab_cells(tab).min(columns.saturating_sub(x));
+        if width == 0 {
+            return;
+        }
+        let area = Rect::new(x, 0, width, 1);
+        let style = if index == tabs.active {
+            active
+        } else {
+            inactive
+        };
+        fill(area, style, buffer);
+        // `•` after the label is unsaved work, matching the switcher's rows.
+        let label = if tab.modified {
+            format!(" {} •", tab.label)
+        } else {
+            format!(" {}", tab.label)
+        };
+        write(&label, area, style, buffer);
+        x += width;
+    }
+}
+
+/// The railed panel: a tinted block with a coloured bar down its left edge and
+/// no border, so nothing needs an ASCII twin and four more cells go to the text
+/// (SPEC §24.8).
+fn render_hover(hover: &HoverView, palette: &Palette, buffer: &mut Buffer) {
+    let area = clamp(hover.rect, buffer.area);
+    let ground = hover
+        .background
+        .map(|color| Style::default().bg(palette.color(color)))
+        .unwrap_or_default();
+    fill(area, ground, buffer);
+
+    let mut y = area.y;
+    for block in &hover.blocks {
+        let rail = ground.fg(color_or_default(block.rail, palette));
+        for line in &block.lines {
+            if y >= area.y + area.height {
+                return;
+            }
+            write("▌", Rect::new(area.x, y, 1, 1), rail, buffer);
+            if area.width > 2 {
+                write(
+                    line,
+                    Rect::new(area.x + 2, y, area.width - 2, 1),
+                    ground,
+                    buffer,
+                );
+            }
+            y += 1;
+        }
+    }
+}
+
+/// Where a list sits and how much of it is on screen.
+///
+/// Shared with [`cursor`], which has to put the terminal's cursor in the query
+/// field: two answers to "where is the query row" would be one answer too many.
+struct OverlayLayout {
+    rect: Rect,
+    query_row: Option<u16>,
+    list_row: u16,
+    /// The first row painted, scrolled far enough that the selection is on
+    /// screen (SPEC §24.1).
+    first: usize,
+    visible: usize,
+}
+
+fn layout_overlay(overlay: &OverlayView, columns: u16, rows: u16) -> Option<OverlayLayout> {
+    if columns < SWITCHER_MIN_WIDTH || rows < 4 {
+        return None;
+    }
+    let has_query = overlay.query.is_some();
+    let top = match overlay.placement {
+        OverlayPlacement::Grid => 0,
+        OverlayPlacement::TopCentre => 1,
+    };
+    // Borders, the query row, and the rule under it — which is only drawn when
+    // there is a list under it to separate.
+    let chrome = 2 + u16::from(has_query) + u16::from(has_query && !overlay.rows.is_empty());
+    let room = rows
+        .saturating_sub(top)
+        .saturating_sub(chrome)
+        .min(rows / OVERLAY_ROWS_PER_GRID);
+    let visible = usize::from(room).min(overlay.rows.len());
+
+    let width = match overlay.placement {
+        OverlayPlacement::Grid => columns,
+        OverlayPlacement::TopCentre => switcher_width(overlay, columns),
+    };
+    let x = (columns.saturating_sub(width)) / 2;
+    let height = chrome.saturating_add(visible.min(usize::from(u16::MAX)) as u16);
+
+    let selected = overlay.selected.unwrap_or(0);
+    let first = selected
+        .saturating_add(1)
+        .saturating_sub(visible.max(1))
+        .min(overlay.rows.len().saturating_sub(visible));
+
+    Some(OverlayLayout {
+        rect: Rect::new(x, top, width, height),
+        query_row: has_query.then_some(top + 1),
+        list_row: top + chrome - 1,
+        first,
+        visible,
+    })
+}
+
+fn switcher_width(overlay: &OverlayView, columns: u16) -> u16 {
+    let content = overlay
+        .rows
+        .iter()
+        .map(|row| {
+            let detail = row
+                .detail
+                .as_ref()
+                .map(|detail| text_cells(&detail.text) + 2)
+                .unwrap_or(0);
+            text_cells(&row.label.text) + detail + if row.modified { 2 } else { 0 }
+        })
+        .max()
+        .unwrap_or(0)
+        .min(u32::from(u16::MAX)) as u16;
+    content
+        .saturating_add(4)
+        .max(SWITCHER_MIN_WIDTH)
+        .min(columns.saturating_sub(SWITCHER_MARGIN))
+}
+
+/// The one widget the finder and the switcher share (SPEC §24.1): a bordered box
+/// over the editor's cells, growing downward from a fixed top edge to fit its
+/// matches, with the selected row tinted and nothing else marking it.
+fn render_overlay(
+    overlay: &OverlayView,
+    snapshot: &ViewSnapshot,
+    palette: &Palette,
+    buffer: &mut Buffer,
+) {
+    let Some(layout) = layout_overlay(overlay, snapshot.columns, snapshot.rows) else {
+        return;
+    };
+    let area = clamp(
+        CellRect::new(
+            layout.rect.x,
+            layout.rect.y,
+            layout.rect.width,
+            layout.rect.height,
+        ),
+        buffer.area,
+    );
+    if area.width < 4 || area.height < 2 {
+        return;
+    }
+
+    let ground = snapshot
+        .editor
+        .as_ref()
+        .and_then(|editor| editor.background)
+        .and_then(|color| palette.surface_background(color))
+        .map(|color| Style::default().bg(color))
+        .unwrap_or_default();
+    fill(area, ground, buffer);
+    render_border(area, overlay.title.as_deref(), ground, buffer);
+
+    let content = Rect::new(
+        area.x + 2,
+        area.y,
+        area.width.saturating_sub(4),
+        area.height,
+    );
+    if let (Some(query_row), Some(query)) = (layout.query_row, overlay.query.as_ref()) {
+        write(
+            &format!("> {}", query.text),
+            Rect::new(content.x, query_row, content.width, 1),
+            ground,
+            buffer,
+        );
+        // Only when there is a list under it to separate: a rule over nothing
+        // would take the row the query is being typed on.
+        if layout.visible > 0 {
+            render_rule(area, layout.list_row.saturating_sub(1), ground, buffer);
+        }
+    }
+    if let Some(footer) = &overlay.footer {
+        let row = layout.query_row.unwrap_or(area.y + area.height - 1);
+        write_right(footer, content.x, content.width, row, ground, buffer);
+    }
+
+    // The theme's own selection background — the same colour a selection in the
+    // buffer uses — and nothing else: no bar, no caret, so every row starts at
+    // the same column (SPEC §24.1).
+    let selection = snapshot
+        .editor
+        .as_ref()
+        .and_then(|editor| editor.selection_background)
+        .map(|color| Style::default().bg(palette.color(color)));
+
+    let detail_column = detail_column(overlay, content.width);
+    for offset in 0..layout.visible {
+        let Some(row) = overlay.rows.get(layout.first + offset) else {
+            break;
+        };
+        let Ok(offset) = u16::try_from(offset) else {
+            break;
+        };
+        let y = layout.list_row + offset;
+        if y + 1 >= area.y + area.height {
+            break;
+        }
+
+        let selected = overlay.selected == Some(layout.first + usize::from(offset));
+        let style = match (selected, selection) {
+            (true, Some(selection)) => selection,
+            (true, None) => ground.add_modifier(Modifier::REVERSED),
+            (false, _) => ground,
+        };
+        fill(
+            Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1),
+            style,
+            buffer,
+        );
+
+        let label = if row.modified {
+            MatchedText {
+                text: format!("{} •", row.label.text),
+                matched: row.label.matched.clone(),
+            }
+        } else {
+            row.label.clone()
+        };
+        write_matched(
+            &label,
+            Rect::new(content.x, y, detail_column.min(content.width), 1),
+            style,
+            buffer,
+        );
+        if let Some(detail) = &row.detail
+            && detail_column < content.width
+        {
+            write_matched(
+                detail,
+                Rect::new(
+                    content.x + detail_column,
+                    y,
+                    content.width - detail_column,
+                    1,
+                ),
+                // Dimmed, because the column is there to tell two files of the
+                // same name apart rather than to be read.
+                style.add_modifier(Modifier::DIM),
+                buffer,
+            );
+        }
+    }
+}
+
+/// Where the directory column starts, from the widest name on screen, so it
+/// starts in the same place on every row (SPEC §24.4).
+fn detail_column(overlay: &OverlayView, width: u16) -> u16 {
+    let widest = overlay
+        .rows
+        .iter()
+        .map(|row| text_cells(&row.label.text) + if row.modified { 2 } else { 0 })
+        .max()
+        .unwrap_or(0)
+        .min(u32::from(u16::MAX)) as u16;
+    widest.saturating_add(2).min(width / 2).max(1)
+}
+
+fn render_border(area: Rect, title: Option<&str>, style: Style, buffer: &mut Buffer) {
+    let bottom = area.y + area.height - 1;
+    let inner = area.width.saturating_sub(2);
+    write(
+        &format!("╭{}╮", "─".repeat(usize::from(inner))),
+        area,
+        style,
+        buffer,
+    );
+    write(
+        &format!("╰{}╯", "─".repeat(usize::from(inner))),
+        Rect::new(area.x, bottom, area.width, 1),
+        style,
+        buffer,
+    );
+    for y in area.y + 1..bottom {
+        write("│", Rect::new(area.x, y, 1, 1), style, buffer);
+        write(
+            "│",
+            Rect::new(area.x + area.width - 1, y, 1, 1),
+            style,
+            buffer,
+        );
+    }
+    if let Some(title) = title
+        && inner > 4
+    {
+        write(
+            &format!("─ {title} "),
+            Rect::new(area.x + 1, area.y, inner, 1),
+            style,
+            buffer,
+        );
+    }
+}
+
+fn render_rule(area: Rect, row: u16, style: Style, buffer: &mut Buffer) {
+    let inner = area.width.saturating_sub(2);
+    write(
+        &format!("├{}┤", "─".repeat(usize::from(inner))),
+        Rect::new(area.x, row, area.width, 1),
+        style,
+        buffer,
+    );
+}
+
+/// Where the terminal's own cursor belongs, which is not always where the
+/// editor's is: while one of `ted`'s own surfaces owns the keyboard, the cursor
+/// belongs in the field being typed in, as a bar, whatever vim's mode says
+/// (SPEC §24.1). A surface with nothing to type in hides it rather than leaving
+/// it under a box.
+pub fn cursor(snapshot: &ViewSnapshot) -> (Option<CellPoint>, CursorShape) {
+    if let Some(overlay) = &snapshot.overlay {
+        let Some(layout) = layout_overlay(overlay, snapshot.columns, snapshot.rows) else {
+            return (None, snapshot.cursor_shape);
+        };
+        let Some((row, query)) = layout.query_row.zip(overlay.query.as_ref()) else {
+            return (None, CursorShape::Bar);
+        };
+        let typed = query.text.get(..query.cursor).unwrap_or(&query.text);
+        let column = layout.rect.x + 4 + text_cells(typed).min(u32::from(u16::MAX)) as u16;
+        return (
+            Some(CellPoint {
+                column: column.min(snapshot.columns.saturating_sub(1)),
+                row,
+            }),
+            CursorShape::Bar,
+        );
+    }
+
+    if let Some(command_line) = &snapshot.command_line
+        && let Some(row) = command_line_row(snapshot)
+    {
+        let typed = command_line
+            .query
+            .get(..command_line.cursor)
+            .unwrap_or(&command_line.query);
+        let column = 1 + text_cells(typed).min(u32::from(u16::MAX)) as u16;
+        return (
+            Some(CellPoint {
+                column: column.min(snapshot.columns.saturating_sub(1)),
+                row,
+            }),
+            CursorShape::Bar,
+        );
+    }
+
+    (snapshot.cursor, snapshot.cursor_shape)
+}
+
+/// Directly above the status line, which is the last row of the grid.
+fn command_line_row(snapshot: &ViewSnapshot) -> Option<u16> {
+    snapshot.rows.checked_sub(2)
+}
+
 fn render_status(status: &StatusView, columns: u16, row: u16, buffer: &mut Buffer) {
     if columns == 0 {
         return;
@@ -339,22 +758,49 @@ fn render_command_line(
     let mut line = String::new();
     line.push(command_line.prefix);
     line.push_str(&command_line.query);
-
-    // Completions share the line with the query rather than opening a popup:
-    // the selected one is what `enter` will dispatch, so it has to be visible.
-    if let Some(selected) = command_line
-        .selected_completion
-        .and_then(|index| command_line.completions.get(index))
-    {
-        line.push_str("  → ");
-        line.push_str(selected);
-    }
     if let Some(message) = &command_line.message {
         line.push_str("  ");
         line.push_str(message);
     }
-
     write(&line, area, Style::default(), buffer);
+
+    // The rest of the selected command, dimmed after the cursor. A list would
+    // have covered the buffer for a half-typed command; one row never does
+    // (SPEC §24.3).
+    let typed = text_cells(&line).min(u32::from(columns)) as u16;
+    if let Some(ghost) = &command_line.ghost
+        && typed < columns
+    {
+        write(
+            ghost,
+            Rect::new(typed, row, columns - typed, 1),
+            Style::default().add_modifier(Modifier::DIM),
+            buffer,
+        );
+    }
+
+    // The first thing that still fits beside what is already on the row: the
+    // keybinding when the selected action has one, and the candidate count
+    // otherwise (SPEC §24.3).
+    let used = typed
+        + command_line
+            .ghost
+            .as_deref()
+            .map(|ghost| text_cells(ghost).min(u32::from(columns)) as u16)
+            .unwrap_or(0);
+    for candidate in &command_line.trailing {
+        let width = text_cells(candidate).min(u32::from(columns)) as u16;
+        if used + width + 1 > columns {
+            continue;
+        }
+        write(
+            candidate,
+            Rect::new(columns - width, row, width, 1),
+            Style::default().add_modifier(Modifier::DIM),
+            buffer,
+        );
+        break;
+    }
 }
 
 /// Paints the question on `message_row` and its numbered answers on
@@ -413,13 +859,63 @@ fn terminal_style(style: &SpanStyle, palette: &Palette) -> Style {
     if style.italic {
         result = result.add_modifier(Modifier::ITALIC);
     }
-    if style.underline {
+    if let Some(underline) = style.underline {
         result = result.add_modifier(Modifier::UNDERLINED);
+        // `SGR 58`, which is the whole of what the buffer says about severity: a
+        // straight coloured underline rather than a curl, which would mean
+        // writing a Ratatui `Backend` for a difference the colour already
+        // carries (SPEC §24.8).
+        if let Some(color) = underline.color {
+            result = result.underline_color(palette.color(color));
+        }
     }
     if style.strikethrough {
         result = result.add_modifier(Modifier::CROSSED_OUT);
     }
     result
+}
+
+fn color_or_default(color: Option<gpui::Hsla>, palette: &Palette) -> ratatui::style::Color {
+    color
+        .map(|color| palette.color(color))
+        .unwrap_or(ratatui::style::Color::Reset)
+}
+
+/// Writes text with the bytes a query matched emphasised, which is the only
+/// thing a list row does that plain text does not.
+fn write_matched(text: &MatchedText, area: Rect, style: Style, buffer: &mut Buffer) {
+    write(&text.text, area, style, buffer);
+    if text.matched.is_empty() {
+        return;
+    }
+
+    let table = crate::snapshot::byte_to_cell_table(&text.text);
+    for byte in &text.matched {
+        let Some(&column) = table.get(*byte) else {
+            continue;
+        };
+        if column >= area.width {
+            continue;
+        }
+        if let Some(cell) = buffer.cell_mut((area.x + column, area.y)) {
+            cell.modifier.insert(Modifier::BOLD);
+        }
+    }
+}
+
+/// Right-aligns `text` inside a run of cells, clipping it away entirely rather
+/// than truncating it when it does not fit.
+fn write_right(text: &str, x: u16, width: u16, row: u16, style: Style, buffer: &mut Buffer) {
+    let cells = text_cells(text).min(u32::from(width)) as u16;
+    if cells == 0 || cells > width {
+        return;
+    }
+    write(
+        text,
+        Rect::new(x + width - cells, row, cells, 1),
+        style,
+        buffer,
+    );
 }
 
 /// Writes plain text into `area`, clipping at its right edge and honouring
@@ -480,7 +976,10 @@ fn clamp(rect: CellRect, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::palette::ColorDepth;
-    use crate::snapshot::{CellPoint, DiffMarker, GutterView, SelectionSpan, StyledSpan};
+    use crate::snapshot::{
+        DiffMarker, GutterView, HoverBlock, OverlayRow, QueryView, SelectionSpan, StyledSpan,
+        TabView, Underline,
+    };
     use gpui::hsla;
 
     fn palette() -> Palette {
@@ -675,14 +1174,13 @@ mod tests {
         let mut snapshot = snapshot_of(20, 4, &["x"]);
         snapshot.command_line = Some(CommandLineView {
             prefix: ':',
-            query: "wq".to_owned(),
-            cursor: 2,
-            completions: vec!["save and quit".to_owned()],
-            selected_completion: Some(0),
-            message: None,
+            query: "w".to_owned(),
+            cursor: 1,
+            ghost: Some("q".to_owned()),
+            ..Default::default()
         });
         let grid = grid(&snapshot);
-        assert_eq!(grid[2], ":wq  → save and quit");
+        assert_eq!(grid[2], ":wq                 ");
         assert!(grid[3].starts_with("[No Name]"));
     }
 
@@ -693,9 +1191,8 @@ mod tests {
             prefix: '/',
             query: "needle".to_owned(),
             cursor: 6,
-            completions: Vec::new(),
-            selected_completion: None,
             message: Some("2/9".to_owned()),
+            ..Default::default()
         });
         snapshot.notifications = vec!["unable to save".to_owned()];
         let grid = grid(&snapshot);
@@ -718,12 +1215,14 @@ mod tests {
 
     #[test]
     fn reserved_rows_grow_with_the_lines_ted_owns() {
-        assert_eq!(reserved_rows(false, false, 0), 1);
-        assert_eq!(reserved_rows(true, false, 0), 2);
-        assert_eq!(reserved_rows(true, false, 3), 5);
+        assert_eq!(reserved_rows(false, false, 0, 0), 1);
+        assert_eq!(reserved_rows(true, false, 0, 0), 2);
+        assert_eq!(reserved_rows(true, false, 3, 0), 5);
         // A prompt is two rows: the question and its answers.
-        assert_eq!(reserved_rows(false, true, 0), 3);
-        assert_eq!(reserved_rows(true, true, 3), 7);
+        assert_eq!(reserved_rows(false, true, 0, 0), 3);
+        assert_eq!(reserved_rows(true, true, 3, 0), 7);
+        // And the tab strip is the one row `ted` keeps above the editor.
+        assert_eq!(reserved_rows(false, false, 0, 1), 2);
     }
 
     #[test]
@@ -751,9 +1250,7 @@ mod tests {
             prefix: ':',
             query: "q".to_owned(),
             cursor: 1,
-            completions: Vec::new(),
-            selected_completion: None,
-            message: None,
+            ..Default::default()
         });
         snapshot.prompt = Some(PromptView {
             message: "Overwrite?".to_owned(),
@@ -765,5 +1262,365 @@ mod tests {
         assert_eq!(grid[3].trim_end(), "[1] Overwrite  [2] Cancel");
         assert_eq!(grid[4].trim_end(), ":q");
         assert!(grid[5].starts_with("[No Name]"));
+    }
+
+    fn overlay_row(label: &str, detail: &str) -> OverlayRow {
+        OverlayRow {
+            label: MatchedText::plain(label),
+            detail: (!detail.is_empty()).then(|| MatchedText::plain(detail)),
+            modified: false,
+        }
+    }
+
+    fn finder(query: &str, rows: Vec<OverlayRow>, footer: &str) -> OverlayView {
+        OverlayView {
+            title: Some("files".to_owned()),
+            query: Some(QueryView {
+                cursor: query.len(),
+                text: query.to_owned(),
+            }),
+            selected: (!rows.is_empty()).then_some(0),
+            rows,
+            footer: Some(footer.to_owned()),
+            placement: OverlayPlacement::Grid,
+        }
+    }
+
+    #[test]
+    fn the_finder_is_a_bordered_box_over_the_grid_with_two_columns() {
+        let mut snapshot = snapshot_of(50, 14, &["fn main() {}"]);
+        snapshot.overlay = Some(finder(
+            "sna",
+            vec![
+                overlay_row("snapshot.rs", "crates/ted/src"),
+                overlay_row("render.rs", "crates/ted/src"),
+            ],
+            "2/412",
+        ));
+        let grid = grid(&snapshot);
+
+        assert!(grid[0].starts_with("╭─ files "), "{:?}", grid[0]);
+        assert!(grid[0].ends_with('╮'), "{:?}", grid[0]);
+        assert!(grid[1].starts_with("│ > sna"), "{:?}", grid[1]);
+        assert!(grid[1].ends_with("2/412 │"), "{:?}", grid[1]);
+        assert!(
+            grid[2].starts_with('├') && grid[2].ends_with('┤'),
+            "{:?}",
+            grid[2]
+        );
+        assert!(
+            grid[3].starts_with("│ snapshot.rs") && grid[3].contains("crates/ted/src"),
+            "{:?}",
+            grid[3]
+        );
+        assert!(grid[4].contains("render.rs"), "{:?}", grid[4]);
+        assert!(
+            grid[5].starts_with('╰') && grid[5].ends_with('╯'),
+            "{:?}",
+            grid[5]
+        );
+        // The buffer behind it is untouched below the box: the overlay floats
+        // over the editor's cells and reserves nothing (SPEC §24.1).
+        assert_eq!(grid[6].trim_end(), "");
+    }
+
+    #[test]
+    fn the_box_grows_to_fit_its_matches_and_paints_no_blank_rows() {
+        let mut snapshot = snapshot_of(40, 14, &["x"]);
+        snapshot.overlay = Some(finder("s", vec![overlay_row("one.rs", "src")], "1/9"));
+        let one = grid(&snapshot);
+        assert!(one[3].contains("one.rs"), "{:?}", one[3]);
+        assert!(one[4].starts_with('╰'), "{:?}", one[4]);
+
+        snapshot.overlay = Some(finder(
+            "s",
+            vec![
+                overlay_row("one.rs", "src"),
+                overlay_row("two.rs", "src"),
+                overlay_row("three.rs", "src"),
+            ],
+            "3/9",
+        ));
+        let grid = grid(&snapshot);
+        assert!(grid[5].contains("three.rs"), "{:?}", grid[5]);
+        assert!(grid[6].starts_with('╰'), "{:?}", grid[6]);
+    }
+
+    #[test]
+    fn a_finder_with_nothing_to_show_says_so_and_opens_no_list() {
+        let mut snapshot = snapshot_of(40, 14, &["x"]);
+        snapshot.overlay = Some(finder("zzz", Vec::new(), "no matches"));
+        let grid = grid(&snapshot);
+        assert!(grid[1].ends_with("no matches │"), "{:?}", grid[1]);
+        assert!(grid[2].starts_with('╰'), "{:?}", grid[2]);
+    }
+
+    #[test]
+    fn a_long_list_scrolls_to_keep_the_selection_visible() {
+        let mut snapshot = snapshot_of(40, 12, &["x"]);
+        let rows = (0..20)
+            .map(|index| overlay_row(&format!("file{index}.rs"), "src"))
+            .collect::<Vec<_>>();
+        let mut overlay = finder("f", rows, "20/20");
+        overlay.selected = Some(19);
+        snapshot.overlay = Some(overlay);
+
+        let grid = grid(&snapshot);
+        let visible = grid
+            .iter()
+            .filter(|row| row.contains("file"))
+            .collect::<Vec<_>>();
+        assert!(
+            visible.len() < 20 && visible.iter().any(|row| row.contains("file19.rs")),
+            "the selection scrolled out of view: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn the_switcher_is_a_small_box_at_the_top_with_no_query_row() {
+        let mut snapshot = snapshot_of(60, 14, &["fn main() {}"]);
+        snapshot.overlay = Some(OverlayView {
+            title: Some("buffers".to_owned()),
+            query: None,
+            rows: vec![
+                OverlayRow {
+                    label: MatchedText::plain("frame.rs"),
+                    detail: Some(MatchedText::plain("crates/ted/src")),
+                    modified: true,
+                },
+                overlay_row("snapshot.rs", "crates/ted/src"),
+            ],
+            // The second row, because the first is the buffer you are in.
+            selected: Some(1),
+            footer: None,
+            placement: OverlayPlacement::TopCentre,
+        });
+        let grid = grid(&snapshot);
+
+        // Row 0 is still the editor: the box hangs below it, centred.
+        assert!(grid[0].starts_with("fn main"), "{:?}", grid[0]);
+        assert!(grid[1].trim_start().starts_with('╭'), "{:?}", grid[1]);
+        assert!(grid[2].contains("frame.rs •"), "{:?}", grid[2]);
+        assert!(grid[3].contains("snapshot.rs"), "{:?}", grid[3]);
+        assert!(grid[4].trim_start().starts_with('╰'), "{:?}", grid[4]);
+        let left = grid[1].len() - grid[1].trim_start().len();
+        assert!(left > 0, "the switcher is not centred: {:?}", grid[1]);
+    }
+
+    #[test]
+    fn the_selected_row_is_a_background_tint_and_nothing_else() {
+        let mut snapshot = snapshot_of(40, 12, &["x"]);
+        let selection = hsla(0.6, 0.5, 0.3, 1.0);
+        if let Some(editor) = snapshot.editor.as_mut() {
+            editor.selection_background = Some(selection);
+        }
+        snapshot.overlay = Some(finder(
+            "o",
+            vec![overlay_row("one.rs", "src"), overlay_row("two.rs", "src")],
+            "2/2",
+        ));
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 12));
+        render(&snapshot, &palette(), &mut buffer);
+        let tint = palette().color(selection);
+        assert_eq!(buffer.cell((2, 3)).map(|cell| cell.bg), Some(tint));
+        assert_ne!(buffer.cell((2, 4)).map(|cell| cell.bg), Some(tint));
+
+        // No bar and no caret: every row starts at the same column.
+        let grid = grid(&snapshot);
+        assert!(grid[3].starts_with("│ one.rs"), "{:?}", grid[3]);
+        assert!(grid[4].starts_with("│ two.rs"), "{:?}", grid[4]);
+    }
+
+    #[test]
+    fn the_tab_strip_takes_the_top_row_and_marks_unsaved_work() {
+        let mut snapshot = snapshot_of(40, 6, &["fn main() {}"]);
+        // The editor was already shifted down by the strip's row when the
+        // projection was built (SPEC §24.7).
+        if let Some(editor) = snapshot.editor.as_mut() {
+            editor.text_rect = CellRect::new(0, 1, 40, 4);
+        }
+        snapshot.tabs = Some(TabStripView {
+            tabs: vec![
+                TabView {
+                    label: "snapshot.rs".to_owned(),
+                    modified: false,
+                },
+                TabView {
+                    label: "frame.rs".to_owned(),
+                    modified: true,
+                },
+            ],
+            active: 1,
+            ..Default::default()
+        });
+        let grid = grid(&snapshot);
+        assert_eq!(grid[0].trim_end(), " snapshot.rs │ frame.rs •");
+        assert_eq!(grid[1].trim_end(), "fn main() {}");
+    }
+
+    #[test]
+    fn the_strip_scrolls_rather_than_eliding_its_middle() {
+        let mut snapshot = snapshot_of(24, 4, &["x"]);
+        snapshot.tabs = Some(TabStripView {
+            tabs: (0..5)
+                .map(|index| TabView {
+                    label: format!("file{index}.rs"),
+                    modified: false,
+                })
+                .collect(),
+            active: 4,
+            first: 3,
+            ..Default::default()
+        });
+        let grid = grid(&snapshot);
+        assert_eq!(grid[0].trim_end(), " file3.rs │ file4.rs");
+    }
+
+    #[test]
+    fn the_hover_panel_rails_each_block_in_its_own_colour() {
+        let mut snapshot = snapshot_of(40, 10, &["let x = f();"]);
+        let error = hsla(0.0, 0.8, 0.5, 1.0);
+        snapshot.hover = Some(HoverView {
+            rect: CellRect::new(0, 1, 40, 4),
+            background: None,
+            blocks: vec![
+                HoverBlock {
+                    rail: Some(error),
+                    lines: vec!["error E0061".to_owned(), "takes 5 arguments".to_owned()],
+                },
+                HoverBlock {
+                    rail: Some(hsla(0.6, 0.5, 0.5, 1.0)),
+                    lines: vec![String::new(), "fn f(a: u16) -> Row".to_owned()],
+                },
+            ],
+        });
+        let grid = grid(&snapshot);
+        assert_eq!(grid[1].trim_end(), "▌ error E0061");
+        assert_eq!(grid[2].trim_end(), "▌ takes 5 arguments");
+        // A blank railed row keeps the diagnostic and the documentation from
+        // reading as one message.
+        assert_eq!(grid[3].trim_end(), "▌");
+        assert_eq!(grid[4].trim_end(), "▌ fn f(a: u16) -> Row");
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 10));
+        render(&snapshot, &palette(), &mut buffer);
+        assert_eq!(
+            buffer.cell((0, 1)).map(|cell| cell.fg),
+            Some(palette().color(error))
+        );
+    }
+
+    #[test]
+    fn the_command_line_ghosts_the_rest_of_the_command() {
+        let mut snapshot = snapshot_of(40, 4, &["x"]);
+        snapshot.command_line = Some(CommandLineView {
+            prefix: ':',
+            query: "w".to_owned(),
+            cursor: 1,
+            ghost: Some("q".to_owned()),
+            trailing: vec!["ctrl-n: 4 more".to_owned()],
+            message: None,
+        });
+        let grid = grid(&snapshot);
+        assert_eq!(
+            grid[2].trim_end(),
+            ":wq                       ctrl-n: 4 more"
+        );
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 4));
+        render(&snapshot, &palette(), &mut buffer);
+        // The ghost is dimmed and the query is not, which is the whole of what
+        // says one was typed and the other was offered.
+        assert!(
+            buffer
+                .cell((2, 2))
+                .is_some_and(|cell| cell.modifier.contains(Modifier::DIM))
+        );
+        assert!(
+            buffer
+                .cell((1, 2))
+                .is_some_and(|cell| !cell.modifier.contains(Modifier::DIM))
+        );
+    }
+
+    #[test]
+    fn the_right_hand_end_takes_the_first_thing_that_fits() {
+        let mut snapshot = snapshot_of(24, 4, &["x"]);
+        snapshot.command_line = Some(CommandLineView {
+            prefix: ':',
+            query: "save".to_owned(),
+            cursor: 4,
+            ghost: None,
+            trailing: vec!["ctrl-s".to_owned(), "ctrl-n: 9 more".to_owned()],
+            message: None,
+        });
+        assert_eq!(grid(&snapshot)[2].trim_end(), ":save             ctrl-s");
+
+        // With no room for the keybinding *and* what is already on the row, the
+        // count is not a smaller answer — nothing is painted rather than
+        // something misleading.
+        let mut narrow = snapshot_of(12, 4, &["x"]);
+        narrow.command_line = Some(CommandLineView {
+            prefix: ':',
+            query: "save all".to_owned(),
+            cursor: 8,
+            ghost: None,
+            trailing: vec!["ctrl-shift-s".to_owned()],
+            message: None,
+        });
+        assert_eq!(grid(&narrow)[2].trim_end(), ":save all");
+    }
+
+    #[test]
+    fn a_diagnostic_underline_keeps_the_colour_its_severity_gave_it() {
+        let mut snapshot = snapshot_of(12, 3, &["let x = 1;"]);
+        let error = hsla(0.0, 0.8, 0.5, 1.0);
+        if let Some(editor) = snapshot.editor.as_mut() {
+            editor.rows[0].spans = vec![StyledSpan {
+                range: 0..10,
+                style: SpanStyle {
+                    underline: Some(Underline { color: Some(error) }),
+                    ..Default::default()
+                },
+            }];
+        }
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 3));
+        render(&snapshot, &palette(), &mut buffer);
+        let cell = buffer.cell((0, 0)).expect("no cell");
+        assert!(cell.modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(cell.underline_color, palette().color(error));
+    }
+
+    #[test]
+    fn the_hardware_cursor_follows_whichever_surface_owns_the_keyboard() {
+        let mut snapshot = snapshot_of(40, 8, &["x"]);
+        snapshot.cursor = Some(CellPoint { column: 4, row: 0 });
+        assert_eq!(cursor(&snapshot).0, Some(CellPoint { column: 4, row: 0 }));
+
+        snapshot.command_line = Some(CommandLineView {
+            prefix: ':',
+            query: "wq".to_owned(),
+            cursor: 2,
+            ..Default::default()
+        });
+        let (position, shape) = cursor(&snapshot);
+        assert_eq!(position, Some(CellPoint { column: 3, row: 6 }));
+        assert_eq!(shape, CursorShape::Bar);
+
+        // An open list is in front of the `:` line as well as the editor.
+        snapshot.overlay = Some(finder("sna", vec![overlay_row("a.rs", "src")], "1/1"));
+        let (position, shape) = cursor(&snapshot);
+        assert_eq!(position, Some(CellPoint { column: 7, row: 1 }));
+        assert_eq!(shape, CursorShape::Bar);
+
+        // A surface with nothing to type in hides it rather than leaving it
+        // under a box.
+        if let Some(overlay) = snapshot.overlay.as_mut() {
+            overlay.query = None;
+            overlay.placement = OverlayPlacement::TopCentre;
+        }
+        assert_eq!(cursor(&snapshot).0, None);
     }
 }

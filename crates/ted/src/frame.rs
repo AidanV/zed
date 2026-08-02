@@ -28,11 +28,14 @@ use ratatui::backend::{Backend as _, CrosstermBackend};
 use theme::ActiveTheme as _;
 use util::ResultExt as _;
 
+use crate::actions::Surface;
 use crate::bootstrap::{self, Backend};
 use crate::command_line::{CommandLine, Effect, HostCommand, Update};
 use crate::config::{self, Config};
 use crate::explore;
+use crate::hover;
 use crate::input::keystroke_for;
+use crate::overlay::{self, Overlay};
 use crate::palette::{ColorDepth, Palette};
 use crate::platform::{TerminalPlatform, TerminalWindowState, set_window_grid};
 use crate::render::{render, reserved_rows};
@@ -70,7 +73,10 @@ pub fn run(options: Options) -> Result<()> {
     enter_terminal_mode()?;
     install_panic_hook();
 
-    set_window_grid(columns, rows.saturating_sub(reserved_rows(false, false, 0)));
+    set_window_grid(
+        columns,
+        rows.saturating_sub(reserved_rows(false, false, 0, 0)),
+    );
     let platform = std::rc::Rc::new(TerminalPlatform::new(columns, rows));
     let result = std::rc::Rc::new(std::cell::RefCell::new(Ok(())));
 
@@ -149,6 +155,11 @@ struct Session {
     columns: u16,
     rows: u16,
     command_line: Option<CommandLine>,
+    /// `ted`'s own list, while one is open. It owns the keyboard, so a key that
+    /// reaches it never reaches GPUI's dispatch tree (SPEC §24.2).
+    overlay: Option<Overlay>,
+    /// What `shift-k` asked for, until the next key dismisses it (SPEC §24.8).
+    hover: Option<hover::Panel>,
     /// Messages `ted` itself raised, cleared on the next keystroke so they stay
     /// transient (SPEC §13.3). Notifications the *backend* raised are read fresh
     /// each frame by `snapshot::backend_notifications`.
@@ -191,6 +202,8 @@ async fn drive(
         columns,
         rows,
         command_line: None,
+        overlay: None,
+        hover: None,
         messages: complaint.into_iter().collect(),
         busy_frames: BUSY_FRAMES_AFTER_INPUT,
     };
@@ -203,22 +216,36 @@ async fn drive(
             return Ok(());
         }
 
-        let command_line = session
-            .command_line
-            .as_ref()
-            .map(|command_line| command_line.view())
-            .or_else(|| search_line(&session, cx));
+        // What a surface asked for while the last frame's keystroke was being
+        // dispatched: a global action listener recorded it, and this is where it
+        // becomes a surface (SPEC §24.2).
+        if let Some(surface) = cx.update(crate::actions::take_request) {
+            open_surface(&mut session, surface, cx).await;
+        }
+        if let Some(overlay) = session.overlay.as_mut() {
+            overlay.poll();
+        }
+        if let Some(hover) = session.hover.as_mut() {
+            hover.poll();
+        }
+
+        let command_line = command_line_view(&session, cx).or_else(|| search_line(&session, cx));
         let prompt = window_state.pending_prompt();
+        let overlay = session.overlay.as_ref().map(Overlay::view);
 
         let mut notifications = session.messages.clone();
         notifications.extend(backend_notifications(&session, cx));
 
         // A line appearing or disappearing changes how much of the grid the
-        // window may use, and that is a resize like any other (SPEC §10.2).
+        // window may use, and that is a resize like any other (SPEC §10.2). An
+        // open overlay is not one of them: it floats over the editor's cells
+        // (SPEC §24.1).
+        let top_rows = cx.update(|cx| session.backend.tab_rows(cx));
         let wanted = reserved_rows(
             command_line.is_some(),
             prompt.is_some(),
             notifications.len(),
+            top_rows,
         );
         if wanted != reserved {
             reserved = wanted;
@@ -233,9 +260,18 @@ async fn drive(
 
         // A closed window is how a `workspace::CloseWindow` reaches this loop,
         // which is a normal way to quit rather than a failure.
-        let Ok(snapshot) =
-            build_snapshot(&session, reserved, command_line, prompt, notifications, cx)
-        else {
+        let Ok(snapshot) = build_snapshot(
+            &session,
+            Reserved {
+                rows: reserved,
+                top_rows,
+            },
+            command_line,
+            overlay,
+            prompt,
+            notifications,
+            cx,
+        ) else {
             return Ok(());
         };
         if tty.painted.as_ref() != Some(&snapshot) {
@@ -271,10 +307,13 @@ async fn drive(
         // into the query. Keeping up with auto-repeat is a matter of making the
         // frame cheap, not of dispatching more per frame.
         match event {
-            // The escape hatch, and the only way out without vim. With a
-            // command line open it cancels that instead, which is both what
-            // vim does and what stops a stray `:` from stranding the user.
-            Event::Key(key) if is_quit(&key) && session.command_line.is_none() => {
+            // The escape hatch, and the only way out without vim. With a command
+            // line or a list open it dismisses that instead, which is both what
+            // vim does and what stops a stray `:` or `ctrl-p` from stranding the
+            // user.
+            Event::Key(key)
+                if is_quit(&key) && session.command_line.is_none() && session.overlay.is_none() =>
+            {
                 return Ok(());
             }
             Event::Key(key) => {
@@ -346,17 +385,17 @@ async fn suspend_to(
 ) -> Result<()> {
     let (child, explore) = match command {
         HostCommand::Shell(command) => (suspend::Child::shell(&command), None),
-        HostCommand::Explore => match cx
-            .update(|cx| explore::prepare(&session.config, &session.backend, cx))
-        {
-            Ok((child, explore)) => (child, Some(explore)),
-            // Nothing has been handed over yet, so there is still a screen to
-            // say so on.
-            Err(error) => {
-                session.messages.push(format!("Explore: {error}"));
-                return Ok(());
+        HostCommand::Explore => {
+            match cx.update(|cx| explore::prepare(&session.config, &session.backend, cx)) {
+                Ok((child, explore)) => (child, Some(explore)),
+                // Nothing has been handed over yet, so there is still a screen to
+                // say so on.
+                Err(error) => {
+                    session.messages.push(format!("Explore: {error}"));
+                    return Ok(());
+                }
             }
-        },
+        }
     };
 
     let message = suspend::run(child, &tty.reader, &mut tty.terminal, cx).await?;
@@ -391,6 +430,17 @@ async fn handle_key(
     key: KeyEvent,
     cx: &mut AsyncApp,
 ) -> Result<Option<HostCommand>> {
+    // The panel dismisses on the next key, whatever that key goes on to do
+    // (SPEC §24.8).
+    session.hover = None;
+
+    // Exactly one owner per keystroke, and `ted`'s own surfaces sit in front of
+    // GPUI: a key that reaches an overlay never reaches the dispatch tree
+    // (SPEC §24.2).
+    if session.overlay.is_some() {
+        handle_overlay_key(session, key, cx).await;
+        return Ok(None);
+    }
     if session.command_line.is_some() {
         return handle_command_line_key(session, key, cx).await;
     }
@@ -421,6 +471,31 @@ async fn handle_key(
     Ok(None)
 }
 
+/// Everything an open list answers to (SPEC §24.2). Nothing here reaches GPUI:
+/// the overlay is in front of it for as long as it is open.
+async fn handle_overlay_key(session: &mut Session, key: KeyEvent, cx: &mut AsyncApp) {
+    let Some(overlay) = session.overlay.as_mut() else {
+        return;
+    };
+
+    match overlay.handle_key(&key) {
+        overlay::Update::Unchanged => {}
+        overlay::Update::QueryChanged => {
+            cx.update(|cx| overlay.refresh(&session.backend, cx));
+        }
+        // Leaving the editor exactly as it was, which is what makes `esc` a
+        // no-op rather than a state change (SPEC §24.6).
+        overlay::Update::Cancel => session.overlay = None,
+        overlay::Update::Confirm(split) => {
+            let opening = overlay.confirm(split, &session.backend, cx);
+            session.overlay = None;
+            if let Err(error) = opening.await {
+                session.messages.push(format!("could not open: {error}"));
+            }
+        }
+    }
+}
+
 async fn handle_command_line_key(
     session: &mut Session,
     key: KeyEvent,
@@ -439,15 +514,35 @@ async fn handle_command_line_key(
         }
         Update::Cancel => session.command_line = None,
         Update::Submit => {
+            // The bare number prompt has no interceptor behind it: it is the
+            // only go-to-line code `ted` has, and it exists only for a session
+            // with no `:` line at all (SPEC §24.5).
+            if let Some(line) = command_line.line_number() {
+                session.command_line = None;
+                if let Err(error) = crate::overlay::go_to_line(&session.backend, line, cx) {
+                    session.messages.push(format!("go to line: {error}"));
+                }
+                return Ok(None);
+            }
+
             let effect = command_line.selected_effect();
             let query = command_line.query().to_owned();
             session.command_line = None;
             match effect {
+                // The second place SPEC §24.2's table is consulted: `:ls`
+                // resolves inside vim's interceptor to `tab_switcher::ToggleAll`,
+                // an action no keymap pass ever saw, and dispatching it would
+                // open a modal `ted` cannot paint.
                 Some(Effect::Dispatch(action)) => {
-                    cx.update_window(session.backend.window.into(), |_, window, cx| {
-                        window.dispatch_action(action, cx);
-                    })
-                    .ok();
+                    match crate::actions::surface_for(action.as_ref()) {
+                        Some(surface) => open_surface(session, surface, cx).await,
+                        None => {
+                            cx.update_window(session.backend.window.into(), |_, window, cx| {
+                                window.dispatch_action(action, cx);
+                            })
+                            .ok();
+                        }
+                    }
                 }
                 Some(Effect::Host(command)) => return Ok(Some(command)),
                 None => session.messages.push(format!("not a command: :{query}")),
@@ -546,18 +641,22 @@ fn paint(
     snapshot: &ViewSnapshot,
     palette: &Palette,
 ) -> Result<()> {
+    // Not `snapshot.cursor` directly: while one of `ted`'s own surfaces owns the
+    // keyboard the cursor belongs in the field being typed in, and the renderer
+    // is what knows where that row is (SPEC §24.1).
+    let (position, shape) = crate::render::cursor(snapshot);
     terminal.draw(|frame| {
         render(snapshot, palette, frame.buffer_mut());
-        if let Some(cursor) = snapshot.cursor {
+        if let Some(cursor) = position {
             frame.set_cursor_position((cursor.column, cursor.row));
         }
     })?;
-    if snapshot.cursor.is_some() {
+    if position.is_some() {
         terminal.show_cursor().ok();
     } else {
         terminal.hide_cursor().ok();
     }
-    set_cursor_shape(snapshot.cursor_shape);
+    set_cursor_shape(shape);
     Ok(())
 }
 
@@ -594,10 +693,20 @@ fn backend_notifications(session: &Session, cx: &mut AsyncApp) -> Vec<String> {
     .unwrap_or_default()
 }
 
+/// How much of the grid `ted` kept for itself this frame, and how much of that
+/// sits above the editor — which the projection needs separately, because rows
+/// withheld at the top also shift every rect the editor reports (SPEC §24.7).
+#[derive(Clone, Copy)]
+struct Reserved {
+    rows: u16,
+    top_rows: u16,
+}
+
 fn build_snapshot(
     session: &Session,
-    reserved: u16,
+    reserved: Reserved,
     command_line: Option<CommandLineView>,
+    overlay: Option<crate::snapshot::OverlayView>,
     prompt: Option<PromptView>,
     notifications: Vec<String>,
     cx: &mut AsyncApp,
@@ -621,8 +730,15 @@ fn build_snapshot(
             crate::snapshot::Frame {
                 columns: session.columns,
                 rows: session.rows,
-                reserved_rows: reserved,
+                reserved_rows: reserved.rows,
+                top_rows: reserved.top_rows,
                 command_line,
+                overlay,
+                hover: session
+                    .hover
+                    .as_ref()
+                    .map(|hover| hover.contents().to_vec())
+                    .unwrap_or_default(),
                 prompt,
                 notifications,
                 workspace: &session.backend.workspace,
@@ -632,6 +748,54 @@ fn build_snapshot(
         )
     })
     .context("window closed while building a frame")
+}
+
+/// The `:` line as it is painted, with the keybinding for whatever `enter` would
+/// dispatch: `Window::keystroke_text_for` needs a window, and the selected
+/// candidate changes without a refresh (SPEC §24.3).
+fn command_line_view(session: &Session, cx: &mut AsyncApp) -> Option<CommandLineView> {
+    let command_line = session.command_line.as_ref()?;
+    let mut view = command_line.view();
+    if let Some(action) = command_line.selected_action()
+        && let Ok(Some(keystrokes)) =
+            cx.update_window(session.backend.window.into(), |_, window, _| {
+                window
+                    .highest_precedence_binding_for_action(action.as_ref())
+                    .map(|binding| {
+                        binding
+                            .keystrokes()
+                            .iter()
+                            .map(|keystroke| keystroke.inner().unparse())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+            })
+    {
+        // Ahead of the count, because showing it is what teaches you that
+        // `ctrl-s` was faster than typing `:save` out.
+        view.trailing.insert(0, keystrokes);
+    }
+    Some(view)
+}
+
+/// Opens whichever of `ted`'s own surfaces an action asked for (SPEC §24.2).
+async fn open_surface(session: &mut Session, surface: Surface, cx: &mut AsyncApp) {
+    match surface {
+        Surface::Finder | Surface::Switcher => {
+            session.overlay = cx.update(|cx| Overlay::open(surface, &session.backend, cx));
+        }
+        Surface::GoToLine => session.command_line = Some(CommandLine::go_to_line()),
+        Surface::Hover => {
+            let window = session.backend.window.into();
+            session.hover = cx
+                .update_window(window, |_, window, cx| {
+                    hover::Panel::open(&session.backend, window, cx)
+                })
+                .ok()
+                .flatten()
+                .filter(|panel| !panel.is_empty());
+        }
+    }
 }
 
 /// Projects the pane's `BufferSearchBar` into `ted`'s bottom line. Vim's `/`
@@ -650,9 +814,8 @@ fn search_line(session: &Session, cx: &mut AsyncApp) -> Option<CommandLineView> 
             prefix: '/',
             cursor: query.len(),
             query,
-            completions: Vec::new(),
-            selected_completion: None,
             message: Some(format!("{index}/{total}")),
+            ..Default::default()
         })
     })
 }

@@ -482,6 +482,217 @@ fn open_with(name: &str, contents: &str, extra: &[&str]) -> anyhow::Result<(Fixt
     Ok((fixture, terminal))
 }
 
+/// Opens `main.rs` *and* the directory around it, so the finder has a real
+/// worktree to search: a lone file path makes a single-file worktree containing
+/// nothing else.
+fn open_project(name: &str, files: &[(&str, &str)]) -> anyhow::Result<(Fixture, Terminal)> {
+    let fixture = Fixture::new(name, "fn main() {}\n")?;
+    for (path, contents) in files {
+        std::fs::write(fixture.path(path), contents)?;
+    }
+    let mut terminal = Terminal::open(&fixture.file(), &fixture.data_dir(), &["."])?;
+    terminal.settle(STARTUP);
+    Ok((fixture, terminal))
+}
+
+/// `ctrl-p`, which the keymap binds to `file_finder::Toggle` and SPEC §24.2
+/// retargets onto `ted`'s own action.
+const CTRL_P: &str = "\u{10}";
+
+/// SPEC §24.4, and the first half of §24.10's acceptance: find a file by name
+/// and open it, in a surface `ted` paints itself.
+#[test]
+fn the_finder_opens_a_file_by_name() -> anyhow::Result<()> {
+    let (_fixture, mut terminal) = open_project("finder", &[("beta.rs", "fn beta() {}\n")])?;
+
+    terminal.send(CTRL_P);
+    assert!(
+        terminal.row(0).contains("files"),
+        "the finder did not open: {:?}",
+        terminal.row(0)
+    );
+
+    terminal.send("beta");
+    assert!(
+        terminal.row(3).contains("beta.rs"),
+        "the match is not in the list: {:?}",
+        terminal.row(3)
+    );
+
+    terminal.send("\r");
+    assert!(
+        terminal.status().contains("beta.rs"),
+        "the chosen file did not open: {:?}",
+        terminal.status()
+    );
+    Ok(())
+}
+
+/// SPEC §24.2: `esc` dismisses the list and leaves the editor exactly as it was,
+/// rather than quitting `ted` or opening anything.
+#[test]
+fn escape_dismisses_the_finder_and_changes_nothing() -> anyhow::Result<()> {
+    let (_fixture, mut terminal) = open_project("finder-escape", &[("beta.rs", "fn beta() {}\n")])?;
+
+    terminal.send(CTRL_P);
+    terminal.send("beta");
+    terminal.send("\u{1b}");
+
+    assert!(
+        !terminal.exited(Duration::from_millis(500)),
+        "dismissing the finder quit ted"
+    );
+    assert!(
+        terminal.status().contains("main.rs"),
+        "the editor did not come back: {:?}",
+        terminal.status()
+    );
+    assert!(
+        terminal.row(0).ends_with("fn main() {}"),
+        "the buffer was not repainted under the box: {:?}",
+        terminal.row(0)
+    );
+    Ok(())
+}
+
+/// SPEC §24.6 and §24.7: with more than one item open, the strip says what is
+/// there and the switcher says which of them you were in last. `:ls` is the case
+/// that forces the surface table to be consulted at dispatch as well as at
+/// keymap load — it arrives as an action no keymap pass ever saw.
+#[test]
+fn the_tab_strip_and_the_switcher_show_what_else_is_open() -> anyhow::Result<()> {
+    let (_fixture, mut terminal) = open_project("switcher", &[("beta.rs", "fn beta() {}\n")])?;
+
+    terminal.send(CTRL_P);
+    terminal.send("beta");
+    terminal.send("\r");
+
+    let strip = terminal.row(0);
+    assert!(
+        strip.contains("main.rs") && strip.contains("beta.rs"),
+        "the tab strip does not show both items: {strip:?}"
+    );
+    assert!(
+        terminal.row(1).ends_with("fn beta() {}"),
+        "the editor was not shifted down by the strip: {:?}",
+        terminal.row(1)
+    );
+
+    terminal.send(":ls\r");
+    assert!(
+        terminal.row(2).contains("beta.rs"),
+        "the switcher does not lead with the buffer you are in: {:?}",
+        terminal.row(2)
+    );
+    assert!(
+        terminal.row(3).contains("main.rs"),
+        "the switcher does not offer the one you came from: {:?}",
+        terminal.row(3)
+    );
+
+    // The selection starts on the second row, so `enter` goes back.
+    terminal.send("\r");
+    assert!(
+        terminal.status().contains("main.rs"),
+        "the switcher did not switch: {:?}",
+        terminal.status()
+    );
+
+    // `:q` closes a tab and the rest take its place (SPEC §24.7); with one item
+    // left there is nothing for a strip to say.
+    terminal.send(":q\r");
+    assert!(
+        !terminal.exited(Duration::from_millis(500)),
+        "closing one of two items quit ted"
+    );
+    assert!(
+        terminal.row(0).ends_with("fn beta() {}"),
+        "the strip did not go when the second item did: {:?}",
+        terminal.row(0)
+    );
+    Ok(())
+}
+
+/// SPEC §24.8: `shift-k` is `editor::Hover`, retargeted onto `ted`'s own panel
+/// because the editor's popover is a view `ted` cannot read. With nothing to say
+/// about the position, the panel never appears — an empty box over the code
+/// would be worse than no answer — and the editor keeps the keyboard.
+#[test]
+fn shift_k_with_nothing_to_say_puts_nothing_on_screen() -> anyhow::Result<()> {
+    let (_fixture, mut terminal) = open("hover", "alpha\nbeta\n")?;
+    let before = terminal.row(0);
+
+    terminal.send("K");
+    assert_eq!(
+        terminal.row(0),
+        before,
+        "something was painted over the code"
+    );
+    assert!(
+        terminal.row(1).ends_with("beta"),
+        "the row under the cursor was covered: {:?}",
+        terminal.row(1)
+    );
+
+    terminal.send("j");
+    assert!(
+        terminal.status().contains("2:1"),
+        "the editor did not keep the keyboard: {:?}",
+        terminal.status()
+    );
+    Ok(())
+}
+
+/// SPEC §24.5: the only go-to-line code `ted` has. With vim, `:42` parses in
+/// vim's own interceptor and there is nothing to build; without it there is no
+/// `:` line at all, and `ctrl-g` would otherwise open a modal `ted` cannot
+/// paint.
+#[test]
+fn ctrl_g_jumps_to_a_line_without_vim() -> anyhow::Result<()> {
+    let contents = (1..=40)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    let (_fixture, mut terminal) = open_with("go-to-line", &contents, &["--no-vim"])?;
+
+    terminal.send("\u{7}");
+    terminal.send("20");
+    assert!(
+        terminal.row(ROWS - 2).starts_with(":20"),
+        "no number prompt: {:?}",
+        terminal.row(ROWS - 2)
+    );
+
+    terminal.send("\r");
+    assert!(
+        terminal.status().trim_end().ends_with("20:1"),
+        "the cursor did not jump: {:?}",
+        terminal.status()
+    );
+    Ok(())
+}
+
+/// SPEC §24.3: the rest of the best-matching command, dimmed after the cursor,
+/// with `right` accepting it. vim's interceptor reports `:w` as `:write`, so the
+/// tail is the part the user did not type.
+#[test]
+fn the_colon_line_completes_with_ghost_text() -> anyhow::Result<()> {
+    let (fixture, mut terminal) = open("ghost", "alpha\nbeta\n")?;
+
+    terminal.send("x");
+    terminal.send(":w");
+    assert!(
+        terminal.row(ROWS - 2).starts_with(":write"),
+        "no ghost text on the command line: {:?}",
+        terminal.row(ROWS - 2)
+    );
+
+    // `right` accepts the ghost into the query, and the query is what runs.
+    terminal.send("\u{1b}[C");
+    terminal.send("\r");
+    assert_eq!(fixture.contents(), "lpha\nbeta\n");
+    Ok(())
+}
+
 #[test]
 fn a_file_is_drawn_with_a_gutter_and_a_status_line() -> anyhow::Result<()> {
     let (_fixture, terminal) = open("draw", "fn main() {\n    let x = 1;\n}\n")?;
@@ -842,7 +1053,10 @@ fn a_resize_while_suspended_is_recovered_and_a_failure_is_reported() -> anyhow::
     terminal.send(" ");
     if terminal.status().is_empty() {
         let rows: Vec<String> = (0..20).map(|r| terminal.row(r)).collect();
-        panic!("ROWS: {rows:#?}\nAFTER KEY: {:?}", terminal.transcript_since(mark));
+        panic!(
+            "ROWS: {rows:#?}\nAFTER KEY: {:?}",
+            terminal.transcript_since(mark)
+        );
     }
 
     assert!(
@@ -926,9 +1140,12 @@ fn explore_opens_what_the_file_manager_chose() -> anyhow::Result<()> {
     // Which of the two ends up active is not something one call to `open_paths`
     // promises, so cycle the pane and assert on what is in it. `main.rs` is
     // still there too, so three steps see everything.
+    //
+    // Row 1, not row 0: three items in the pane means a tab strip, and the
+    // editor's rows start under it (SPEC §24.7).
     let mut opened = Vec::new();
     for _ in 0..3 {
-        opened.push((terminal.status(), terminal.row(0)));
+        opened.push((terminal.status(), terminal.row(1)));
         terminal.send(":bnext\r");
     }
 

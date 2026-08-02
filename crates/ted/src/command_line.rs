@@ -9,6 +9,7 @@
 
 use command_palette_hooks::{CommandPaletteFilter, GlobalCommandPaletteInterceptor};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use fuzzy_nucleo::StringMatchCandidate;
 use gpui::{Action, App, AsyncApp, Entity, WeakEntity};
 use workspace::Workspace;
 
@@ -61,7 +62,37 @@ struct Completion {
     effect: Effect,
 }
 
+/// What the rest of the line says about the selected candidate (SPEC §24.3).
+enum Ghost {
+    /// The query is a prefix of the command, so `right` accepts the rest of it.
+    Rest(String),
+    /// It is not, so the line describes the candidate instead. There is nothing
+    /// to accept: appending a description would not be a command.
+    Description(String),
+}
+
+impl Ghost {
+    fn text(&self) -> &str {
+        match self {
+            Self::Rest(text) | Self::Description(text) => text,
+        }
+    }
+}
+
+/// Which line this is. They are drawn the same and share every editing key; what
+/// differs is what is behind them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Resolved through the host table and then vim's interceptor (SPEC §13.2).
+    Command,
+    /// A bare number, with no interceptor behind it at all. The only go-to-line
+    /// code `ted` has, and it exists only for a `--no-vim` session, where there
+    /// is no `:` line for `:42` to be typed on (SPEC §24.5).
+    Number,
+}
+
 pub struct CommandLine {
+    mode: Mode,
     /// The range vim would have seeded the palette with (`'<,'>`, `.,.+4`, or
     /// empty), which is part of the query the interceptor parses.
     prefix: String,
@@ -77,6 +108,7 @@ impl CommandLine {
     pub fn new(prefix: String) -> Self {
         let cursor = prefix.len();
         Self {
+            mode: Mode::Command,
             prefix: prefix.clone(),
             query: prefix,
             cursor,
@@ -86,18 +118,65 @@ impl CommandLine {
         }
     }
 
+    pub fn go_to_line() -> Self {
+        Self {
+            mode: Mode::Number,
+            ..Self::new(String::new())
+        }
+    }
+
+    /// The line the user typed, when this is the number prompt and they typed
+    /// one.
+    pub fn line_number(&self) -> Option<u32> {
+        (self.mode == Mode::Number)
+            .then(|| self.query.trim().parse().ok())
+            .flatten()
+    }
+
     pub fn view(&self) -> CommandLineView {
         CommandLineView {
             prefix: ':',
             query: self.query.clone(),
             cursor: self.cursor,
-            completions: self
-                .completions
-                .iter()
-                .map(|completion| completion.label.clone())
-                .collect(),
-            selected_completion: self.selected,
+            ghost: self.ghost().map(|ghost| ghost.text().to_owned()),
+            trailing: self.candidate_count().into_iter().collect(),
             message: self.message.clone(),
+        }
+    }
+
+    /// The rest of the selected candidate, or a description of it when the query
+    /// is not a prefix of one.
+    fn ghost(&self) -> Option<Ghost> {
+        if self.mode == Mode::Number {
+            return None;
+        }
+        let label = &self.completions.get(self.selected?)?.label;
+        // vim's interceptor reports its commands with the `:` the user already
+        // typed to open this line, and `ted`'s query does not carry it.
+        let command = label.strip_prefix(':').unwrap_or(label);
+        match command.get(..self.query.len()) {
+            Some(head) if head.eq_ignore_ascii_case(&self.query) && !self.query.is_empty() => {
+                Some(Ghost::Rest(command[self.query.len()..].to_owned()))
+            }
+            _ => Some(Ghost::Description(format!(" — {label}"))),
+        }
+    }
+
+    /// How many other candidates the matcher found, which is what the right-hand
+    /// end of the line says when the selected action has no keybinding to show
+    /// there instead.
+    fn candidate_count(&self) -> Option<String> {
+        let others = self.completions.len().checked_sub(1).filter(|&n| n > 0)?;
+        Some(format!("ctrl-n: {others} more"))
+    }
+
+    /// The action `enter` would dispatch, for the frame loop to look a
+    /// keybinding up for — `Window::keystroke_text_for` needs a window, and the
+    /// selected candidate changes without a refresh.
+    pub fn selected_action(&self) -> Option<Box<dyn Action>> {
+        match self.completions.get(self.selected?)?.effect.clone() {
+            Effect::Dispatch(action) => Some(action),
+            Effect::Host(_) => None,
         }
     }
 
@@ -148,6 +227,20 @@ impl CommandLine {
                     .unwrap_or(0);
                 Update::Unchanged
             }
+            // At the end of the query `right` accepts the ghost, which is the
+            // only way the line completes anything; anywhere else it is a
+            // cursor movement like any other (SPEC §24.3).
+            KeyCode::Right if self.cursor >= self.query.len() => {
+                let Some(Ghost::Rest(rest)) = self.ghost() else {
+                    return Update::Unchanged;
+                };
+                if rest.is_empty() {
+                    return Update::Unchanged;
+                }
+                self.query.push_str(&rest);
+                self.cursor = self.query.len();
+                Update::QueryChanged
+            }
             KeyCode::Right => {
                 self.cursor = self.query[self.cursor..]
                     .char_indices()
@@ -164,15 +257,23 @@ impl CommandLine {
                 self.cursor = self.query.len();
                 Update::Unchanged
             }
-            KeyCode::Tab | KeyCode::Down => {
+            // `ctrl-n` / `ctrl-p` move a selection here exactly as they do in
+            // `ted`'s other surfaces, and only those do. `up`/`down` stay
+            // unbound rather than being reserved for a command history `ted`
+            // does not keep (SPEC §24.2, §24.3).
+            KeyCode::Char('n') if control => {
                 self.cycle_completion(1);
                 Update::Unchanged
             }
-            KeyCode::BackTab | KeyCode::Up => {
+            KeyCode::Char('p') if control => {
                 self.cycle_completion(-1);
                 Update::Unchanged
             }
-            KeyCode::Char(character) if !control => {
+            // A number prompt takes numbers. Anything else typed at it is a key
+            // that was meant for the editor behind it.
+            KeyCode::Char(character)
+                if !control && (self.mode == Mode::Command || character.is_ascii_digit()) =>
+            {
                 self.query.insert(self.cursor, character);
                 self.cursor += character.len_utf8();
                 Update::QueryChanged
@@ -206,6 +307,9 @@ impl CommandLine {
     /// `ted` falls back to matching action names, which is the same policy Zed's
     /// own palette applies.
     pub async fn refresh(&mut self, workspace: WeakEntity<Workspace>, cx: &mut AsyncApp) {
+        if self.mode == Mode::Number {
+            return;
+        }
         let host = host_command(&self.query);
         // `:!` answers its query alone: everything vim resolves for one is aimed
         // at a terminal panel `ted` does not have. `:Explore` shares its letters
@@ -291,22 +395,23 @@ fn host_completion(command: HostCommand) -> Completion {
     }
 }
 
-/// Actions whose humanized name contains every character of `query` in order,
-/// excluding the ones the palette filter hides (which is where SPEC §5.5's
-/// font-size actions are suppressed).
+/// Actions matching `query`, ranked by the same matcher and the same arguments
+/// Zed's own palette uses, so `:w` ghosts whatever `:w` would have selected in
+/// GUI Zed (SPEC §24.3).
+///
+/// Ordering *is* the feature here: the line shows one candidate at a time, so
+/// which one the matcher puts first is the whole of what the user sees. Actions
+/// the palette filter hides — SPEC §5.5's font-size actions, and the modals
+/// SPEC §24.2 replaced — are left out, the same policy the palette applies.
 fn matching_action_names(query: &str, cx: &mut App) -> Vec<Completion> {
-    let normalized = command_palette::normalize_action_query(query).to_lowercase();
+    let normalized = command_palette::normalize_action_query(query);
     if normalized.is_empty() {
         return Vec::new();
     }
 
-    let names = cx.all_action_names().to_vec();
-    let mut matches = Vec::new();
-    for name in names {
-        let humanized = command_palette::humanize_action_name(name);
-        if !is_subsequence(&normalized, &humanized.to_lowercase()) {
-            continue;
-        }
+    let mut actions = Vec::new();
+    let mut candidates = Vec::new();
+    for name in cx.all_action_names().to_vec() {
         let Ok(action) = cx.build_action(name, None) else {
             continue;
         };
@@ -315,21 +420,28 @@ fn matching_action_names(query: &str, cx: &mut App) -> Vec<Completion> {
         {
             continue;
         }
-        matches.push(Completion {
-            label: humanized,
-            effect: Effect::Dispatch(action),
-        });
+        candidates.push(StringMatchCandidate::new(
+            actions.len(),
+            command_palette::humanize_action_name(name),
+        ));
+        actions.push(action);
     }
 
-    matches.sort_by_key(|completion| completion.label.len());
-    matches
-}
-
-fn is_subsequence(needle: &str, haystack: &str) -> bool {
-    let mut haystack = haystack.chars();
-    needle
-        .chars()
-        .all(|wanted| haystack.any(|candidate| candidate == wanted))
+    fuzzy_nucleo::match_strings(
+        &candidates,
+        &normalized,
+        fuzzy_nucleo::Case::Smart,
+        fuzzy_nucleo::LengthPenalty::On,
+        MAX_COMPLETIONS,
+    )
+    .into_iter()
+    .filter_map(|found| {
+        Some(Completion {
+            label: found.string.to_string(),
+            effect: Effect::Dispatch(actions.get(found.candidate_id)?.boxed_clone()),
+        })
+    })
+    .collect()
 }
 
 /// The prefix vim's own `:` bindings would have used, consuming the pending
@@ -459,10 +571,78 @@ mod tests {
         assert_eq!(host_command(""), None);
     }
 
+    /// Stands in for what `refresh` would have put there, so the ghost's own
+    /// rules can be exercised without an interceptor or an `App`.
+    fn with_candidates(query: &str, labels: &[&str]) -> CommandLine {
+        let mut line = CommandLine::new(String::new());
+        for character in query.chars() {
+            line.handle_key(&key(KeyCode::Char(character)));
+        }
+        line.completions = labels
+            .iter()
+            .map(|label| Completion {
+                label: (*label).to_owned(),
+                effect: Effect::Host(HostCommand::Explore),
+            })
+            .collect();
+        line.selected = (!labels.is_empty()).then_some(0);
+        line
+    }
+
     #[test]
-    fn subsequence_matching_is_order_sensitive() {
-        assert!(is_subsequence("wq", "write quit"));
-        assert!(is_subsequence("save", "workspace: save"));
-        assert!(!is_subsequence("qw", "write quit"));
+    fn the_ghost_is_the_rest_of_a_command_the_query_starts() {
+        let line = with_candidates("w", &[":wq"]);
+        assert_eq!(line.view().ghost.as_deref(), Some("q"));
+    }
+
+    #[test]
+    fn a_candidate_the_query_does_not_start_is_described_instead() {
+        let line = with_candidates("save", &["workspace: save all"]);
+        assert_eq!(line.view().ghost.as_deref(), Some(" — workspace: save all"));
+    }
+
+    #[test]
+    fn right_accepts_a_ghost_that_completes_and_nothing_else() {
+        let mut line = with_candidates("w", &[":wq"]);
+        assert_eq!(line.handle_key(&key(KeyCode::Right)), Update::QueryChanged);
+        assert_eq!(line.query(), "wq");
+
+        let mut described = with_candidates("save", &["workspace: save all"]);
+        assert_eq!(
+            described.handle_key(&key(KeyCode::Right)),
+            Update::Unchanged,
+            "a description is not something to accept"
+        );
+        assert_eq!(described.query(), "save");
+    }
+
+    #[test]
+    fn right_inside_the_query_still_moves_the_cursor() {
+        let mut line = with_candidates("wq", &[":wq"]);
+        line.handle_key(&key(KeyCode::Home));
+        assert_eq!(line.handle_key(&key(KeyCode::Right)), Update::Unchanged);
+        assert_eq!(line.cursor, 1);
+        assert_eq!(line.query(), "wq");
+    }
+
+    #[test]
+    fn only_ctrl_n_and_ctrl_p_cycle_the_candidates() {
+        let mut line = with_candidates("w", &[":wq", ":w!", ":write"]);
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Tab] {
+            line.handle_key(&key(code));
+            assert_eq!(line.selected, Some(0), "{code:?} cycled the candidates");
+        }
+
+        let control = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        line.handle_key(&control);
+        assert_eq!(line.selected, Some(1));
+        assert_eq!(line.view().ghost.as_deref(), Some("!"));
+    }
+
+    #[test]
+    fn the_line_says_how_many_other_candidates_there_are() {
+        let line = with_candidates("w", &[":wq", ":w!", ":write"]);
+        assert_eq!(line.view().trailing, vec!["ctrl-n: 2 more".to_owned()]);
+        assert!(with_candidates("w", &[":wq"]).view().trailing.is_empty());
     }
 }

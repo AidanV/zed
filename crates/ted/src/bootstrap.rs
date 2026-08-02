@@ -106,6 +106,15 @@ impl Backend {
             .all(|pane| pane.read(cx).items_len() == 0)
     }
 
+    /// The one row `ted` paints *above* the editor, and only when the pane has
+    /// more than one item for it to show (SPEC §24.7). The single answer both
+    /// the reserved-row count and the projection go by, so the window's size and
+    /// the rects painted inside it cannot disagree about it.
+    pub fn tab_rows(&self, cx: &App) -> u16 {
+        let items = self.workspace.read(cx).active_pane().read(cx).items_len();
+        u16::from(items > 1)
+    }
+
     pub fn active_pane_search_bar(&self, cx: &App) -> Option<Entity<BufferSearchBar>> {
         self.workspace
             .read(cx)
@@ -190,6 +199,7 @@ pub fn init(vim: bool, cx: &mut App) -> Result<Arc<AppState>> {
     if vim {
         vim::init(cx);
     }
+    crate::actions::init(cx);
 
     // Again, and this time after `vim::init`: vim installs the `:` interceptor
     // (§13.2) from a `SettingsStore` observer, and an observer only runs when
@@ -256,12 +266,16 @@ fn load_keymap(vim: bool, cx: &mut App) -> Result<()> {
 
     if let Some(user_keymap) = std::fs::read_to_string(paths::keymap_file()).log_err() {
         match KeymapFile::load(&user_keymap, cx) {
-            settings::KeymapFileLoadResult::Success { key_bindings } => cx.bind_keys(key_bindings),
+            settings::KeymapFileLoadResult::Success { mut key_bindings } => {
+                crate::actions::retarget(&mut key_bindings, cx);
+                cx.bind_keys(key_bindings);
+            }
             settings::KeymapFileLoadResult::SomeFailedToLoad {
-                key_bindings,
+                mut key_bindings,
                 error_message,
             } => {
                 log::warn!("some bindings in keymap.json could not be loaded: {error_message}");
+                crate::actions::retarget(&mut key_bindings, cx);
                 cx.bind_keys(key_bindings);
             }
             settings::KeymapFileLoadResult::JsonParseFailure { error } => {
@@ -281,12 +295,19 @@ fn bind_asset_keymap(path: &str, source: KeybindSource, cx: &mut App) -> Result<
     for binding in &mut bindings {
         binding.set_meta(source.meta());
     }
+    // After the source is stamped, because retargeting carries it over: a
+    // rewritten binding is the same binding with a different action at the end
+    // of it (SPEC §24.2).
+    crate::actions::retarget(&mut bindings, cx);
     cx.bind_keys(bindings);
     Ok(())
 }
 
-/// Keeps the font-size actions out of the `:` line's completions, which resolve
-/// through the same `CommandPaletteFilter` Zed's palette consults (SPEC §5.5).
+/// Keeps out of the `:` line's completions what cannot work there: the
+/// font-size actions, which would move `CELL` under a window sized in the old
+/// one (SPEC §5.5), and every action that only ever drove a modal `ted` has
+/// replaced with a surface of its own (SPEC §24.2). Both resolve through the
+/// same `CommandPaletteFilter` Zed's palette consults.
 fn hide_filtered_actions(cx: &mut App) {
     let hidden = [
         TypeId::of::<IncreaseBufferFontSize>(),
@@ -295,6 +316,9 @@ fn hide_filtered_actions(cx: &mut App) {
     ];
     command_palette_hooks::CommandPaletteFilter::update_global(cx, |filter, _| {
         filter.hide_action_types(&hidden);
+        for namespace in crate::actions::REPLACED_NAMESPACES {
+            filter.hide_namespace(namespace);
+        }
     });
 }
 
