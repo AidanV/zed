@@ -60,6 +60,7 @@ pub struct ViewSnapshot {
     pub editor: Option<EditorView>,
     pub status: StatusView,
     pub command_line: Option<CommandLineView>,
+    pub prompt: Option<PromptView>,
     pub notifications: Vec<String>,
     /// Where to park the terminal's hardware cursor. SPEC §7 places the real
     /// cursor rather than drawing one, so the terminal blinks it and screen
@@ -246,6 +247,17 @@ pub struct CommandLineView {
     pub message: Option<String>,
 }
 
+/// A question GPUI asked the window, waiting on an answer (SPEC §13.3).
+///
+/// The answers are numbered rather than laid out as buttons because a terminal
+/// has no pointer: the number is the whole interaction.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PromptView {
+    pub message: String,
+    pub detail: Option<String>,
+    pub answers: Vec<String>,
+}
+
 /// Everything the projection needs that `ted` — not Zed — is the source of.
 pub struct Frame<'a> {
     pub columns: u16,
@@ -254,6 +266,7 @@ pub struct Frame<'a> {
     /// (SPEC §10.2). The editor's rect can never reach into them.
     pub reserved_rows: u16,
     pub command_line: Option<CommandLineView>,
+    pub prompt: Option<PromptView>,
     pub notifications: Vec<String>,
     pub workspace: &'a Entity<Workspace>,
 }
@@ -299,6 +312,7 @@ pub fn build(frame: Frame<'_>, window: &mut Window, cx: &mut App) -> ViewSnapsho
             rows: frame.rows,
             status,
             command_line: frame.command_line,
+            prompt: frame.prompt,
             notifications,
             ..Default::default()
         };
@@ -315,6 +329,7 @@ pub fn build(frame: Frame<'_>, window: &mut Window, cx: &mut App) -> ViewSnapsho
             rows: frame.rows,
             status,
             command_line: frame.command_line,
+            prompt: frame.prompt,
             notifications,
             ..Default::default()
         };
@@ -334,6 +349,7 @@ pub fn build(frame: Frame<'_>, window: &mut Window, cx: &mut App) -> ViewSnapsho
 
     snapshot.status = status;
     snapshot.command_line = frame.command_line;
+    snapshot.prompt = frame.prompt;
     snapshot.notifications = notifications;
     snapshot
 }
@@ -385,6 +401,7 @@ pub fn for_editor(
             ..Default::default()
         },
         command_line: None,
+        prompt: None,
         notifications: Vec::new(),
         cursor,
         cursor_shape,

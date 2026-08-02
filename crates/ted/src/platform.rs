@@ -4,6 +4,7 @@
 //! real.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use gpui::{
 };
 
 use crate::cell::grid_size;
+use crate::snapshot::PromptView;
 use crate::text_system::CellTextSystem;
 
 /// The GPUI window's size in cells, packed as `columns << 16 | rows`.
@@ -486,6 +488,13 @@ pub struct TerminalWindowState {
     title: RefCell<Option<String>>,
     is_fullscreen: Cell<bool>,
     atlas: Arc<TerminalAtlas>,
+    /// Questions GPUI is waiting on answers to (SPEC §13.3), oldest first.
+    ///
+    /// A queue rather than a slot because nothing stops a second prompt being
+    /// raised while the first is unanswered, and replacing the first would
+    /// drop its sender — which the caller reads as "cancelled" without the
+    /// user ever having seen the question.
+    prompts: RefCell<VecDeque<PendingPrompt>>,
     on_request_frame: RefCell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
     on_input: RefCell<Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>>,
     on_active_status_change: RefCell<Option<Box<dyn FnMut(bool)>>>,
@@ -516,6 +525,7 @@ impl TerminalWindowState {
             title: RefCell::new(None),
             is_fullscreen: Cell::new(false),
             atlas: Arc::new(TerminalAtlas::default()),
+            prompts: RefCell::new(VecDeque::new()),
             on_request_frame: RefCell::new(None),
             on_input: RefCell::new(None),
             on_active_status_change: RefCell::new(None),
@@ -548,6 +558,35 @@ impl TerminalWindowState {
     /// inside the callback whether the window is dirty enough to redraw.
     pub fn request_frame(&self) {
         self.invoke_on_request_frame(RequestFrameOptions::default());
+    }
+
+    /// The question the user is being asked, if any (SPEC §13.3). Read once a
+    /// frame by the frame loop, which is what paints it.
+    pub fn pending_prompt(&self) -> Option<PromptView> {
+        self.prompts
+            .borrow()
+            .front()
+            .map(|prompt| prompt.view.clone())
+    }
+
+    /// Answers the oldest unanswered prompt with the answer at `index`, which
+    /// resumes whatever asked the question.
+    ///
+    /// Out-of-range indices are ignored rather than clamped: they can only come
+    /// from a keystroke that names an answer the user cannot see.
+    pub fn answer_prompt(&self, index: usize) {
+        let prompt = {
+            let mut prompts = self.prompts.borrow_mut();
+            match prompts.front() {
+                Some(prompt) if index < prompt.view.answers.len() => prompts.pop_front(),
+                _ => None,
+            }
+        };
+        // Outside the borrow: the send wakes the task that was awaiting the
+        // answer, and that task is free to raise another prompt.
+        if let Some(prompt) = prompt {
+            prompt.answer.send(index).ok();
+        }
     }
 
     /// Fires the `on_active_status_change` callback with `true`. Must be
@@ -607,6 +646,13 @@ impl TerminalWindowState {
             *self.on_active_status_change.borrow_mut() = Some(callback);
         }
     }
+}
+
+/// A question raised through `PlatformWindow::prompt`, paired with the sender
+/// that answers it.
+struct PendingPrompt {
+    view: PromptView,
+    answer: oneshot::Sender<usize>,
 }
 
 /// GPUI's window handle. Wraps the shared `TerminalWindowState` so that
@@ -688,12 +734,36 @@ impl PlatformWindow for TerminalWindow {
     fn prompt(
         &self,
         _level: PromptLevel,
-        _msg: &str,
-        _detail: Option<&str>,
-        _answers: &[PromptButton],
+        message: &str,
+        detail: Option<&str>,
+        answers: &[PromptButton],
     ) -> Option<oneshot::Receiver<usize>> {
-        // Fall back to GPUI's own rendered prompts (SPEC §13).
-        None
+        // Never `None`, which is what asks GPUI to render its own prompt view
+        // instead: that view is an element tree inside the window, and `ted`
+        // projects only the editor's (SPEC §10.2), so it would take focus
+        // without ever being painted — an unanswerable question, and the editor
+        // dead to input until it is answered. Answering here is `ted`'s job
+        // because `ted` owns the screen (SPEC §13.3).
+        let (sender, receiver) = oneshot::channel();
+        let answers: Vec<String> = answers
+            .iter()
+            .map(|answer| answer.label().to_string())
+            .collect();
+        self.0.prompts.borrow_mut().push_back(PendingPrompt {
+            view: PromptView {
+                message: message.to_owned(),
+                detail: detail.map(str::to_owned),
+                // A prompt with no answers could never be dismissed. GPUI does
+                // not raise one, but the type allows it.
+                answers: if answers.is_empty() {
+                    vec!["OK".to_owned()]
+                } else {
+                    answers
+                },
+            },
+            answer: sender,
+        });
+        Some(receiver)
     }
 
     fn activate(&self) {}

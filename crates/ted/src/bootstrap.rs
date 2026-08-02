@@ -191,6 +191,16 @@ pub fn init(vim: bool, cx: &mut App) -> Result<Arc<AppState>> {
         vim::init(cx);
     }
 
+    // Again, and this time after `vim::init`: vim installs the `:` interceptor
+    // (§13.2) from a `SettingsStore` observer, and an observer only runs when
+    // the store *changes* — never for the value it already holds. The override
+    // above ran before `vim::init` registered that observer, so without a
+    // second settings change here the interceptor is installed only if
+    // something else happens to touch settings later (opening a file with a
+    // language does; opening a plain-text one does not), and until it is, `:w`
+    // and `:q` fall through to matching action names and quietly do nothing.
+    apply_settings_override(vim, cx)?;
+
     hide_filtered_actions(cx);
     install_pane_search_bars(cx);
     load_keymap(vim, cx)?;

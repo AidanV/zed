@@ -507,8 +507,10 @@ with the no-op callbacks made real. It must:
   which sets bounds and invokes the stored `on_resize` callback.
 - `draw(&Scene)` — discard. `sprite_atlas()` — the tile-allocating stub from
   `headless/window.rs`, copied.
-- `prompt()` → `None`, so GPUI falls back to its own rendered prompts, which we
-  then project as a modal (§13).
+- `prompt()` → a real `oneshot::Receiver<usize>`, queueing the question for the
+  frame loop to paint and answer (§13.3). Never `None`: that is what asks GPUI
+  to render the prompt into the window instead, where nothing paints it and it
+  still takes focus.
 
 Window is opened with `WindowOptions { focus: true, show: false, window_bounds:
 Some(Windowed(terminal_grid_in_px)), .. }`.
@@ -1014,11 +1016,24 @@ concern in `vim`, with no duplicated parsing.
 
 ### 13.3 Prompts and notifications
 
-`TerminalWindow::prompt()` returns `None`, so GPUI renders its own prompt view;
-project it as a centred modal with numbered answers. Workspace notifications
-(save errors, LSP failures) render as a transient line above the status line —
-important, because a TUI that silently drops an "unable to save" error is worse
-than useless.
+`TerminalWindow::prompt()` answers the question itself rather than returning
+`None`: it queues the message and its answers and hands back the receiver GPUI
+awaits. `ted` paints the queue's head in two of its reserved rows — the question
+above its answers, numbered from 1 — and a keystroke sends the index. `enter`
+takes the first answer, GPUI's default; `esc` takes the last, which on every
+prompt reachable here is `Cancel`.
+
+Returning `None` instead is what makes GPUI render *its* prompt view, an element
+tree inside the window. `ted` projects only the editor's rect (§10.2), so such a
+prompt is never painted — but it still holds focus, which is indistinguishable
+from a hang: the editor stops answering keys and whatever asked the question
+waits forever. `:q` on a modified buffer is the shortest path to it
+(`workspace::CloseActiveItem` with `SaveIntent::Close`), which makes this the
+one platform method that cannot be stubbed out.
+
+Workspace notifications (save errors, LSP failures) render as a transient line
+above the status line — important, because a TUI that silently drops an "unable
+to save" error is worse than useless.
 
 ### 13.4 Host commands, and `:Explore`
 

@@ -36,7 +36,7 @@ use crate::input::keystroke_for;
 use crate::palette::{ColorDepth, Palette};
 use crate::platform::{TerminalPlatform, TerminalWindowState, set_window_grid};
 use crate::render::{render, reserved_rows};
-use crate::snapshot::{CommandLineView, CursorShape, StatusView, ViewSnapshot};
+use crate::snapshot::{CommandLineView, CursorShape, PromptView, StatusView, ViewSnapshot};
 use crate::suspend::{self, Reader};
 
 /// Below this the editor's width arithmetic goes negative, which is not a case
@@ -70,7 +70,7 @@ pub fn run(options: Options) -> Result<()> {
     enter_terminal_mode()?;
     install_panic_hook();
 
-    set_window_grid(columns, rows.saturating_sub(reserved_rows(false, 0)));
+    set_window_grid(columns, rows.saturating_sub(reserved_rows(false, false, 0)));
     let platform = std::rc::Rc::new(TerminalPlatform::new(columns, rows));
     let result = std::rc::Rc::new(std::cell::RefCell::new(Ok(())));
 
@@ -208,13 +208,18 @@ async fn drive(
             .as_ref()
             .map(|command_line| command_line.view())
             .or_else(|| search_line(&session, cx));
+        let prompt = window_state.pending_prompt();
 
         let mut notifications = session.messages.clone();
         notifications.extend(backend_notifications(&session, cx));
 
         // A line appearing or disappearing changes how much of the grid the
         // window may use, and that is a resize like any other (SPEC §10.2).
-        let wanted = reserved_rows(command_line.is_some(), notifications.len());
+        let wanted = reserved_rows(
+            command_line.is_some(),
+            prompt.is_some(),
+            notifications.len(),
+        );
         if wanted != reserved {
             reserved = wanted;
             resize_window(&session, reserved, &window_state);
@@ -228,7 +233,8 @@ async fn drive(
 
         // A closed window is how a `workspace::CloseWindow` reaches this loop,
         // which is a normal way to quit rather than a failure.
-        let Ok(snapshot) = build_snapshot(&session, reserved, command_line, notifications, cx)
+        let Ok(snapshot) =
+            build_snapshot(&session, reserved, command_line, prompt, notifications, cx)
         else {
             return Ok(());
         };
@@ -276,7 +282,22 @@ async fn drive(
                 // user acknowledging them. A resize is not — it may not even be
                 // something the user did.
                 session.messages.clear();
-                if let Some(command) = handle_key(&mut session, key, cx).await? {
+
+                // Read again rather than reuse the frame's copy: the task the
+                // last keystroke started may have raised a prompt while this
+                // one was still on its way, and the answer belongs to whichever
+                // question is open *now*.
+                //
+                // An unanswered prompt owns the keyboard, because what asked it
+                // is waiting on the answer and everything the key would
+                // otherwise reach is downstream of that (SPEC §13.3). Ctrl-C
+                // above still gets out, and dropping the sender on the way is a
+                // cancel.
+                if let Some(prompt) = window_state.pending_prompt() {
+                    if let Some(answer) = answer_for(&key, &prompt) {
+                        window_state.answer_prompt(answer);
+                    }
+                } else if let Some(command) = handle_key(&mut session, key, cx).await? {
                     suspend_to(&mut session, &mut tty, command, &window_state, reserved, cx)
                         .await?;
                 }
@@ -472,6 +493,35 @@ fn active_editor(session: &Session, cx: &mut AsyncApp) -> Option<Entity<Editor>>
     cx.update(|cx| session.backend.active_editor(cx))
 }
 
+/// Which answer a keystroke picks from an open prompt, or `None` when it picks
+/// none and the prompt stays up (SPEC §13.3).
+///
+/// The digits are the answers as they are painted, numbered from 1. `enter`
+/// takes the first, which is the answer GPUI treats as the default and the one
+/// a platform dialog would have focused. `esc` takes the last: every prompt
+/// Zed raises on this path ends in `Cancel`, and a terminal user reaching for
+/// escape means to back out, not to save.
+fn answer_for(key: &KeyEvent, prompt: &PromptView) -> Option<usize> {
+    let answers = prompt.answers.len();
+    if matches!(key.kind, KeyEventKind::Release) || answers == 0 {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Enter => Some(0),
+        KeyCode::Esc => Some(answers - 1),
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            let chosen = character.to_digit(10)?.checked_sub(1)? as usize;
+            (chosen < answers).then_some(chosen)
+        }
+        _ => None,
+    }
+}
+
 fn is_quit(key: &KeyEvent) -> bool {
     !matches!(key.kind, KeyEventKind::Release)
         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -548,6 +598,7 @@ fn build_snapshot(
     session: &Session,
     reserved: u16,
     command_line: Option<CommandLineView>,
+    prompt: Option<PromptView>,
     notifications: Vec<String>,
     cx: &mut AsyncApp,
 ) -> Result<ViewSnapshot> {
@@ -572,6 +623,7 @@ fn build_snapshot(
                 rows: session.rows,
                 reserved_rows: reserved,
                 command_line,
+                prompt,
                 notifications,
                 workspace: &session.backend.workspace,
             },

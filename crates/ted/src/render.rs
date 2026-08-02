@@ -13,15 +13,23 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use crate::cell::{cluster_cells, text_cells};
 use crate::palette::Palette;
 use crate::snapshot::{
-    CellRect, CommandLineView, EditorView, RowView, SpanStyle, StatusView, ViewSnapshot,
+    CellRect, CommandLineView, EditorView, PromptView, RowView, SpanStyle, StatusView, ViewSnapshot,
 };
 
+/// A prompt is always exactly this tall — the question on one row, the numbered
+/// answers on the next — so the reserved-row count does not depend on how long
+/// the question is. Both rows are clipped at the right edge like every other
+/// line `ted` paints.
+const PROMPT_ROWS: usize = 2;
+
 /// The rows `ted` paints itself, bottom-up: the status line always, then the
-/// `:` / `/` line when one is open, then one row per notification. The GPUI
-/// window is sized to the grid minus exactly this many rows, so the editor's
-/// reported rect can never overlap them (SPEC §10.2).
-pub fn reserved_rows(command_line: bool, notifications: usize) -> u16 {
-    let reserved = 1 + usize::from(command_line) + notifications;
+/// `:` / `/` line when one is open, then a prompt when one is unanswered, then
+/// one row per notification. The GPUI window is sized to the grid minus exactly
+/// this many rows, so the editor's reported rect can never overlap them
+/// (SPEC §10.2).
+pub fn reserved_rows(command_line: bool, prompt: bool, notifications: usize) -> u16 {
+    let reserved =
+        1 + usize::from(command_line) + usize::from(prompt) * PROMPT_ROWS + notifications;
     u16::try_from(reserved).unwrap_or(u16::MAX)
 }
 
@@ -42,6 +50,20 @@ pub fn render(snapshot: &ViewSnapshot, palette: &Palette, buffer: &mut Buffer) {
         };
         next_row = row;
         render_command_line(command_line, snapshot.columns, row, buffer);
+    }
+
+    // Directly above the status line, and above the `:` line when both are up:
+    // it is the only thing on screen the user has to answer before anything
+    // else happens.
+    if let Some(prompt) = &snapshot.prompt {
+        let Some(answers_row) = next_row.checked_sub(1) else {
+            return;
+        };
+        let Some(message_row) = answers_row.checked_sub(1) else {
+            return;
+        };
+        next_row = message_row;
+        render_prompt(prompt, snapshot.columns, message_row, answers_row, buffer);
     }
 
     for notification in &snapshot.notifications {
@@ -333,6 +355,48 @@ fn render_command_line(
     }
 
     write(&line, area, Style::default(), buffer);
+}
+
+/// Paints the question on `message_row` and its numbered answers on
+/// `answers_row` (SPEC §13.3).
+///
+/// The question is reversed like a notification, because it is one until it is
+/// answered; the answers are painted plainly, like the `:` line, because that
+/// row is what the user is about to type into.
+fn render_prompt(
+    prompt: &PromptView,
+    columns: u16,
+    message_row: u16,
+    answers_row: u16,
+    buffer: &mut Buffer,
+) {
+    if columns == 0 {
+        return;
+    }
+
+    let mut message = prompt.message.clone();
+    if let Some(detail) = &prompt.detail {
+        message.push_str(" — ");
+        message.push_str(detail);
+    }
+
+    let reversed = Style::default().add_modifier(Modifier::REVERSED);
+    let message_area = Rect::new(0, message_row, columns, 1);
+    fill(message_area, reversed, buffer);
+    write(&message, message_area, reversed, buffer);
+
+    let mut answers = String::new();
+    for (index, answer) in prompt.answers.iter().enumerate() {
+        if !answers.is_empty() {
+            answers.push_str("  ");
+        }
+        // Numbered from 1, because that is the key the user presses.
+        answers.push_str(&format!("[{}] {answer}", index + 1));
+    }
+
+    let answers_area = Rect::new(0, answers_row, columns, 1);
+    fill(answers_area, Style::default(), buffer);
+    write(&answers, answers_area, Style::default(), buffer);
 }
 
 fn terminal_style(style: &SpanStyle, palette: &Palette) -> Style {
@@ -654,8 +718,52 @@ mod tests {
 
     #[test]
     fn reserved_rows_grow_with_the_lines_ted_owns() {
-        assert_eq!(reserved_rows(false, 0), 1);
-        assert_eq!(reserved_rows(true, 0), 2);
-        assert_eq!(reserved_rows(true, 3), 5);
+        assert_eq!(reserved_rows(false, false, 0), 1);
+        assert_eq!(reserved_rows(true, false, 0), 2);
+        assert_eq!(reserved_rows(true, false, 3), 5);
+        // A prompt is two rows: the question and its answers.
+        assert_eq!(reserved_rows(false, true, 0), 3);
+        assert_eq!(reserved_rows(true, true, 3), 7);
+    }
+
+    #[test]
+    fn a_prompt_puts_its_answers_directly_above_the_status_line() {
+        let mut snapshot = snapshot_of(40, 5, &["x"]);
+        snapshot.prompt = Some(PromptView {
+            message: "a.rs has changes. Save them?".to_owned(),
+            detail: None,
+            answers: vec![
+                "Save".to_owned(),
+                "Don't Save".to_owned(),
+                "Cancel".to_owned(),
+            ],
+        });
+        let grid = grid(&snapshot);
+        assert_eq!(grid[2].trim_end(), "a.rs has changes. Save them?");
+        assert_eq!(grid[3].trim_end(), "[1] Save  [2] Don't Save  [3] Cancel");
+        assert!(grid[4].starts_with("[No Name]"));
+    }
+
+    #[test]
+    fn a_prompt_sits_above_the_command_line_when_both_are_up() {
+        let mut snapshot = snapshot_of(30, 6, &["x"]);
+        snapshot.command_line = Some(CommandLineView {
+            prefix: ':',
+            query: "q".to_owned(),
+            cursor: 1,
+            completions: Vec::new(),
+            selected_completion: None,
+            message: None,
+        });
+        snapshot.prompt = Some(PromptView {
+            message: "Overwrite?".to_owned(),
+            detail: Some("changed on disk".to_owned()),
+            answers: vec!["Overwrite".to_owned(), "Cancel".to_owned()],
+        });
+        let grid = grid(&snapshot);
+        assert_eq!(grid[2].trim_end(), "Overwrite? — changed on disk");
+        assert_eq!(grid[3].trim_end(), "[1] Overwrite  [2] Cancel");
+        assert_eq!(grid[4].trim_end(), ":q");
+        assert!(grid[5].starts_with("[No Name]"));
     }
 }

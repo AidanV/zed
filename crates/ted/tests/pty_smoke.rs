@@ -14,6 +14,8 @@ use std::io::{Read as _, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
+
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 const COLUMNS: u16 = 80;
@@ -244,19 +246,25 @@ impl Terminal {
     }
 
     fn exited(&mut self, timeout: Duration) -> bool {
+        self.exit_status(timeout).is_some()
+    }
+
+    /// How `ted` exited, which is not the same question as whether it did: a
+    /// shutdown that panics — on leaked entity handles, say — still exits.
+    fn exit_status(&mut self, timeout: Duration) -> Option<portable_pty::ExitStatus> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             match self.child.try_wait() {
-                Ok(Some(_)) => return true,
+                Ok(Some(status)) => return Some(status),
                 Ok(None) => {
                     // Keep draining, or the child can block writing its final
                     // frame into a full pty buffer and never reach exit.
                     self.output.recv_timeout(Duration::from_millis(100)).ok();
                 }
-                Err(_) => return false,
+                Err(_) => return None,
             }
         }
-        false
+        None
     }
 }
 
@@ -615,9 +623,87 @@ fn colon_q_quits() -> anyhow::Result<()> {
     // `:q` maps to `workspace::CloseActiveItem`, which in GUI Zed would leave an
     // empty window; in a terminal the empty workspace *is* the exit condition.
     terminal.send(":q\r");
+    let status = terminal
+        .exit_status(Duration::from_secs(10))
+        .context("ted is still running after :q")?;
+    assert!(status.success(), "ted exited badly: {status:?}");
+    Ok(())
+}
+
+#[test]
+fn colon_q_on_a_dirty_buffer_asks_before_quitting() -> anyhow::Result<()> {
+    let (fixture, mut terminal) = open("quit_dirty", "alpha\nbeta\n")?;
+
+    // `x` deletes a character, which is what makes the close prompt.
+    terminal.send("x");
     assert!(
-        terminal.exited(Duration::from_secs(10)),
-        "ted is still running after :q"
+        terminal.status().contains("[+]"),
+        "the buffer is not marked dirty: {:?}",
+        terminal.status()
+    );
+
+    // `:q` closes a dirty item through a `window.prompt`. Without a projection
+    // of it, GPUI renders the prompt into the window instead — where nothing
+    // paints it and it holds focus — and `ted` hangs with no way to answer
+    // (SPEC §13.3).
+    terminal.send(":q\r");
+    let answers = terminal.row(ROWS - 2);
+    assert!(
+        answers.contains("[1] Save") && answers.contains("[2] Don't Save"),
+        "the save prompt was not projected: {answers:?}"
+    );
+    assert!(
+        !terminal.exited(Duration::from_millis(500)),
+        "ted quit without waiting for an answer"
+    );
+
+    // Answer 2, "Don't Save": the edit is discarded, the item closes, and the
+    // empty workspace is the exit condition (SPEC §14.3).
+    terminal.send("2");
+    let status = terminal
+        .exit_status(Duration::from_secs(10))
+        .context("ted is still running after answering the save prompt")?;
+    // Not merely "it exited": an answered prompt leaves nothing awaiting it, so
+    // the shutdown has no abandoned task holding entity handles and gpui's leak
+    // detector has nothing to panic about.
+    assert!(status.success(), "ted exited badly: {status:?}");
+    assert_eq!(fixture.contents(), "alpha\nbeta\n");
+    Ok(())
+}
+
+#[test]
+fn escape_cancels_the_save_prompt_and_leaves_the_buffer_alone() -> anyhow::Result<()> {
+    let (fixture, mut terminal) = open("quit_cancel", "alpha\nbeta\n")?;
+
+    terminal.send("x");
+    terminal.send(":q\r");
+    assert!(
+        terminal.row(ROWS - 2).contains("[3] Cancel"),
+        "the save prompt was not projected: {:?}",
+        terminal.row(ROWS - 2)
+    );
+
+    // Escape takes the last answer, which on every prompt Zed raises here is
+    // `Cancel`: the editor comes back, still dirty, with the file untouched.
+    terminal.send("\x1b");
+    assert!(
+        !terminal.exited(Duration::from_millis(500)),
+        "cancelling the prompt quit anyway"
+    );
+    assert!(
+        terminal.status().contains("[+]"),
+        "the buffer stopped being dirty after cancelling: {:?}",
+        terminal.status()
+    );
+    assert_eq!(fixture.contents(), "alpha\nbeta\n");
+
+    // And the editor has the keyboard again, which is the part a prompt that
+    // was never answered would have kept.
+    terminal.send("j");
+    assert!(
+        terminal.status().contains("2:1"),
+        "the editor did not take the keyboard back: {:?}",
+        terminal.status()
     );
     Ok(())
 }
@@ -946,5 +1032,9 @@ fn the_terminal_is_restored_when_ted_exits() -> anyhow::Result<()> {
         trailing.contains("\u{1b}[<"),
         "the keyboard enhancement flags were never popped"
     );
+    let status = terminal
+        .exit_status(Duration::from_secs(10))
+        .context("ted is still running after ctrl-c")?;
+    assert!(status.success(), "ted exited badly: {status:?}");
     Ok(())
 }
