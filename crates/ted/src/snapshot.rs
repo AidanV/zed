@@ -6,7 +6,7 @@
 use std::ops::Range;
 
 use buffer_diff::DiffHunkStatusKind;
-use editor::display_map::DisplayRow;
+use editor::display_map::{DisplayRow, DisplaySnapshot, ToDisplayPoint as _};
 use editor::{DisplayPoint, Editor};
 use gpui::{App, Entity, FontStyle, FontWeight, Hsla, Pixels, Window};
 use language::LanguageAwareStyling;
@@ -544,6 +544,12 @@ fn shift_down(snapshot: &mut ViewSnapshot, rows: u16) {
     if let Some(editor) = snapshot.editor.as_mut() {
         editor.text_rect.y += rows;
         editor.gutter_rect.y += rows;
+        // Selection spans name a display row and are resolved against the text
+        // rect when they are painted, so they move with it. The cursors are
+        // already grid points and do not.
+        for cursor in &mut editor.secondary_cursors {
+            cursor.row += rows;
+        }
     }
     if let Some(cursor) = snapshot.cursor.as_mut() {
         cursor.row += rows;
@@ -883,7 +889,20 @@ fn build_editor_view(
 
     let relative_numbers = editor.relative_line_numbers(cx).enabled();
     let show_line_numbers = editor.line_numbers_enabled(cx);
-    let cursor_display_row = editor.selections.newest_display(display).head().row().0;
+
+    // Two things vim's visual modes need are kept outside the selections
+    // themselves, and reading the selections alone gets both wrong.
+    let line_mode = editor.selections.line_mode();
+    let offset_cursor = vim::mode(editor, cx).is_some_and(|mode| mode.has_selection());
+    let newest = editor.selections.newest_display(display);
+    let (_, newest_head) = rendered_selection(
+        newest.start..newest.end,
+        newest.reversed,
+        display,
+        line_mode,
+        offset_cursor,
+    );
+    let cursor_display_row = newest_head.row().0;
 
     let end_row = first_row
         .saturating_add(visible)
@@ -930,11 +949,16 @@ fn build_editor_view(
     let visible_rows = first_row..first_row.saturating_add(visible);
     let mut selections = Vec::new();
     let mut secondary_cursors = Vec::new();
-    let newest = editor.selections.newest_display(display);
     let mut primary_cursor = None;
 
     for selection in editor.selections.all_display(display) {
-        let range = selection.start..selection.end;
+        let (range, head) = rendered_selection(
+            selection.start..selection.end,
+            selection.reversed,
+            display,
+            line_mode,
+            offset_cursor,
+        );
         for (display_row, start_cell, end_cell) in
             selection_cells(&rows_view, &range, visible_rows.clone())
         {
@@ -947,7 +971,6 @@ fn build_editor_view(
             }
         }
 
-        let head = selection.head();
         let Some(point) = cell_for(&rows_view, head.row().0, head.column() as usize, &text_rect)
         else {
             continue;
@@ -961,7 +984,7 @@ fn build_editor_view(
 
     // Buffer coordinates, not display ones: a status line that counted
     // soft-wrap rows would disagree with `:42` and with every other editor.
-    let buffer_point = newest.head().to_point(display);
+    let buffer_point = newest_head.to_point(display);
     let primary_position = Some((buffer_point.row + 1, buffer_point.column + 1));
 
     let built = BuiltEditor {
@@ -1091,6 +1114,54 @@ fn span_style(
     }
 }
 
+/// What a selection actually looks like: the range it covers, and the display
+/// point its cursor sits on.
+///
+/// Neither is the selection as vim stores it, and `editor`'s own element derives
+/// both the same way in `SelectionLayout::new`. A whole-line selection is a flag
+/// on the collection rather than an expanded range, so `shift-v` reaching here
+/// unexpanded would paint as an ordinary character selection; and a forward
+/// selection's head is its *exclusive* end, one position past the block cursor,
+/// so `v` would move the cursor a cell to the right of where vim has it.
+fn rendered_selection(
+    mut range: Range<DisplayPoint>,
+    reversed: bool,
+    display: &DisplaySnapshot,
+    line_mode: bool,
+    offset_cursor: bool,
+) -> (Range<DisplayPoint>, DisplayPoint) {
+    let mut head = if reversed { range.start } else { range.end };
+    if line_mode {
+        let lines =
+            display.expand_to_line(range.start.to_point(display)..range.end.to_point(display));
+        range = lines.start.to_display_point(display)..lines.end.to_display_point(display);
+    }
+
+    if offset_cursor && !range.is_empty() && !reversed {
+        if head.column() > 0 {
+            // `clip_point` rather than a bare subtraction: a column is a byte
+            // offset, and one byte back from a multi-byte grapheme is not a
+            // position.
+            head = display.clip_point(
+                DisplayPoint::new(head.row(), head.column() - 1),
+                editor::Bias::Left,
+            );
+        } else if head.row().0 > 0 {
+            let previous = DisplayRow(head.row().0 - 1);
+            head = display.clip_point(
+                DisplayPoint::new(previous, display.line_len(previous)),
+                editor::Bias::Left,
+            );
+            // The clip may have moved the head up further than one row, across
+            // a block, so the range follows it rather than the row it started
+            // from.
+            range.end = DisplayPoint::new(DisplayRow(head.row().0 + 1), 0);
+        }
+    }
+
+    (range, head)
+}
+
 /// The cells a selection covers on each visible row it touches. A visual-block
 /// selection produces the same column range on every row, so the rectangle
 /// falls out with no special case.
@@ -1170,6 +1241,36 @@ pub fn byte_to_cell_table(text: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC §24.7: a tab strip moves the editor down the grid, and everything
+    /// the projection has already placed in grid coordinates has to move with
+    /// it. Selection spans name a display row and are resolved when they are
+    /// painted, so they are carried already; both kinds of cursor are not.
+    #[test]
+    fn a_tab_strip_moves_every_cursor_down_with_the_text() {
+        let mut snapshot = ViewSnapshot {
+            editor: Some(EditorView {
+                text_rect: CellRect::new(4, 0, 20, 6),
+                gutter_rect: CellRect::new(0, 0, 4, 6),
+                secondary_cursors: vec![CellPoint { column: 6, row: 2 }],
+                ..Default::default()
+            }),
+            cursor: Some(CellPoint { column: 5, row: 1 }),
+            ..Default::default()
+        };
+
+        shift_down(&mut snapshot, 1);
+
+        let editor = snapshot.editor.expect("no editor view");
+        assert_eq!(editor.text_rect.y, 1);
+        assert_eq!(editor.gutter_rect.y, 1);
+        assert_eq!(
+            editor.secondary_cursors,
+            vec![CellPoint { column: 6, row: 3 }],
+            "a secondary cursor stayed on the row the tab strip took"
+        );
+        assert_eq!(snapshot.cursor, Some(CellPoint { column: 5, row: 2 }));
+    }
 
     #[test]
     fn ascii_bytes_map_to_their_own_column() {

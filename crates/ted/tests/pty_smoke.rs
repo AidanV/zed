@@ -1153,6 +1153,21 @@ fn explore_opens_what_the_file_manager_chose() -> anyhow::Result<()> {
         opened.iter().any(|(status, _)| status.contains("first.rs")),
         "the first chosen file was not opened: {opened:#?}"
     );
+    // A chosen file is named by its name, wherever it came from. `ted` was
+    // given `main.rs`, so neither of these is inside a worktree yet and each
+    // gets one of its own — and an *invisible* worktree is one Zed answers for
+    // with an absolute path, which is not what belongs in a tab.
+    let directory = first
+        .parent()
+        .expect("the fixture has a directory")
+        .display()
+        .to_string();
+    for (status, _) in &opened {
+        assert!(
+            !status.contains(&directory),
+            "a chosen file was named by its absolute path: {status:?}"
+        );
+    }
     let Some((_, drawn)) = opened
         .iter()
         .find(|(status, _)| status.contains("second.rs"))

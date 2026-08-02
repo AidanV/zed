@@ -105,9 +105,22 @@ impl Explore {
                 workspace.open_paths(
                     paths.clone(),
                     OpenOptions {
-                        // What the user picked in a file manager is a file to
-                        // edit, not a directory to add to the project.
-                        visible: Some(OpenVisible::None),
+                        // A directory the user browsed past is not one they
+                        // asked to add to the project, so only the files become
+                        // worktrees — and they become *visible* ones, which is
+                        // what `ted <file>` already makes of the file it is
+                        // given.
+                        //
+                        // Visibility is not about a project panel here; `ted`
+                        // has none. It is what a buffer ends up *named* by. A
+                        // file already inside a worktree is unaffected, but one
+                        // that is not gets a worktree of its own, and
+                        // `Worktree::full_path` answers for an invisible
+                        // worktree with an absolute path — so a file just
+                        // created in the file manager would reach the tab strip,
+                        // the status line and the switcher as `/home/…/notes.md`
+                        // rather than as `notes.md`.
+                        visible: Some(OpenVisible::OnlyFiles),
                         ..Default::default()
                     },
                     None,

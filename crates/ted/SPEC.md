@@ -940,6 +940,18 @@ The cursor is *not* drawn as a cell; §7 places the terminal's real cursor.
 Additional cursors (multi-cursor) do get drawn as inverted cells, since a
 terminal has only one hardware cursor.
 
+**Neither a selection's span nor its cursor is the selection as vim stores it.**
+Two of vim's visual modes are kept outside the selection, and §10's projection
+has to derive both — the same way `editor`'s own element does in
+`SelectionLayout::new`, which is the only definition of "what this selection
+looks like" either renderer has. A whole-line selection is a flag on the
+*collection*, so `shift-v` arrives covering the one character `v` would and has
+to be expanded to the line; and a forward selection's head is its *exclusive*
+end, one position past the block cursor vim paints, so the cursor belongs one
+position to its left. A projection that read `Selection` directly gets a `shift-v`
+that looks like a `v`, and a `v` that shifts the cursor a cell right and back
+again on the keystroke that leaves.
+
 **Invisibles, tabs, wide chars.** `DisplayMap`'s `TabMap` has already expanded
 tabs to spaces, so no tab handling is needed at render time — a common source
 of column bugs in hand-rolled TUI editors, avoided for free.
@@ -1080,6 +1092,14 @@ shell, so pipes, redirection and quoting mean what they mean at a prompt.
 
 Multiple selected paths open as multiple buffers in one call. The start directory
 is the active buffer's parent, falling back to the first worktree root.
+
+A chosen *file* opens as a visible worktree when it is not already inside one,
+which is what `ted <file>` makes of the file it is given; a directory the user
+only browsed past opens as nothing at all. Visibility is not a project-panel
+concern here — `ted` has no panel — but the thing a buffer is *named* by:
+`Worktree::full_path` answers for an invisible worktree with an absolute path, so
+a file created in Yazi and opened would arrive in the tab strip, the status line
+and the switcher as `/home/…/notes.md` rather than as `notes.md`.
 
 The command is `ted.json`'s `file_manager` (§9) rather than a hard-coded binary —
 an argument vector with `{chooser}` and `{directory}` substituted into it, so
@@ -1943,9 +1963,14 @@ editor is painted at the rectangle the editor reports, whose row 0 is the
 terminal's row 0. A strip on top has nothing to do with that count; it means
 every rectangle the editor reports has to be shifted down by the strip's height
 before anything is painted from it. That is one addition in one place in
-`snapshot::build`, applied to `text_rect`, `gutter_rect` and the cursor together.
-Ten lines. The only way to get it wrong is to apply it to two of the three, which
-puts the cursor a row off its text — §5.4's failure mode wearing a new costume.
+`snapshot::build`, applied to everything the projection has already placed in
+grid coordinates: `text_rect`, `gutter_rect`, and *both* kinds of cursor — the
+primary one the terminal parks and the multi-cursors painted as inverted cells
+(§11), which are grid points as much as the rects are. Selection spans are not,
+since they name a display row and are resolved against the text rect at the
+moment they are painted. Ten lines. The only way to get it wrong is to apply it
+to some of them, which puts a cursor a row off its own text — §5.4's failure mode
+wearing a new costume.
 
 **Decided: `:q` closes a tab and the others take its place.** vim's interceptor
 resolves it to `workspace::CloseActiveItem`, which does exactly that already. Two

@@ -335,9 +335,24 @@ fn visual_mode_reports_a_selection_over_the_cells_it_covers() {
 fn visual_line_mode_selects_whole_rows() {
     let mut session = Session::open(24, 6, "alpha\nbeta\n");
 
-    session.keys("shift-v j");
+    // Vim marks a whole-line selection on the selection collection instead of
+    // widening the selection itself, so `shift-v` alone covers exactly the one
+    // character `v` would until the projection expands it.
+    session.keys("shift-v");
     assert_eq!(session.mode().as_deref(), Some("VISUAL LINE"));
+    let editor = session.snapshot().editor.expect("no editor view");
+    assert_eq!(editor.selections.len(), 1);
+    assert_eq!(editor.selections[0].display_row, 0);
+    assert_eq!(
+        (
+            editor.selections[0].start_cell,
+            editor.selections[0].end_cell
+        ),
+        (0, 5),
+        "shift-v selected characters rather than the line"
+    );
 
+    session.keys("j");
     let editor = session.snapshot().editor.expect("no editor view");
     let rows: Vec<u32> = editor
         .selections
@@ -347,6 +362,53 @@ fn visual_line_mode_selects_whole_rows() {
     assert_eq!(rows, vec![0, 1]);
     assert_eq!(editor.selections[0].start_cell, 0);
     assert_eq!(editor.selections[0].end_cell, 5);
+    assert_eq!(editor.selections[1].start_cell, 0);
+    assert_eq!(editor.selections[1].end_cell, 4);
+}
+
+/// A forward selection's head is its *exclusive* end, one position past the
+/// block cursor vim paints — so a projection that placed the cursor on the head
+/// would move it one cell right on `v` and back again on the `v` that leaves.
+#[test]
+fn entering_and_leaving_visual_mode_leaves_the_cursor_where_it_was() {
+    let mut session = Session::open(24, 6, "alpha\nbeta\n");
+
+    session.keys("l l");
+    let before = session.snapshot();
+    assert_eq!(before.status.position, Some((1, 3)));
+
+    session.keys("v");
+    let during = session.snapshot();
+    assert_eq!(during.status.mode.as_deref(), Some("VISUAL"));
+    assert_eq!(during.cursor, before.cursor, "`v` moved the cursor");
+    assert_eq!(during.status.position, before.status.position);
+
+    session.keys("v");
+    let after = session.snapshot();
+    assert_eq!(after.status.mode.as_deref(), Some("NORMAL"));
+    assert_eq!(after.cursor, before.cursor, "leaving moved the cursor");
+    assert_eq!(after.status.position, before.status.position);
+}
+
+/// `g l` is `vim::SelectNext`, which leaves the match it started on behind as a
+/// second selection. The terminal has one hardware cursor, so that one is
+/// painted as an inverted cell (SPEC §11) — on the row its own match is on.
+#[test]
+fn a_second_cursor_lands_on_the_row_its_own_match_is_on() {
+    let mut session = Session::open(24, 6, "alpha\nbeta\nalpha\n");
+
+    session.keys("g l");
+    let snapshot = session.snapshot();
+    let editor = snapshot.editor.clone().expect("no editor view");
+    assert_eq!(editor.secondary_cursors.len(), 1);
+    assert_eq!(
+        editor.secondary_cursors[0].row, editor.text_rect.y,
+        "the first match's cursor left its row"
+    );
+    assert_eq!(
+        snapshot.cursor.expect("no cursor").row,
+        editor.text_rect.y + 2
+    );
 }
 
 #[test]
