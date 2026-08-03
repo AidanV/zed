@@ -1568,6 +1568,7 @@ connection (§13.4). Optionally move the frontend out of process across the
 | What the `ctrl-g` takeover elides | **The middle of the string, keeping up to eighteen cells of tail.** The numbers are short and sit at the end, so what a narrow grid eats is the middle of the path — the part a reader can most easily do without, with the file's name at one end and its worktree at the other. §21/M3.5. |
 | A markdown block too wide for the panel | **Clipped, not wrapped or scrolled.** A fenced code line and a box-drawn table row are laid out already; breaking either says something the document does not, and a terminal panel has nowhere to scroll sideways to. Prose wraps, and a list item's continuation indents under its text. §24.8. |
 | How quitting on an empty pane reaches the frame loop | **`ted` ends the session itself** when something asked it to and every pane is empty — `:q` on an already-empty pane, or `:qa` once its save prompts are answered. Not by letting `Pane::close_active_item` ask the *window* to close: a terminal has no window to leave behind, and tearing one down under a `ted` that is already shutting down only strands the workspace's handles. §24.7. |
+| The hint screen's wordmark | **Block glyphs saying `TED`**, in the accent colour the keys already have, dropped rather than clipped when the grid cannot hold both it and the hints. Not an outline of Zed's mark: the hints are box drawing already, and a mark at that weight would read as more chrome. §24.7. |
 | The `:` line on an empty pane | **Opens.** §13.2 opens it only from a vim mode, and there is no mode without a buffer — but there is also no buffer for `:` to be a character in, so it is a command. Without this the hint screen names three ways out that cannot be typed. §24.7. |
 | Where `ted`'s own settings live | **`ted.json`, beside `settings.json`**, read by `ted` alone — not a `ted` section in Zed's settings schema. `settings.json` is shared because its keys mean the same thing in both; a key only `ted` can act on does not, and putting it there would make one run of `ted` a permanent addition to a GUI user's configuration. Switching between GUI and TUI configures neither. §9. |
 
@@ -2128,6 +2129,16 @@ line keeps its mode and reports that there is no buffer. Quitting becomes
 explicit: `:q` from the empty state, `:qa`, or `ctrl-c`. `Backend::is_empty`
 stops being how quit reaches the frame loop, which is the whole mechanical
 change. Not M2; the current behaviour is a placeholder, not a decision.
+
+**The screen carries a wordmark over the hints**, in block glyphs, saying `TED`
+— the program the reader started, not the editor it is built from. It is drawn
+in blocks rather than as an outline of Zed's own mark because the hints under it
+are box drawing already, and a mark at that stroke weight would read as another
+row of chrome rather than as the one thing on the screen that is not
+instructions. It takes the accent colour, which the keys already have, so the
+screen stays two colours. The mark is also the first thing to go when the grid
+cannot hold both: the hints are what the screen is *for*, and a wordmark clipped
+to fit says less than no wordmark at all.
 
 **Decided, in the strip's details:**
 

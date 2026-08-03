@@ -580,8 +580,8 @@ fn render_menu(menu: &MenuView, palette: &Palette, buffer: &mut Buffer) {
     }
 }
 
-/// The screen an empty pane sits on (SPEC §24.7): the ways out of it, centred,
-/// keys in one column and what they do in the next.
+/// The screen an empty pane sits on (SPEC §24.7): the wordmark, then the ways
+/// out of it, centred, keys in one column and what they do in the next.
 fn render_hint(hint: &HintView, columns: u16, rows: u16, palette: &Palette, buffer: &mut Buffer) {
     let ground = Style::default()
         .fg(color_or_default(hint.foreground, palette))
@@ -607,9 +607,43 @@ fn render_hint(hint: &HintView, columns: u16, rows: u16, palette: &Palette, buff
         return;
     }
 
-    let x = (columns - widest) / 2;
-    let top = (rows.saturating_sub(1).saturating_sub(height)) / 2;
+    let logo_cells = hint
+        .logo
+        .iter()
+        .map(|line| text_cells(line).min(u32::from(u16::MAX)) as u16)
+        .max()
+        .unwrap_or(0);
+    let logo_height = hint.logo.len().min(usize::from(u16::MAX)) as u16;
+    // The mark is the first thing to go when the grid cannot hold both: the
+    // hints are what the screen is for, and a wordmark clipped to fit says less
+    // than no wordmark at all. The extra row is the gap under it.
+    let logo_rows = if logo_cells > 0 && logo_cells <= columns && height + logo_height + 2 < rows {
+        logo_height + 1
+    } else {
+        0
+    };
+
     let accent = ground.fg(color_or_default(hint.accent, palette));
+    let x = (columns - widest) / 2;
+    let top = (rows.saturating_sub(1).saturating_sub(height + logo_rows)) / 2;
+    if logo_rows > 0 {
+        // Centred on the grid rather than over the block below it, because the
+        // block's own width is an accident of the longest description.
+        let logo_x = (columns - logo_cells) / 2;
+        for (offset, line) in hint.logo.iter().enumerate() {
+            let Ok(offset) = u16::try_from(offset) else {
+                break;
+            };
+            write(
+                line,
+                Rect::new(logo_x, top + offset, columns - logo_x, 1),
+                accent,
+                buffer,
+            );
+        }
+    }
+
+    let top = top + logo_rows;
     for (offset, row) in hint.rows.iter().enumerate() {
         let Ok(offset) = u16::try_from(offset) else {
             break;
@@ -2194,6 +2228,26 @@ mod tests {
         assert!(!rest.modifier.contains(Modifier::BOLD));
     }
 
+    fn hint_view(logo: &'static [&'static str]) -> HintView {
+        HintView {
+            logo,
+            rows: vec![
+                HintRow {
+                    key: "ctrl-p".to_owned(),
+                    description: "find a file".to_owned(),
+                },
+                HintRow {
+                    key: ":q".to_owned(),
+                    description: "quit ted".to_owned(),
+                },
+            ],
+            key_cells: 6,
+            background: None,
+            foreground: None,
+            accent: None,
+        }
+    }
+
     /// SPEC §24.7: an empty pane is a state `ted` sits in, and the screen names
     /// the ways out of it rather than leaving a blank grid.
     #[test]
@@ -2205,22 +2259,7 @@ mod tests {
                 empty: true,
                 ..Default::default()
             },
-            hint: Some(HintView {
-                rows: vec![
-                    HintRow {
-                        key: "ctrl-p".to_owned(),
-                        description: "find a file".to_owned(),
-                    },
-                    HintRow {
-                        key: ":q".to_owned(),
-                        description: "quit ted".to_owned(),
-                    },
-                ],
-                key_cells: 6,
-                background: None,
-                foreground: None,
-                accent: None,
-            }),
+            hint: Some(hint_view(&[])),
             ..Default::default()
         };
 
@@ -2236,6 +2275,57 @@ mod tests {
         );
         // And the bar says there is nothing open rather than going silent.
         assert!(grid[7].contains("no buffer"), "{:?}", grid[7]);
+    }
+
+    /// SPEC §24.7: the wordmark stands over the hints, centred on the grid and
+    /// separated from them by a row.
+    #[test]
+    fn the_wordmark_stands_over_the_hints() {
+        let snapshot = ViewSnapshot {
+            columns: 30,
+            rows: 10,
+            status: StatusView {
+                empty: true,
+                ..Default::default()
+            },
+            hint: Some(hint_view(&["▀▀▀", " █ ", " █ "])),
+            ..Default::default()
+        };
+
+        let grid = grid(&snapshot);
+        assert_eq!(grid[1].trim_end(), "             ▀▀▀");
+        assert_eq!(grid[2].trim_end(), "              █");
+        assert_eq!(grid[3].trim_end(), "              █");
+        // A row of its own between the mark and the hints.
+        assert_eq!(grid[4].trim_end(), "");
+        assert_eq!(grid[5].trim_end(), "     ctrl-p  find a file");
+        assert_eq!(grid[6].trim_end(), "         :q  quit ted");
+    }
+
+    /// The hints are what the screen is for, so a grid with room for them but
+    /// not for the mark keeps them and drops it (SPEC §24.7).
+    #[test]
+    fn a_short_grid_keeps_the_hints_and_drops_the_wordmark() {
+        let snapshot = ViewSnapshot {
+            columns: 20,
+            rows: 5,
+            status: StatusView {
+                empty: true,
+                ..Default::default()
+            },
+            hint: Some(hint_view(&["▀▀▀", " █ ", " █ "])),
+            ..Default::default()
+        };
+
+        let grid = grid(&snapshot);
+        assert!(
+            grid.iter().all(|row| !row.contains('▀')),
+            "the mark was painted anyway: {grid:?}"
+        );
+        assert!(
+            grid.iter().any(|row| row.contains("ctrl-p  find a file")),
+            "{grid:?}"
+        );
     }
 
     #[test]

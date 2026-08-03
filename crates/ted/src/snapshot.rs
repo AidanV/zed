@@ -574,14 +574,17 @@ impl MenuRow {
 /// blank grid wondering whether the session is still alive.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HintView {
+    /// The wordmark above the rows, one line per cell row. Empty when the grid
+    /// is not the shape for it, which the renderer decides.
+    pub logo: &'static [&'static str],
     pub rows: Vec<HintRow>,
     /// The widest key, so the renderer can right-align the column without
     /// measuring the rows twice.
     pub key_cells: u16,
     pub background: Option<Hsla>,
     pub foreground: Option<Hsla>,
-    /// The keys' own colour, which is the only thing on the screen that is not
-    /// prose.
+    /// The colour of the keys and of the wordmark — everything on the screen
+    /// that is not prose.
     pub accent: Option<Hsla>,
 }
 
@@ -881,6 +884,22 @@ fn diagnostic_counts(workspace: &Entity<Workspace>, cx: &App) -> DiagnosticCount
     }
 }
 
+/// The name of the thing the empty pane belongs to (SPEC §24.7).
+///
+/// Block glyphs rather than an outline of Zed's mark: the hints below are drawn
+/// in box drawing already, and a mark at the same stroke weight would read as
+/// another row of chrome rather than as the one thing on the screen that is not
+/// instructions. The glyphs are there — `ted` targets terminals with a complete
+/// font and has no ASCII tier (SPEC §24.1) — and it says `TED` rather than `ZED`
+/// because that is the program the reader started.
+const WORDMARK: [&str; 5] = [
+    "██████ ██████ ██████",
+    "  ██   ██     ██   ██",
+    "  ██   █████  ██   ██",
+    "  ██   ██     ██   ██",
+    "  ██   ██████ ██████",
+];
+
 /// The ways out of an empty pane, named (SPEC §24.7).
 ///
 /// The finder's keystroke is read back from the keymap rather than written down
@@ -925,6 +944,7 @@ fn hint_screen(vim: bool, window: &Window, cx: &App) -> HintView {
         .unwrap_or(0);
     let colors = cx.theme().colors();
     HintView {
+        logo: &WORDMARK,
         rows,
         key_cells,
         background: Some(colors.editor_background),

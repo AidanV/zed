@@ -880,6 +880,10 @@ fn an_empty_pane_is_a_state_ted_sits_in_and_quitting_is_explicit() -> anyhow::Re
         "the hint screen does not name the way out: {screen:?}"
     );
     assert!(
+        screen.iter().filter(|row| row.contains('█')).count() == 5,
+        "the wordmark is not standing over the hints: {screen:?}"
+    );
+    assert!(
         terminal.status().contains("no buffer"),
         "the bar went silent instead of saying there is nothing open: {:?}",
         terminal.status()
