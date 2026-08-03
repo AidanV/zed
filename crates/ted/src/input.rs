@@ -122,15 +122,16 @@ struct Click {
 }
 
 impl Mouse {
-    /// The input for a terminal mouse report, or `None` when it lands on a row
-    /// `ted` painted itself rather than in the GPUI window.
+    /// The input for a terminal mouse report.
     ///
-    /// `top_rows` is how many rows sit above the window's first row: the window
-    /// is sized to the grid minus the rows `ted` owns (SPEC §10.2), so a report
-    /// in terminal coordinates has to be moved into the window's before it is
-    /// scaled into pixels.
-    pub fn translate(&mut self, event: &MouseEvent, top_rows: u16) -> Option<PlatformInput> {
-        let row = event.row.checked_sub(top_rows)?;
+    /// The window's row 0 is the terminal's row 0: every row `ted` paints itself
+    /// is at the *bottom* of the grid (SPEC §10.2), and the one that was not —
+    /// the tab strip — became a row inside the pane in M4 (SPEC §25.2). So a
+    /// report is scaled into pixels and nothing is subtracted from it; a click
+    /// below the window lands on a row `ted` owns, where GPUI's own hit testing
+    /// finds nothing.
+    pub fn translate(&mut self, event: &MouseEvent) -> Option<PlatformInput> {
+        let row = event.row;
         let column = event.column;
         // The cell's left edge rather than its middle: a click on cell N means
         // the cursor goes to column N, which is where that boundary is.
@@ -347,10 +348,7 @@ mod tests {
     fn a_cell_becomes_the_pixel_at_its_top_left_corner() {
         let mut mouse = Mouse::default();
         let input = mouse
-            .translate(
-                &mouse_event(MouseEventKind::Down(MouseButton::Left), 3, 5),
-                0,
-            )
+            .translate(&mouse_event(MouseEventKind::Down(MouseButton::Left), 3, 5))
             .expect("a click inside the window");
         let PlatformInput::MouseDown(event) = input else {
             panic!("a button press should arrive as a press");
@@ -360,27 +358,15 @@ mod tests {
         assert_eq!(event.click_count, 1);
     }
 
-    /// The window starts below the rows `ted` paints itself, so a report has to
-    /// be moved into the window's coordinates before it is scaled.
+    /// The window's row 0 is the terminal's row 0 from M4 on: the tab strip is a
+    /// row inside the pane rather than one withheld from the top of the window
+    /// (SPEC §25.2), so a report is scaled with nothing subtracted from it.
     #[test]
-    fn rows_ted_owns_are_not_the_windows() {
+    fn the_windows_first_row_is_the_terminals() {
         let mut mouse = Mouse::default();
-        assert!(
-            mouse
-                .translate(
-                    &mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
-                    1
-                )
-                .is_none(),
-            "a click on the tab strip reached the window"
-        );
-
         let input = mouse
-            .translate(
-                &mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 1),
-                1,
-            )
-            .expect("a click below the strip");
+            .translate(&mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0))
+            .expect("a click on the first row");
         let PlatformInput::MouseDown(event) = input else {
             panic!("a button press should arrive as a press");
         };
@@ -394,7 +380,7 @@ mod tests {
         let elsewhere = mouse_event(MouseEventKind::Down(MouseButton::Left), 9, 2);
 
         let counts =
-            [&press, &press, &press, &elsewhere].map(|event| match mouse.translate(event, 0) {
+            [&press, &press, &press, &elsewhere].map(|event| match mouse.translate(event) {
                 Some(PlatformInput::MouseDown(event)) => event.click_count,
                 _ => panic!("a button press should arrive as a press"),
             });
@@ -405,7 +391,7 @@ mod tests {
     fn the_wheel_scrolls_whole_lines() {
         let mut mouse = Mouse::default();
         let Some(PlatformInput::ScrollWheel(event)) =
-            mouse.translate(&mouse_event(MouseEventKind::ScrollDown, 0, 0), 0)
+            mouse.translate(&mouse_event(MouseEventKind::ScrollDown, 0, 0))
         else {
             panic!("the wheel should arrive as a scroll");
         };

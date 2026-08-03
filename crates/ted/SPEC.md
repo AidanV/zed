@@ -1,6 +1,6 @@
 # `ted` — a terminal UI for Zed
 
-**Status:** M0 through M3.5 implemented (§21). M4 is next
+**Status:** M0 through M4 implemented
 **Scope:** a new crate + binary in this repository that presents Zed's editor as a
 full-screen terminal application, using Ratatui for presentation and Zed's own
 `editor` + `vim` + `workspace` + `project` crates for all behaviour.
@@ -1499,7 +1499,25 @@ recursion, and that `terminal_view` is itself a GPUI view over `alacritty_termin
 projecting a terminal inside a terminal is best done by reading the
 `terminal::Terminal` grid directly, not through `ViewSnapshot`. Note that §7.1
 already covers running *one* program without embedding an emulator, so the panel
-is only needed for a persistent terminal alongside the editor.
+is only needed for a persistent terminal alongside the editor. **§25 is where the
+design for both lives.**
+
+**Landed as:** the projection stopped having *an* editor. `ViewSnapshot::editor`
+became `panes: Vec<PaneView>`, each carrying the rect
+`Workspace::bounding_box_for_pane` reported, its own strip, and either an editor
+or the hint screen — with one accessor for "the active pane's editor", which is
+what the completions box, the hover panel and the cursor all mean by "the editor".
+The strip moved with it: `Pane::set_render_tab_bar` now installs an element
+exactly a cell tall that paints nothing, so Zed's layout leaves `ted` a row inside
+each pane, and `reserved_rows`' tab argument, `Frame::top_rows`, `Backend::tab_rows`,
+`shift_down` and the mouse's top-row correction all went — the rows `ted` withholds
+are once again only the ones at the bottom of the grid. `crate::terminal` reads the
+panel's grid straight out of `Terminal::last_content()`. **No upstream change: every
+geometry M4 needed was one Zed had already computed and already exposed.** §23
+records what the code settled that the design left open, including the strip
+appearing for a single item — which answers the fourth remaining question — and the
+pane index leaving the status line, which §14.3 had put there only because M1 could
+not paint a split.
 
 **M5 — Collaboration + optional process split.** Terminal-friendly sign-in,
 collaborator cursors and presence, following. `:Explore` against an SSH-remote
@@ -1570,6 +1588,16 @@ connection (§13.4). Optionally move the frontend out of process across the
 | How quitting on an empty pane reaches the frame loop | **`ted` ends the session itself** when something asked it to and every pane is empty — `:q` on an already-empty pane, or `:qa` once its save prompts are answered. Not by letting `Pane::close_active_item` ask the *window* to close: a terminal has no window to leave behind, and tearing one down under a `ted` that is already shutting down only strands the workspace's handles. §24.7. |
 | The hint screen's wordmark | **Block glyphs saying `TED`**, in the accent colour the keys already have, dropped rather than clipped when the grid cannot hold both it and the hints. Not an outline of Zed's mark: the hints are box drawing already, and a mark at that weight would read as more chrome. §24.7. |
 | The `:` line on an empty pane | **Opens.** §13.2 opens it only from a vim mode, and there is no mode without a buffer — but there is also no buffer for `:` to be a character in, so it is a command. Without this the hint screen names three ways out that cannot be typed. §24.7. |
+| The pane tree's geometry | **Each pane's own reported bounds**, floored into cells, with the window standing in for the one case `bounding_box_for_pane` answers `None` for — a lone root pane, where the window *is* the pane. §25.1. |
+| Where the tab strip's row comes from | **Zed's layout, not a reserved row.** `Pane::set_render_tab_bar` installs an element a cell tall that paints nothing, so every pane is inset by a row wherever it is — which is what a split needs and a row withheld from the top of the window cannot give. It also removes `shift_down` and the mouse's top-row correction. §25.2. |
+| The strip on a pane with one item | **Shown.** The row is the pane's now, and hiding it for one item would resize the pane's editor every time a second file opened. This answers remaining question 4: a session with one dirty buffer has its `•` on the strip. §25.2. |
+| What separates two panes | **A rule down the last column of any pane that is not against the grid's edge**, and nothing at all between panes stacked vertically — the lower one's strip is already a boundary, and a second one would cost a whole row. §25.3. |
+| What marks the live pane | **The cursor, and the strips agreeing with it.** An unfocused pane paints its active tab on the inactive ground and keeps its selections but loses its caret, which is what vim does with an unfocused window. Nothing is dimmed. §25.3. |
+| The pane index on the status line | **Gone.** §14.3 put it there because M1 could not paint a split; M4 paints it, so the index says nothing the screen does not, and the sparse bar's rule is that a transient earns its place by saying something nothing else says. §25.3. |
+| How the terminal panel is projected | **From `Terminal::last_content()`**, the grid before `TerminalElement` shapes it, placed at `Content::terminal_bounds` — a reported bound like every other rect in M4. Its ANSI colours resolve through the theme exactly as GUI Zed's do. §25.5. |
+| `ctrl-c` while the panel has focus | **The panel's.** A shell beside the editor is only worth having if the key that interrupts a command still does; the test is the one an open list and the `:` line already answer — who owns the keyboard. §25.5. |
+| The terminal panel's height | **A third of the grid, pinned in cells.** The panel's own default is 320 pixels, which is twenty rows of twenty-four; a user's later resize is serialised and wins. §25.5. |
+| A strip for the terminal panel | **None.** Its pane is not in the workspace's `panes()` and its group is private, so there are no bounds to paint one against — and a shell names itself in its prompt. §25.5. |
 | Where `ted`'s own settings live | **`ted.json`, beside `settings.json`**, read by `ted` alone — not a `ted` section in Zed's settings schema. `settings.json` is shared because its keys mean the same thing in both; a key only `ted` can act on does not, and putting it there would make one run of `ted` a permanent addition to a GUI user's configuration. Switching between GUI and TUI configures neither. §9. |
 
 ### Remaining
@@ -1583,13 +1611,20 @@ connection (§13.4). Optionally move the frontend out of process across the
    disagree on East Asian ambiguous-width. `ted` is self-consistent either way,
    but the *setting* needs a default chosen — narrow (matches most modern
    terminals) is the likely answer, with an override.
-4. **What the sparse bar says about unsaved work, which M3.5 left it saying
-   nothing about.** §21 settled the bar as mode, counts and position "and
-   nothing else", on the reasoning that the tab strip names the file — but the
-   strip only appears once a pane holds more than one item (§24.7), so a session
-   with a single dirty buffer has no modified marker anywhere except `ctrl-g`'s
-   takeover. Either the strip appears for one item too, or `•` joins the
-   mid-row transients, or `ctrl-g` is deemed enough.
+4. ~~**What the sparse bar says about unsaved work, which M3.5 left it saying
+   nothing about.**~~ **Answered in M4**: the strip appears for one item too,
+   because its row is now the pane's rather than one withheld from the window
+   (§25.2), so a session with a single dirty buffer carries its `•` where the
+   file's name already is. The bar stays as §21 settled it.
+
+5. **Whether a pane should be able to hold something that is not an editor.**
+   M4 paints a pane's item only when it `act_as::<Editor>`; anything else keeps
+   the pane's strip and shows the pane's ground under it. That is honest and
+   nearly free, and it is also every non-editor item Zed has — the panel is the
+   only non-editor surface `ted` projects at all, and it is a dock rather than a
+   pane item. The question is whether a second projection (a diff view, a
+   settings editor that is not an `Editor`) is worth the machinery or whether
+   the strip plus an empty rect is the right permanent answer.
 
 ---
 
@@ -2433,3 +2468,275 @@ own tests, its text against the diagnostic and markdown it is built from, and
 the pty harness asserts only the half that needs no server — that a position with
 nothing to say puts nothing on screen and leaves the editor holding the keyboard.
 Diagnostics *arriving* is `editor`'s to get right, and it already does.
+
+---
+
+## 25. M4 — Layout, surface by surface
+
+§21's M4 line names two things: the pane tree drawn as a cell-space split, and a
+terminal panel. They are one milestone because they are one question asked twice
+— *where on the grid does a thing Zed laid out belong* — and because the answer
+is the same both times: the thing itself already knows, and `ted` reads it rather
+than working it out.
+
+Everything through M3.5 painted one rectangle. The editor's rect was read back
+(§10.2), but there was only ever one of them, and everything `ted` drew of its
+own — the tab strip, the status line, the `:` line — was laid out against the
+*grid* rather than against anything Zed had placed. M4 is the milestone where the
+grid stops being the unit of layout and the pane does.
+
+### 25.1 The pane tree, in cells
+
+**What it is.** `Workspace` maintains a `PaneGroup` — a tree of horizontal and
+vertical axes with a `Pane` at each leaf — regardless of who paints it. `:vsplit`,
+`:split`, `<C-w>v`, `<C-w>s`, `<C-w>hjkl` and `<C-w>><C-w><` have worked since M1
+(§14.3); what M1 did with the result was show `2/3` in the status line and paint
+the active pane over the whole grid, which is honest about the *existence* of the
+other panes and silent about everything else.
+
+**Where the state comes from.** `PaneAxis`'s element records the bounds of every
+child it lays out (`pane_group.rs`, `bounding_boxes`), `PaneGroup::bounding_box_for_pane`
+reads them back, and `Workspace::bounding_box_for_pane` already forwards to it —
+so the whole of M4's geometry is a call that exists, which is why the milestone
+needs no upstream change at all (§25.6).
+
+That call answers `None` in exactly one case — a tree whose root is a single pane,
+which no axis ever laid out. That case needs no answer: with one pane the window
+*is* the pane, and `ted` already knows the window's size in cells because it
+chose it (§10.2).
+
+**Decided: the pane rect is floored into cells, and the editor is painted inside
+it at the rect the editor itself reports.** Both, not one or the other. A pane's
+bounds say where the pane is; the editor's `last_bounds` says where its text
+starts, which is a different question once a pane has a tab strip above the item
+and a search bar in the toolbar between them. Reading only the editor's rect
+loses the pane's own extent — the cells around the editor that are still the
+pane's, and that something has to paint. Reading only the pane's rect puts
+`ted` back in the business of computing where a gutter ends, which §5.4 spends a
+page refusing to do.
+
+**Splitting an odd number of columns.** An axis divides its bounds by the flex
+values and rounds each child to whole pixels, so a 101-column window splits into
+one pane of 50.5 cells and one of 50.5 cells starting at cell 50.5. Flooring both
+(§5.3) puts the right pane's origin at cell 50 while its content actually begins
+half a cell later — the same half-cell error the single-pane case has always
+absorbed, and it lands the same way: text is painted half a cell to the left of
+where GPUI put it, and nothing overlaps, because the *left* pane's wrap width was
+floored down by the same arithmetic.
+
+### 25.2 The strip moves into the pane
+
+M3.5's tab strip is one row at the top of the grid, withheld from the GPUI window
+by `reserved_rows` and paid for by shifting every rect the editor reports down by
+one (§24.7, "What that costs, mechanically"). That works for exactly one pane. Two
+panes side by side need two strips, and two panes stacked need the lower one's
+strip halfway down the grid, which a row withheld from the top of the window
+cannot reach.
+
+**Decided: the strip becomes part of the pane, and Zed lays out the row it goes
+in.** `Pane::set_render_tab_bar` is public and replaces the element a pane puts
+above its item. `ted` installs one that paints nothing and is exactly `CELL_HEIGHT`
+tall, and Zed's own layout then insets each pane's item by exactly one cell row —
+in the pane, wherever the pane is. `ted` paints its strip into that row, which it
+finds where it finds everything else: at the top of the pane's reported rect.
+
+Three things fall out of this, all of them subtractions:
+
+- **`reserved_rows` loses its `tabs` argument**, `Frame` loses `top_rows`,
+  `Backend::tab_rows` goes, and so does `shift_down` — the ten lines §24.7
+  described, and the only ten lines in the projection that ever moved a rect Zed
+  had reported. The rows `ted` withholds from the window are once again the rows
+  at the *bottom* of the grid, which is what they were before the strip existed.
+- **The mouse loses its top-row correction** (§17, "The window is not the grid").
+  The window's row 0 is the terminal's row 0 again, so a click on a tab is a click
+  in the window, not a report that has to have a row subtracted from it before it
+  is dispatched.
+- **The strip appears for a single item too**, because the row is now the pane's
+  and a pane that hid it for one item would resize its own editor every time a
+  second file opened. This answers §23's fourth remaining question: a session with
+  one dirty buffer has its `•` on the strip, where the file's name already is,
+  rather than nowhere but `ctrl-g`.
+
+An *empty* pane still has no strip: Zed renders no tab bar when a pane has no
+active item, so there is no row to paint one in, and the hint screen (§24.7) fills
+the pane's whole rect. In a split that state never lasts a frame — closing the
+last item in one pane of a tree removes the pane and the other takes its space,
+which is `Pane`'s own behaviour and vim's — so the hint screen is what the *last*
+pane shows, and M3.5's "an empty pane is a state `ted` sits in" turns out to have
+been a statement about the last pane all along.
+
+### 25.3 What separates two panes, and what marks the live one
+
+**Decided: a rule down the right edge of every pane that is not against the grid's
+right edge, and nothing between panes stacked vertically.** The lower pane's strip
+is already a horizontal band the eye reads as a boundary; spending a whole row on
+a second one buys nothing. A vertical boundary has no such luck — two files of
+code abutting with nothing between them is unreadable — so the pane's last column
+carries `│` in the theme's border colour, and the text rect painted inside is
+clipped one column short of it.
+
+The column is not free, but it is nearly free: the editor's usable width is
+already its rect minus a gutter, a margin and an em (§10.2), so the wrap width
+Zed chose almost always leaves the last column of a pane empty anyway. Clipping
+guarantees it in the case where it does not.
+
+**Decided: the live pane is the one with the cursor in it, and its strip is the
+one painted in full colour.** A terminal has one hardware cursor (§7) and it goes
+where the keyboard goes, which is the strongest possible marker and costs nothing.
+Alongside it, an unfocused pane's strip paints its active tab on the inactive
+ground with muted text, so the strips agree with the cursor about which pane is
+live. Nothing else is dimmed: an unfocused pane's *text* is the same text, and
+graying out half the screen to say which half is typing into is a high price for
+something the cursor already says. Selections stay painted in an unfocused pane —
+they are state the user set — but its cursor does not, which is what vim does with
+an unfocused window.
+
+**The status line stops reporting the pane index.** §14.3 put it there because M1
+could not render a split and "invisible state the user can navigate into is the
+failure mode to avoid"; M4 renders the split, so the index says nothing the screen
+does not. The sparse bar's rule is that a transient earns its place by saying
+something nothing else says (§21/M3.5), and this one has stopped.
+
+### 25.4 What the projection becomes
+
+`ViewSnapshot`'s single `editor` becomes a list of panes:
+
+```rust
+pub struct ViewSnapshot {
+    pub panes: Vec<PaneView>,
+    pub terminal: Option<TerminalView>,   // §25.5
+    // ... status, command_line, overlay, hover, menu, prompt, notifications
+}
+
+pub struct PaneView {
+    pub rect: CellRect,            // the pane's own extent, from its bounds
+    pub tabs: Option<TabStripView>,// in the pane's top row; None when empty
+    pub editor: Option<EditorView>,
+    pub hint: Option<HintView>,    // the empty pane's screen, in this rect
+    pub active: bool,
+    pub divider: bool,             // a rule down the last column
+}
+```
+
+`hint` moves off the snapshot and into the pane because emptiness is a property of
+a pane and not of the session: one pane of a split can be empty while the other
+holds a file, and M3.5's "the hint screen or the editor" is a choice made per pane
+from M4 on. Everything that anchors to *the* editor — the completions box (§24.9),
+the hover panel (§24.8), the terminal's own cursor — anchors to the active pane's,
+through one accessor, so there is one answer to "which editor" rather than one per
+consumer.
+
+Everything `ted` paints over the whole grid stays over the whole grid: the status
+line, the `:` line, notifications, prompts, and the lists in §24.1. A finder is a
+workspace-level surface — it opens into whichever pane is active, and centring it
+over that pane rather than over the screen would move it every time the user
+changed panes.
+
+### 25.5 The terminal panel
+
+**What it is, and why it is not §7.1.** §7.1 already runs one program on the real
+terminal by handing it over and taking it back, which covers `:!make` and
+`:Explore` and needs no emulator. What it cannot do is keep a shell *beside* the
+editor, because the editor is not on screen while the child holds the terminal.
+That is the whole of what the panel adds, and it is why the panel is worth an
+emulator that §7.1 is not.
+
+**Decided: read the terminal's grid, not its element tree.** `terminal_view` is a
+GPUI view over `alacritty_terminal`, and `TerminalElement` turns a grid of cells
+into shaped runs — which is exactly the transformation `ted` spends §4.2 undoing.
+`Terminal::last_content()` is the grid before that happens: `Vec<IndexedCell>`
+with a point, a character, foreground and background, and flags. Every one of
+those maps onto a terminal cell with no measurement involved, because it *is* a
+terminal cell. Nothing here goes through `ViewSnapshot`'s editor projection.
+
+**Where it goes.** `Content::terminal_bounds` carries the bounds the element was
+laid out at, in window pixels, along with the cell width and line height the
+element measured — which under §5 are `CELL_WIDTH` and `CELL_HEIGHT`. So the
+panel's rect is a reported bound like every other rect in this section, and the
+pty's own row and column count is Zed's answer to how many cells that rect holds.
+`ted` never sizes the pty: `TerminalElement` does it from the bounds, and those
+bounds came from a window `ted` sized in cells.
+
+**Colour.** `alacritty_terminal`'s `Color` is one of a named ANSI slot, a 256-colour
+index, or an RGB triple. Zed's theme carries the sixteen named slots
+(`ThemeColors::terminal_ansi_*`), which is what GUI Zed resolves them against, so
+`ted` resolves them the same way and hands the result to §12's palette like any
+other colour. An indexed or RGB colour is already what it is. The flags —
+`INVERSE`, `BOLD`, `ITALIC`, `UNDERLINE`, `STRIKEOUT`, `DIM`, `HIDDEN` — are
+terminal attributes on both sides of the projection, which is what makes this
+nearly the one surface in `ted` that loses nothing at all in translation.
+
+*Nearly*, because two of those flags cannot be read. `terminal::Cell` names
+`is_inverse`, `is_bold`, `is_italic`, `is_dim`, `has_underline`, `has_strikeout`
+and `is_wide_char_spacer`, and keeps alacritty's `Flags` bitset private — so
+`HIDDEN` (a concealed cell paints its text anyway) and
+`LEADING_WIDE_CHAR_SPACER` (the placeholder written before a wide glyph that
+would split across a wrap, which is a space and so falls through the blank test
+unless the pen had a colour at that moment) have no accessor to go through. Both
+are one upstream reader each and neither is worth one yet: a password prompt that
+echoes nothing is the only common `HIDDEN`, and it is `HIDDEN` on the *shell's*
+side rather than in what `ted` paints.
+
+**Decided: the panel's cursor is the terminal's, and it is `ted`'s hardware cursor
+while the panel has focus.** A terminal with a block cursor drawn as an inverted
+cell next to a hardware cursor blinking in an editor is two cursors; the rule
+stays what §7 set — one hardware cursor, in whatever owns the keyboard.
+
+**Decided: `ctrl-c` belongs to the panel while the panel has focus.** The frame
+loop treats `ctrl-c` as the way out of `ted` when no surface of `ted`'s own is open
+(§7), and a shell in the panel needs it to mean what it means in a shell. The test
+is the same one the `:` line and an open list already answer — who owns the
+keyboard — with the panel added to the list of things that can own it.
+
+**Its height is pinned in cells.** The panel's own default is 320 pixels, which is
+a fifth of a GUI window and twenty rows of a terminal's twenty-four — opening it
+would leave the editor one line of code. `ted` pins `terminal.default_height` to a
+third of the grid, never fewer than five rows, which is the same answer §5 gives
+everywhere else: a measurement that means something in pixels has to be said again
+in cells. A resize the user makes afterwards is serialised with the workspace and
+wins over the pin.
+
+**What the panel does not get.** No mouse selection inside it (§17's reporting is
+off by default and the panel would need its own hit testing), no scrollback beyond
+what the grid shows, and **no strip of its own**: the panel's pane is not in the
+workspace's `panes()`, its group is private to `TerminalPanel`, and there are no
+bounds to paint a strip against — while the thing it would name is a shell, which
+names itself in its prompt. The rows Zed lays out above the grid inside the dock
+take the editor's ground like any other cells the pane tree does not claim
+(§25.4).
+
+### 25.6 What M4 leaves out, what it needs upstream, and when it is done
+
+**Left out on purpose.**
+
+| Left out | Where it goes |
+|---|---|
+| A project panel | never, by §23's decision: `:Explore` (§13.4) covers browsing, and a sidebar would duplicate it |
+| Left and right docks, and any panel but the terminal's | not deferred so much as absent — nothing else `ted` bootstraps registers one |
+| Mouse-driven pane resizing and tab clicks | the strip and the divider are painted, not hit-tested; `<C-w>` and `<C-w>>` are the interface |
+| Terminal scrollback, selection and search in the panel | past M4; the panel projects the visible grid |
+| Following a collaborator into another pane | M5 with the rest of collaboration (§18) |
+
+**Upstream changes.** None. **M4 requires no change to any crate but `ted`**,
+which is the second milestone that can say so (§24.10 was the first) and is a
+consequence of the model rather than a coincidence: every geometry M4 needs is
+one Zed had already computed and already exposed —
+`Workspace::bounding_box_for_pane` for the pane, `Pane::set_render_tab_bar` for
+the strip's row, `Editor::last_bounds` for the text, and
+`Content::terminal_bounds` for the panel. A milestone about layout is exactly the
+milestone that should need nothing, because layout is the half of the design
+(§4.2) that was never `ted`'s to do.
+
+**Acceptance.** A `:vsplit` puts two files side by side with a rule between them,
+each under a strip of its own; `<C-w>h` and `<C-w>l` move the cursor across the
+rule and the strips agree with it about which pane is live; `<C-w><` moves the
+rule by exactly one column, because a pane resize is in pixels and a pixel column
+is a cell (§14.3). A terminal panel opens over the bottom of the grid, runs a
+command and shows its output — and `ctrl-c` while it has focus interrupts what is
+running in it rather than ending the session, while the same key outside it still
+ends the session. The pty harness (§20.3) asserts all of it against the real
+binary's grid: the rule's column before and after a resize, the cursor's column
+after each `<C-w>`, both strips on one row, and the panel's output beside an
+editor that is still there.
+
+formatted by test prettier

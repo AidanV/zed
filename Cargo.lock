@@ -18818,6 +18818,8 @@ dependencies = [
  "settings",
  "tab_switcher",
  "tempfile",
+ "terminal",
+ "terminal_view",
  "theme",
  "theme_settings",
  "unicode-segmentation",

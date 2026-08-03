@@ -67,6 +67,12 @@ settings.workspace = true
 # SPEC §24.2's table retargets onto `ted`'s own.
 tab_switcher.workspace = true
 tempfile.workspace = true
+# The terminal panel is projected from the emulator's grid rather than from its
+# element tree (SPEC §25.5). `terminal` carries the cell and colour types, and
+# `terminal_view` the panel itself and the theme's own colour resolution, so
+# `alacritty_terminal` is never reached for directly.
+terminal.workspace = true
+terminal_view.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
 unicode-segmentation.workspace = true

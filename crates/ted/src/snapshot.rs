@@ -69,11 +69,25 @@ pub enum CursorShape {
 pub struct ViewSnapshot {
     pub columns: u16,
     pub rows: u16,
-    pub editor: Option<EditorView>,
-    /// The pane's other items, along the top (SPEC §24.7). The only thing `ted`
-    /// paints above the editor, and the reason every rect the editor reports is
-    /// shifted down by a row while it is there.
-    pub tabs: Option<TabStripView>,
+    /// The cells the GPUI window occupies — the grid minus the rows `ted` keeps
+    /// for itself (SPEC §10.2) — painted with the editor's ground before
+    /// anything else.
+    ///
+    /// The pane tree does not always claim all of them: a workspace lays a
+    /// divider or a collapsed dock out around the center group, and those cells
+    /// are still inside the window. Filling the window first is what keeps them
+    /// from showing the real terminal's background through the middle of an
+    /// opaque session (SPEC §25.1).
+    pub window: CellRect,
+    pub background: Option<Hsla>,
+    /// The pane tree, one entry per leaf, each at the rect its own bounds
+    /// reported (SPEC §25.1). One pane fills the grid; a split fills its share
+    /// of it.
+    pub panes: Vec<PaneView>,
+    /// The terminal panel's grid, when the dock holding it is open
+    /// (SPEC §25.5). Painted over the panes, because the dock's rows are rows
+    /// the center group no longer has.
+    pub terminal: Option<crate::terminal::TerminalPanelView>,
     pub status: StatusView,
     pub command_line: Option<CommandLineView>,
     /// A list painted *over* the editor — the finder or the switcher
@@ -86,16 +100,68 @@ pub struct ViewSnapshot {
     /// The language server's completions, or the code actions deployed from the
     /// gutter — one box, because they are one `editor` field (SPEC §24.9).
     pub menu: Option<MenuView>,
-    /// The screen an empty pane sits on (SPEC §24.7). Mutually exclusive with
-    /// `editor`: it is what is painted when there is no item to paint.
-    pub hint: Option<HintView>,
     pub prompt: Option<PromptView>,
     pub notifications: Vec<String>,
     /// Where to park the terminal's hardware cursor. SPEC §7 places the real
     /// cursor rather than drawing one, so the terminal blinks it and screen
-    /// readers see it.
+    /// readers see it. It belongs to the active pane, or to the terminal panel
+    /// while that has focus — a terminal has one, and it goes where the keyboard
+    /// goes (SPEC §25.3, §25.5).
     pub cursor: Option<CellPoint>,
     pub cursor_shape: CursorShape,
+}
+
+impl ViewSnapshot {
+    /// The pane the keyboard is in, which is what every editor-anchored surface
+    /// means by "the editor" (SPEC §25.4).
+    pub fn active_pane(&self) -> Option<&PaneView> {
+        self.panes
+            .iter()
+            .find(|pane| pane.active)
+            .or_else(|| self.panes.first())
+    }
+
+    pub fn editor(&self) -> Option<&EditorView> {
+        self.active_pane()?.editor.as_ref()
+    }
+
+    pub fn editor_mut(&mut self) -> Option<&mut EditorView> {
+        let index = self
+            .panes
+            .iter()
+            .position(|pane| pane.active)
+            .or(if self.panes.is_empty() { None } else { Some(0) })?;
+        self.panes.get_mut(index)?.editor.as_mut()
+    }
+}
+
+/// One leaf of the pane tree, at the rect the tree laid it out in
+/// (SPEC §25.1).
+///
+/// A pane is what `ted` paints *between*: everything inside it — the strip, the
+/// editor, the hint screen — is placed against this rect rather than against the
+/// grid, which is the whole of what M4 changed about the projection.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PaneView {
+    pub rect: CellRect,
+    /// The pane's items, in its own top row — the row Zed's layout leaves for it
+    /// because `ted` replaced the tab bar with an element exactly a cell tall
+    /// (SPEC §25.2). `None` for a pane with no items, which has no tab bar and
+    /// so no row.
+    pub tabs: Option<TabStripView>,
+    pub editor: Option<EditorView>,
+    /// The screen an empty pane sits on (SPEC §24.7), in this pane's rect.
+    /// Mutually exclusive with `editor`: it is what is painted when this pane
+    /// has no item to paint.
+    pub hint: Option<HintView>,
+    /// Whether the keyboard is here. The cursor says so already; the strip
+    /// agrees with it, and nothing else is dimmed (SPEC §25.3).
+    pub active: bool,
+    /// Whether the pane's last column carries a rule, which it does whenever
+    /// something is on the other side of it (SPEC §25.3).
+    pub divider: bool,
+    pub background: Option<Hsla>,
+    pub divider_color: Option<Hsla>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -458,14 +524,21 @@ pub enum OverlayPlacement {
     TopCentre,
 }
 
-/// The pane's items along the top (SPEC §24.7).
+/// The pane's items along its own top row (SPEC §24.7, §25.2).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TabStripView {
+    /// The row Zed's layout left for it at the top of the pane, which is where
+    /// the strip is painted and how wide it may be (SPEC §25.2).
+    pub rect: CellRect,
     pub tabs: Vec<TabView>,
     pub active: usize,
     /// The first tab painted. Overflow scrolls rather than eliding the middle,
     /// so the active tab is always on screen.
     pub first: usize,
+    /// Whether this strip's pane holds the keyboard. An unfocused pane paints
+    /// its active tab on the inactive ground, so the strips agree with the
+    /// cursor about which pane is live (SPEC §25.3).
+    pub focused: bool,
     pub active_background: Option<Hsla>,
     pub background: Option<Hsla>,
     pub active_foreground: Option<Hsla>,
@@ -574,7 +647,11 @@ impl MenuRow {
 /// blank grid wondering whether the session is still alive.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HintView {
-    /// The wordmark above the rows, one line per cell row. Empty when the grid
+    /// The empty pane's own rect (SPEC §25.1): one pane of a split can be empty
+    /// while the other holds a file, so the screen is centred in the pane rather
+    /// than in the grid.
+    pub rect: CellRect,
+    /// The wordmark above the rows, one line per cell row. Empty when the pane
     /// is not the shape for it, which the renderer decides.
     pub logo: &'static [&'static str],
     pub rows: Vec<HintRow>,
@@ -649,10 +726,6 @@ pub struct StatusView {
     /// Multi-keystroke bindings in flight, e.g. `d2` while `d2w` is being typed
     /// (SPEC §8.3).
     pub pending_keys: Option<String>,
-    /// Surfaced whenever there is more than one pane, because M1 renders only
-    /// the active one and invisible state the user can navigate into is the
-    /// failure mode to avoid (SPEC §14.3).
-    pub panes: Option<(usize, usize)>,
     /// A wrap pass still running after a resize on a large file (SPEC §10.2).
     pub rewrapping: bool,
     /// Whether the pane has nothing open at all. The bar says so rather than
@@ -732,11 +805,6 @@ pub struct Frame<'a> {
     /// The rows `ted` paints itself, withheld from the GPUI window
     /// (SPEC §10.2). The editor's rect can never reach into them.
     pub reserved_rows: u16,
-    /// How many of those rows sit *above* the editor — the tab strip, and
-    /// nothing else in M2. Withholding them is not enough on its own: every rect
-    /// the editor reports starts at the window's row 0 and has to be shifted
-    /// down by exactly this much (SPEC §24.7).
-    pub top_rows: u16,
     pub command_line: Option<CommandLineView>,
     /// `ted`'s own list, already built by [`crate::overlay`]. It floats over the
     /// editor and costs no reserved rows (SPEC §24.1).
@@ -751,6 +819,10 @@ pub struct Frame<'a> {
     /// sits on names the ways out of it (SPEC §24.7), and without vim there is
     /// no `:` line for three of them to be typed into (SPEC §24.5).
     pub vim: bool,
+    /// The terminal panel's grid, already read from the emulator by
+    /// [`crate::terminal`] (SPEC §25.5). It arrives built rather than being read
+    /// here because none of it goes through the editor projection.
+    pub terminal: Option<crate::terminal::TerminalPanelView>,
     pub workspace: &'a Entity<Workspace>,
 }
 
@@ -764,27 +836,21 @@ pub fn build(frame: Frame<'_>, window: &mut Window, cx: &mut App) -> ViewSnapsho
     let notifications = frame.notifications;
     let overlay = frame.overlay;
     let hover = frame.hover;
-    let workspace = frame.workspace.read(cx);
-    let active_pane = workspace.active_pane().clone();
-    let panes = workspace.panes().len();
-    let pane_index = workspace
-        .panes()
-        .iter()
-        .position(|pane| pane == &active_pane)
-        .map(|index| index + 1)
-        .unwrap_or(1);
-    // Gated on the row already withheld for it rather than on the item count
-    // again: one answer to "is there a strip", so the window's size and the
-    // rects painted inside it cannot disagree (SPEC §24.7).
-    let tabs = (frame.top_rows > 0)
-        .then(|| tab_strip(&active_pane, frame.columns, window, cx))
-        .flatten();
+    let active_pane = frame.workspace.read(cx).active_pane().clone();
+    let pane_entities = frame.workspace.read(cx).panes().to_vec();
+    // The window is the grid minus the rows `ted` keeps for itself, and every
+    // rect Zed reports is inside it (SPEC §10.2). With one pane that window is
+    // also the pane, which is exactly the case `bounding_box_for_pane` answers
+    // `None` for: no axis ever laid a lone root pane out.
+    let window_rect = CellRect::new(
+        0,
+        0,
+        frame.columns,
+        frame.rows.saturating_sub(frame.reserved_rows),
+    );
 
-    let colors = cx.theme().colors();
+    let colors = cx.theme().colors().clone();
     let mut status = StatusView {
-        // Surfaced only when there is more than one, because M1 renders just
-        // the active pane (SPEC §14.3).
-        panes: (panes > 1).then_some((pane_index, panes)),
         pending_keys: pending_keys(window),
         diagnostics: Some(diagnostic_counts(frame.workspace, cx)),
         background: Some(colors.status_bar_background),
@@ -792,65 +858,56 @@ pub fn build(frame: Frame<'_>, window: &mut Window, cx: &mut App) -> ViewSnapsho
         ..Default::default()
     };
 
-    let Some(item) = workspace.active_item(cx) else {
-        status.empty = true;
-        return ViewSnapshot {
-            columns: frame.columns,
-            rows: frame.rows,
-            tabs,
-            status,
-            command_line: frame.command_line,
-            overlay,
-            hint: Some(hint_screen(frame.vim, window, cx)),
-            prompt: frame.prompt,
-            notifications,
-            ..Default::default()
-        };
+    let mut panes = Vec::with_capacity(pane_entities.len());
+    let mut active_built = None;
+    for pane in &pane_entities {
+        let rect = frame
+            .workspace
+            .read(cx)
+            .bounding_box_for_pane(pane)
+            .map(|bounds| cell_rect(bounds, window_rect))
+            .unwrap_or(window_rect);
+        let active = pane == &active_pane;
+        let built = pane_view(pane, rect, window_rect, active, frame.vim, window, cx);
+
+        if active {
+            status.empty = built.view.hint.is_some();
+            status.mode = built.mode;
+            status.position = built.position;
+            status.rewrapping = built.rewrapping;
+            status.takeover = built.takeover;
+            active_built = Some((built.cursor, built.cursor_shape, built.menu));
+        }
+        panes.push(built.view);
+    }
+
+    let (cursor, cursor_shape, menu) = active_built.unwrap_or_default();
+    let mut snapshot = ViewSnapshot {
+        columns: frame.columns,
+        rows: frame.rows,
+        window: window_rect,
+        background: Some(colors.editor_background),
+        panes,
+        terminal: frame.terminal,
+        status,
+        command_line: frame.command_line,
+        overlay,
+        menu,
+        prompt: frame.prompt,
+        notifications,
+        cursor,
+        cursor_shape,
+        ..Default::default()
     };
-
-    let Some(editor) = item.act_as::<Editor>(cx) else {
-        return ViewSnapshot {
-            columns: frame.columns,
-            rows: frame.rows,
-            tabs,
-            status,
-            command_line: frame.command_line,
-            overlay,
-            prompt: frame.prompt,
-            notifications,
-            ..Default::default()
-        };
-    };
-
-    let mut snapshot = for_editor(
-        &editor,
-        frame.columns,
-        frame.rows,
-        frame.reserved_rows,
-        window,
-        cx,
-    );
-    status.mode = snapshot.status.mode.take();
-    status.position = snapshot.status.position;
-    status.rewrapping = snapshot.status.rewrapping;
-    // Read here rather than in `for_editor` because it is a workspace-level
-    // decision how long the takeover lasts, and `vim::Vim::action` already
-    // clears the label on the next action outside a dot replay — so the bar
-    // comes back on its own with no dismissal logic here (SPEC §24.5).
-    status.takeover = vim::status_label(editor.read(cx), cx).map(|label| label.to_string());
-
-    // The one addition SPEC §24.7 calls for, applied to the text rect, the
-    // gutter rect and the cursor together: applying it to two of the three puts
-    // the cursor a row off its own text.
-    shift_down(&mut snapshot, frame.top_rows);
-
-    snapshot.tabs = tabs;
-    snapshot.status = status;
-    snapshot.command_line = frame.command_line;
+    // The panel's own cursor wins while the panel has the keyboard: there is one
+    // hardware cursor and it goes where the typing goes (SPEC §25.5).
+    if let Some(terminal) = snapshot.terminal.as_ref()
+        && terminal.focused
+    {
+        snapshot.cursor = terminal.cursor;
+        snapshot.cursor_shape = terminal.cursor_shape;
+    }
     snapshot.hover = place_hover(hover, &snapshot, cx);
-    snapshot.overlay = overlay;
-    snapshot.prompt = frame.prompt;
-    snapshot.notifications = notifications;
     snapshot
 }
 
@@ -907,7 +964,7 @@ const WORDMARK: [&str; 5] = [
 /// no hint. Everything else is typed into the `:` line, which a `--no-vim`
 /// session does not have at all (SPEC §24.5) — so without vim the screen offers
 /// the finder and the one key that always works.
-fn hint_screen(vim: bool, window: &Window, cx: &App) -> HintView {
+fn hint_screen(rect: CellRect, vim: bool, window: &Window, cx: &App) -> HintView {
     let mut rows = Vec::new();
     if let Some(keystrokes) = binding_for(&workspace::ToggleFileFinder::default(), window) {
         rows.push(HintRow {
@@ -944,6 +1001,7 @@ fn hint_screen(vim: bool, window: &Window, cx: &App) -> HintView {
         .unwrap_or(0);
     let colors = cx.theme().colors();
     HintView {
+        rect,
         logo: &WORDMARK,
         rows,
         key_cells,
@@ -965,34 +1023,143 @@ fn binding_for(action: &dyn gpui::Action, window: &Window) -> Option<String> {
     )
 }
 
-fn shift_down(snapshot: &mut ViewSnapshot, rows: u16) {
-    if rows == 0 {
-        return;
+/// A rect Zed reported, in cells (SPEC §5.3, §25.1).
+///
+/// Floored on both axes and then clipped to the window, so a pane whose share of
+/// an odd column count ends half a cell into the next one is painted from the
+/// cell it starts in rather than the one after it — the same half-cell the
+/// single-pane case has always absorbed, and it lands the same way because the
+/// pane on the other side had its own wrap width floored by the same arithmetic.
+fn cell_rect(bounds: gpui::Bounds<gpui::Pixels>, window: CellRect) -> CellRect {
+    let left = cells(bounds.origin.x, CELL_WIDTH).min(window.width);
+    let top = cells(bounds.origin.y, CELL_HEIGHT).min(window.height);
+    let width = cells(bounds.size.width, CELL_WIDTH).min(window.width - left);
+    let height = cells(bounds.size.height, CELL_HEIGHT).min(window.height - top);
+    CellRect::new(left, top, width, height)
+}
+
+/// One pane, and what the frame needs from it when it is the active one.
+///
+/// Everything after `view` is the active pane's alone — the one cursor, the one
+/// menu, the one thing the status line is about — so an inactive pane fills them
+/// in with nothing rather than with its own answers (SPEC §25.4).
+#[derive(Default)]
+struct BuiltPane {
+    view: PaneView,
+    cursor: Option<CellPoint>,
+    cursor_shape: CursorShape,
+    menu: Option<MenuView>,
+    mode: Option<String>,
+    position: Option<(u32, u32)>,
+    rewrapping: bool,
+    /// Vim's `ctrl-g` location string while it stands (SPEC §24.5).
+    takeover: Option<String>,
+}
+
+/// The projection of one pane: its strip, its item, and the rule down its edge
+/// (SPEC §25.1).
+fn pane_view(
+    pane: &Entity<Pane>,
+    rect: CellRect,
+    window_rect: CellRect,
+    active: bool,
+    vim: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> BuiltPane {
+    let colors = cx.theme().colors();
+    // Something is on the other side of this edge — another pane, and never the
+    // grid's own edge, because a rule there would separate the pane from
+    // nothing (SPEC §25.3).
+    let divider = rect.x.saturating_add(rect.width) < window_rect.width;
+    let mut view = PaneView {
+        rect,
+        active,
+        divider,
+        background: Some(colors.editor_background),
+        divider_color: Some(colors.border),
+        ..Default::default()
+    };
+
+    let item = pane.read(cx).active_item();
+    let Some(item) = item else {
+        // No item means no tab bar, so Zed left no row for a strip and the hint
+        // screen has the pane's whole rect (SPEC §25.2).
+        view.hint = Some(hint_screen(rect, vim, window, cx));
+        return BuiltPane {
+            view,
+            ..Default::default()
+        };
+    };
+
+    view.tabs = tab_strip(pane, rect, active, window, cx);
+    let Some(editor) = item.act_as::<Editor>(cx) else {
+        // An item `ted` has no projection for. The pane keeps its strip, which
+        // is what names the thing that is open.
+        return BuiltPane {
+            view,
+            ..Default::default()
+        };
+    };
+
+    // The rows and columns of the pane the item may be painted in: the strip's
+    // row is Zed's, taken out of the pane above the item, and the rule's column
+    // is `ted`'s, taken out below (SPEC §25.2, §25.3).
+    let mut area = rect;
+    if view.tabs.is_some() {
+        area.y = area.y.saturating_add(1);
+        area.height = area.height.saturating_sub(1);
     }
-    if let Some(editor) = snapshot.editor.as_mut() {
-        editor.text_rect.y += rows;
-        editor.gutter_rect.y += rows;
-        // Selection spans name a display row and are resolved against the text
-        // rect when they are painted, so they move with it. The cursors are
-        // already grid points and do not.
-        for cursor in &mut editor.secondary_cursors {
-            cursor.row += rows;
-        }
+    if divider {
+        area.width = area.width.saturating_sub(1);
     }
-    if let Some(menu) = snapshot.menu.as_mut() {
-        menu.rect.y += rows;
-    }
-    if let Some(cursor) = snapshot.cursor.as_mut() {
-        cursor.row += rows;
+
+    let (built, cursor) =
+        editor.update(cx, |editor, cx| build_editor_view(editor, area, window, cx));
+    let mode = vim::mode(editor.read(cx), cx).map(|mode| mode.to_string());
+    let cursor_shape = match mode.as_deref() {
+        Some("INSERT") => CursorShape::Bar,
+        Some("REPLACE") => CursorShape::Underline,
+        _ => CursorShape::Block,
+    };
+    // Only the active pane's: the box is one surface over the grid, and an
+    // inactive pane has nothing typing into it to have opened one.
+    let menu = active
+        .then(|| crate::menu::read(&editor, cx))
+        .flatten()
+        .and_then(|contents| place_menu(contents, &built.editor, cursor, cx));
+    // Read here rather than in `build` because the label is the editor's, and
+    // read *only* while the pane is active because the bar is one row about one
+    // pane. `vim::Vim::action` already clears it on the next action outside a dot
+    // replay, so the bar comes back on its own with no dismissal logic
+    // (SPEC §24.5).
+    let takeover = active
+        .then(|| vim::status_label(editor.read(cx), cx))
+        .flatten()
+        .map(|label| label.to_string());
+
+    view.editor = Some(built.editor);
+    BuiltPane {
+        view,
+        // Only the pane with the keyboard in it gets the one hardware cursor
+        // there is; an unfocused pane keeps its selections and loses its caret,
+        // which is what vim does with an unfocused window (SPEC §25.3).
+        cursor: active.then_some(cursor).flatten(),
+        cursor_shape,
+        menu,
+        mode,
+        position: built.primary_position,
+        rewrapping: built.rewrapping,
+        takeover,
     }
 }
 
-/// The projection of a single editor, without a workspace around it.
+/// The projection of a single editor filling the grid, without a workspace
+/// around it.
 ///
-/// `build` goes through here, and so do tests: everything the cell contract
-/// governs — rects, wrap, cursor placement, gutter, selections, syntax spans —
-/// is decided in this function, so exercising it needs no `Project`, `Client`
-/// or database.
+/// Tests go through here: everything the cell contract governs — rects, wrap,
+/// cursor placement, gutter, selections, syntax spans — is decided under this
+/// function, so exercising it needs no `Project`, `Client` or database.
 pub fn for_editor(
     editor: &Entity<Editor>,
     columns: u16,
@@ -1001,10 +1168,9 @@ pub fn for_editor(
     window: &mut Window,
     cx: &mut App,
 ) -> ViewSnapshot {
-    let editor_height = rows.saturating_sub(reserved_rows);
-    let (view, cursor) = editor.update(cx, |editor, cx| {
-        build_editor_view(editor, columns, editor_height, window, cx)
-    });
+    let area = CellRect::new(0, 0, columns, rows.saturating_sub(reserved_rows));
+    let (view, cursor) =
+        editor.update(cx, |editor, cx| build_editor_view(editor, area, window, cx));
 
     let mode = vim::mode(editor.read(cx), cx).map(|mode| mode.to_string());
     let cursor_shape = match mode.as_deref() {
@@ -1019,7 +1185,13 @@ pub fn for_editor(
     ViewSnapshot {
         columns,
         rows,
-        editor: Some(view.editor),
+        window: area,
+        panes: vec![PaneView {
+            rect: area,
+            editor: Some(view.editor),
+            active: true,
+            ..Default::default()
+        }],
         status: StatusView {
             mode,
             position: view.primary_position,
@@ -1176,11 +1348,20 @@ fn first_visible_menu_row(selected: Option<usize>, total: usize, visible: usize)
 
 /// The pane's items along the top, and where the strip has to start so the
 /// active tab is on screen (SPEC §24.7).
-fn tab_strip(pane: &Entity<Pane>, columns: u16, window: &Window, cx: &App) -> Option<TabStripView> {
+fn tab_strip(
+    pane: &Entity<Pane>,
+    rect: CellRect,
+    focused: bool,
+    window: &Window,
+    cx: &App,
+) -> Option<TabStripView> {
     let items = pane.read(cx).items().cloned().collect::<Vec<_>>();
-    if items.is_empty() {
+    if items.is_empty() || rect.height == 0 {
         return None;
     }
+    // The row Zed's layout leaves at the top of the pane for the element `ted`
+    // put where the tab bar was (SPEC §25.2).
+    let rect = CellRect::new(rect.x, rect.y, rect.width, 1);
 
     // `tab_details` computes exactly the detail level each tab needs, so two
     // files called `mod.rs` grow a directory in their labels and nothing else
@@ -1203,9 +1384,11 @@ fn tab_strip(pane: &Entity<Pane>, columns: u16, window: &Window, cx: &App) -> Op
         .min(tabs.len().saturating_sub(1));
     let colors = cx.theme().colors();
     Some(TabStripView {
-        first: first_visible_tab(&tabs, active, columns),
+        first: first_visible_tab(&tabs, active, rect.width),
+        rect,
         tabs,
         active,
+        focused,
         active_background: Some(colors.tab_active_background),
         background: Some(colors.tab_inactive_background),
         active_foreground: Some(colors.text),
@@ -1257,7 +1440,7 @@ fn place_hover(
     if contents.is_empty() {
         return None;
     }
-    let text_rect = snapshot.editor.as_ref()?.text_rect;
+    let text_rect = snapshot.editor()?.text_rect;
     let cursor = snapshot.cursor?;
     // The rail and the space after it.
     let width = text_rect.width.max(3);
@@ -1485,10 +1668,14 @@ struct BuiltEditor {
     rewrapping: bool,
 }
 
+/// `area` is the cells of the pane the item may be painted in — the pane's rect
+/// less the strip's row above it and the rule's column beside it (SPEC §25.2,
+/// §25.3). Everything here is still read back from the editor; the area only
+/// says what to clip against, which with one pane is the window and with a split
+/// is that pane's share of it.
 fn build_editor_view(
     editor: &mut Editor,
-    columns: u16,
-    rows: u16,
+    area: CellRect,
     window: &mut Window,
     cx: &mut gpui::Context<Editor>,
 ) -> (BuiltEditor, Option<CellPoint>) {
@@ -1501,13 +1688,22 @@ fn build_editor_view(
     let gutter = editor_snapshot.gutter_dimensions(font_id, font_size, &style, window, cx);
 
     let bounds = editor.last_bounds().copied();
-    let origin = bounds.map(|bounds| bounds.origin).unwrap_or_default();
-    let top = cells(origin.y, CELL_HEIGHT);
-    let left = cells(origin.x, CELL_WIDTH);
+    // Before the first frame there are no bounds to read, and the pane's own
+    // area is the closest true statement about where the editor will be.
+    let top = bounds
+        .map(|bounds| cells(bounds.origin.y, CELL_HEIGHT))
+        .unwrap_or(area.y)
+        .max(area.y);
+    let left = bounds
+        .map(|bounds| cells(bounds.origin.x, CELL_WIDTH))
+        .unwrap_or(area.x)
+        .max(area.x);
+    let bottom = area.y.saturating_add(area.height);
+    let right = area.x.saturating_add(area.width);
     let height = bounds
         .map(|bounds| cells(bounds.size.height, CELL_HEIGHT))
-        .unwrap_or(rows)
-        .min(rows.saturating_sub(top));
+        .unwrap_or(area.height)
+        .min(bottom.saturating_sub(top));
 
     // Rounded up rather than floored: the gutter's own margin is a fraction of
     // a cell (SPEC §5.4), and rounding it down would put the first column of
@@ -1523,13 +1719,19 @@ fn build_editor_view(
     let text_width = editor
         .visible_column_count()
         .map(|count| count.max(0.0).floor() as u16)
-        .unwrap_or_else(|| columns.saturating_sub(gutter_cells));
+        .unwrap_or_else(|| right.saturating_sub(left.saturating_add(gutter_cells)));
 
-    let gutter_rect = CellRect::new(left, top, gutter_cells, height);
-    let text_rect = CellRect::new(
-        left + gutter_cells,
+    let text_left = left.saturating_add(gutter_cells);
+    let gutter_rect = CellRect::new(
+        left,
         top,
-        text_width.min(columns.saturating_sub(left + gutter_cells)),
+        gutter_cells.min(right.saturating_sub(left)),
+        height,
+    );
+    let text_rect = CellRect::new(
+        text_left,
+        top,
+        text_width.min(right.saturating_sub(text_left.min(right))),
         height,
     );
 
@@ -2285,7 +2487,7 @@ mod tests {
         let mut session = RealEditor::open(40, 8, "fn main() {\n    let x = 1;\n}\n");
 
         let before = session.snapshot(40, 8);
-        let row0 = &before.editor.as_ref().expect("no editor view").rows[0];
+        let row0 = &before.editor().expect("no editor view").rows[0];
         assert_eq!(
             row0.gutter.crease,
             Some(CreaseState::Foldable),
@@ -2300,7 +2502,7 @@ mod tests {
         session.update(|editor, window, cx| editor.fold_at(MultiBufferRow(0), window, cx));
 
         let after = session.snapshot(40, 8);
-        let editor_view = after.editor.as_ref().expect("no editor view");
+        let editor_view = after.editor().expect("no editor view");
         let row0 = &editor_view.rows[0];
         assert_eq!(row0.gutter.crease, Some(CreaseState::Folded));
         assert!(row0.text.contains('⋯'), "no placeholder in {:?}", row0.text);
@@ -2348,7 +2550,7 @@ mod tests {
         });
 
         let snapshot = session.snapshot(40, 6);
-        let row0 = &snapshot.editor.as_ref().expect("no editor view").rows[0];
+        let row0 = &snapshot.editor().expect("no editor view").rows[0];
         assert_eq!(row0.text, "let x: i32 = 1;");
 
         // The inlay's own span is coloured apart from the surrounding buffer
@@ -2382,7 +2584,7 @@ mod tests {
         });
 
         let snapshot = session.snapshot(40, 6);
-        let text_rect = snapshot.editor.as_ref().expect("no editor view").text_rect;
+        let text_rect = snapshot.editor().expect("no editor view").text_rect;
         let cursor = snapshot.cursor.expect("no cursor in the snapshot");
         let expected_column =
             text_rect.x + text_cells("let x: i32").min(u32::from(u16::MAX)) as u16;
@@ -2416,7 +2618,7 @@ mod tests {
         });
 
         let snapshot = session.snapshot(40, 8);
-        let rows = &snapshot.editor.as_ref().expect("no editor view").rows;
+        let rows = &snapshot.editor().expect("no editor view").rows;
         let block_row = rows
             .iter()
             .find(|row| row.kind == RowKind::Block)
@@ -2425,34 +2627,26 @@ mod tests {
         assert_eq!(block_row.gutter.line_number, None);
     }
 
-    /// SPEC §24.7: a tab strip moves the editor down the grid, and everything
-    /// the projection has already placed in grid coordinates has to move with
-    /// it. Selection spans name a display row and are resolved when they are
-    /// painted, so they are carried already; both kinds of cursor are not.
+    /// SPEC §25.1: a pane's bounds are floored into cells and clipped to the
+    /// window, so an axis that split an odd number of columns lands the right
+    /// pane on the cell it starts in rather than the one after it.
     #[test]
-    fn a_tab_strip_moves_every_cursor_down_with_the_text() {
-        let mut snapshot = ViewSnapshot {
-            editor: Some(EditorView {
-                text_rect: CellRect::new(4, 0, 20, 6),
-                gutter_rect: CellRect::new(0, 0, 4, 6),
-                secondary_cursors: vec![CellPoint { column: 6, row: 2 }],
-                ..Default::default()
-            }),
-            cursor: Some(CellPoint { column: 5, row: 1 }),
-            ..Default::default()
+    fn a_panes_bounds_are_floored_into_the_cell_it_starts_in() {
+        let window = CellRect::new(0, 0, 101, 20);
+        let half = gpui::Bounds {
+            origin: gpui::point(CELL_WIDTH * 50.5, gpui::px(0.0)),
+            size: gpui::size(CELL_WIDTH * 50.5, CELL_HEIGHT * 20.0),
         };
+        let rect = cell_rect(half, window);
+        assert_eq!((rect.x, rect.width), (50, 50));
 
-        shift_down(&mut snapshot, 1);
-
-        let editor = snapshot.editor.expect("no editor view");
-        assert_eq!(editor.text_rect.y, 1);
-        assert_eq!(editor.gutter_rect.y, 1);
-        assert_eq!(
-            editor.secondary_cursors,
-            vec![CellPoint { column: 6, row: 3 }],
-            "a secondary cursor stayed on the row the tab strip took"
-        );
-        assert_eq!(snapshot.cursor, Some(CellPoint { column: 5, row: 2 }));
+        // And nothing reaches past the window, whatever the layout reported.
+        let overrun = gpui::Bounds {
+            origin: gpui::point(gpui::px(0.0), gpui::px(0.0)),
+            size: gpui::size(CELL_WIDTH * 200.0, CELL_HEIGHT * 40.0),
+        };
+        let rect = cell_rect(overrun, window);
+        assert_eq!((rect.width, rect.height), (101, 20));
     }
 
     #[test]

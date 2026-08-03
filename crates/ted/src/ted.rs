@@ -20,4 +20,5 @@ pub mod platform;
 pub mod render;
 pub mod snapshot;
 pub mod suspend;
+pub mod terminal;
 pub mod text_system;

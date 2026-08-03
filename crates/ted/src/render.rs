@@ -14,8 +14,8 @@ use crate::cell::{cluster_cells, text_cells};
 use crate::palette::Palette;
 use crate::snapshot::{
     CellPoint, CellRect, CommandLineView, CreaseState, CursorShape, EditorView, HintView,
-    HoverView, MatchedText, MenuRow, MenuView, OverlayPlacement, OverlayView, PromptView, RowView,
-    SpanStyle, StatusView, StyledText, TabStripView, ViewSnapshot, tab_cells,
+    HoverView, MatchedText, MenuRow, MenuView, OverlayPlacement, OverlayView, PaneView, PromptView,
+    RowView, SpanStyle, StatusView, StyledText, TabStripView, ViewSnapshot, tab_cells,
 };
 
 /// A prompt is always exactly this tall — the question on one row, the numbered
@@ -36,32 +36,39 @@ const SWITCHER_MARGIN: u16 = 4;
 
 /// The rows `ted` paints itself: the status line always, then the `:` / `/` line
 /// when one is open, then a prompt when one is unanswered, then one row per
-/// notification — and the tab strip, which is the only one of them above the
-/// editor. The GPUI window is sized to the grid minus exactly this many rows, so
-/// the editor's reported rect can never overlap them (SPEC §10.2).
+/// notification. Every one of them is at the *bottom* of the grid, and the GPUI
+/// window is sized to the grid minus exactly this many rows, so the rects Zed
+/// reports can never overlap them (SPEC §10.2).
 ///
-/// An open overlay is deliberately absent: it floats over the editor's cells and
-/// costs no rows at all, so a box whose height follows a query never resizes the
-/// window (SPEC §24.1).
-pub fn reserved_rows(command_line: bool, prompt: bool, notifications: usize, tabs: u16) -> u16 {
+/// The tab strip is deliberately absent from M4 on: it is a row inside each
+/// pane, which Zed's own layout leaves for it, rather than a row withheld from
+/// the window (SPEC §25.2). An open overlay is absent for a different reason —
+/// it floats over the editor's cells and costs no rows at all, so a box whose
+/// height follows a query never resizes the window (SPEC §24.1).
+pub fn reserved_rows(command_line: bool, prompt: bool, notifications: usize) -> u16 {
     let reserved =
         1 + usize::from(command_line) + usize::from(prompt) * PROMPT_ROWS + notifications;
-    u16::try_from(reserved)
-        .unwrap_or(u16::MAX)
-        .saturating_add(tabs)
+    u16::try_from(reserved).unwrap_or(u16::MAX)
 }
 
 pub fn render(snapshot: &ViewSnapshot, palette: &Palette, buffer: &mut Buffer) {
-    if let Some(editor) = &snapshot.editor {
-        render_editor(editor, palette, buffer);
+    if let Some(background) = snapshot
+        .background
+        .and_then(|color| palette.surface_background(color))
+    {
+        fill(
+            clamp(snapshot.window, buffer.area),
+            Style::default().bg(background),
+            buffer,
+        );
     }
-    // Mutually exclusive with the editor: this is what is painted when there is
-    // no item to paint (SPEC §24.7).
-    if let Some(hint) = &snapshot.hint {
-        render_hint(hint, snapshot.columns, snapshot.rows, palette, buffer);
+    for pane in &snapshot.panes {
+        render_pane(pane, palette, buffer);
     }
-    if let Some(tabs) = &snapshot.tabs {
-        render_tabs(tabs, snapshot.columns, palette, buffer);
+    // Over the panes, because the dock's rows are rows the center group no
+    // longer has (SPEC §25.5).
+    if let Some(terminal) = &snapshot.terminal {
+        crate::terminal::render(terminal, palette, buffer);
     }
     // Over the editor, and under the overlay: a list the user opened is in front
     // of a panel they left open.
@@ -126,6 +133,50 @@ pub fn render(snapshot: &ViewSnapshot, palette: &Palette, buffer: &mut Buffer) {
             Style::default().add_modifier(Modifier::REVERSED),
             buffer,
         );
+    }
+}
+
+/// One pane: its own ground, whatever it holds, its strip, and the rule down its
+/// edge (SPEC §25.1).
+///
+/// The ground is painted first and across the whole pane rather than only under
+/// the editor, because a pane is more than its editor — the row Zed left for the
+/// strip and the rows a deployed search bar takes are the pane's too, and a pane
+/// that painted only its text rect would leave the terminal's own background
+/// showing through them.
+fn render_pane(pane: &PaneView, palette: &Palette, buffer: &mut Buffer) {
+    let area = clamp(pane.rect, buffer.area);
+    if let Some(background) = pane
+        .background
+        .and_then(|color| palette.surface_background(color))
+    {
+        fill(area, Style::default().bg(background), buffer);
+    }
+
+    if let Some(editor) = &pane.editor {
+        render_editor(editor, palette, buffer);
+    }
+    // Mutually exclusive with the editor: this is what is painted when the pane
+    // has no item to paint (SPEC §24.7).
+    if let Some(hint) = &pane.hint {
+        render_hint(hint, palette, buffer);
+    }
+    if let Some(tabs) = &pane.tabs {
+        render_tabs(tabs, palette, buffer);
+    }
+
+    if pane.divider && area.width > 0 {
+        let column = area.x + area.width - 1;
+        let style = match pane.divider_color {
+            Some(color) => Style::default().fg(palette.color(color)),
+            None => Style::default(),
+        };
+        for row in area.y..area.y + area.height {
+            if let Some(cell) = buffer.cell_mut((column, row)) {
+                cell.set_symbol("│");
+                cell.set_style(style);
+            }
+        }
     }
 }
 
@@ -385,50 +436,65 @@ fn paint_selection(
     }
 }
 
-/// The pane's items along the top, shaped like Zed's: the active tab on the
-/// editor's own background, the inactive ones on a darker ground, separated the
-/// way Zed separates them (SPEC §24.7).
-fn render_tabs(tabs: &TabStripView, columns: u16, palette: &Palette, buffer: &mut Buffer) {
+/// The pane's items along its own top row, shaped like Zed's: the active tab on
+/// the editor's own background, the inactive ones on a darker ground, separated
+/// the way Zed separates them (SPEC §24.7).
+///
+/// The strip is painted in the row Zed's layout left at the top of the pane, and
+/// only within that pane's columns (SPEC §25.2) — which is what makes two panes
+/// side by side carry two strips rather than fighting over one.
+fn render_tabs(tabs: &TabStripView, palette: &Palette, buffer: &mut Buffer) {
+    let area = clamp(tabs.rect, buffer.area);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let ground = tabs
         .background
         .map(|color| Style::default().bg(palette.color(color)))
         .unwrap_or_default();
-    fill(Rect::new(0, 0, columns, 1), ground, buffer);
+    fill(area, ground, buffer);
 
-    let active = Style::default()
-        .fg(color_or_default(tabs.active_foreground, palette))
-        .bg(color_or_default(tabs.active_background, palette));
+    // An unfocused pane's active tab is painted on the inactive ground, so the
+    // strips agree with the cursor about which pane is live (SPEC §25.3).
+    let active = if tabs.focused {
+        Style::default()
+            .fg(color_or_default(tabs.active_foreground, palette))
+            .bg(color_or_default(tabs.active_background, palette))
+    } else {
+        ground.fg(color_or_default(tabs.active_foreground, palette))
+    };
     let inactive = ground.fg(color_or_default(tabs.foreground, palette));
     let separator = ground.fg(color_or_default(tabs.separator, palette));
 
-    let mut x = 0u16;
+    let right = area.x + area.width;
+    let mut x = area.x;
     for (index, tab) in tabs.tabs.iter().enumerate().skip(tabs.first) {
         if index > tabs.first {
-            if x >= columns {
+            if x >= right {
                 return;
             }
-            write("│", Rect::new(x, 0, 1, 1), separator, buffer);
+            write("│", Rect::new(x, area.y, 1, 1), separator, buffer);
             x += 1;
         }
 
-        let width = tab_cells(tab).min(columns.saturating_sub(x));
+        let width = tab_cells(tab).min(right.saturating_sub(x));
         if width == 0 {
             return;
         }
-        let area = Rect::new(x, 0, width, 1);
+        let cells = Rect::new(x, area.y, width, 1);
         let style = if index == tabs.active {
             active
         } else {
             inactive
         };
-        fill(area, style, buffer);
+        fill(cells, style, buffer);
         // `•` after the label is unsaved work, matching the switcher's rows.
         let label = if tab.modified {
             format!(" {} •", tab.label)
         } else {
             format!(" {}", tab.label)
         };
-        write(&label, area, style, buffer);
+        write(&label, cells, style, buffer);
         x += width;
     }
 }
@@ -582,17 +648,17 @@ fn render_menu(menu: &MenuView, palette: &Palette, buffer: &mut Buffer) {
 
 /// The screen an empty pane sits on (SPEC §24.7): the wordmark, then the ways
 /// out of it, centred, keys in one column and what they do in the next.
-fn render_hint(hint: &HintView, columns: u16, rows: u16, palette: &Palette, buffer: &mut Buffer) {
+fn render_hint(hint: &HintView, palette: &Palette, buffer: &mut Buffer) {
+    let area = clamp(hint.rect, buffer.area);
+    let columns = area.width;
+    let rows = area.height;
     let ground = Style::default()
         .fg(color_or_default(hint.foreground, palette))
         .bg(color_or_default(hint.background, palette));
-    // The whole grid above the status line, because there is no editor behind
-    // this to have filled it in already.
-    fill(
-        Rect::new(0, 0, columns, rows.saturating_sub(1)),
-        ground,
-        buffer,
-    );
+    // The pane's whole rect, because there is no editor behind this to have
+    // filled it in already — and the pane's rather than the grid's, since one
+    // pane of a split can be empty while the other holds a file (SPEC §25.1).
+    fill(area, ground, buffer);
 
     let widest = hint
         .rows
@@ -603,7 +669,7 @@ fn render_hint(hint: &HintView, columns: u16, rows: u16, palette: &Palette, buff
         .max()
         .unwrap_or(0);
     let height = hint.rows.len().min(usize::from(u16::MAX)) as u16;
-    if widest == 0 || widest > columns || height + 1 >= rows {
+    if widest == 0 || widest > columns || height >= rows {
         return;
     }
 
@@ -617,26 +683,26 @@ fn render_hint(hint: &HintView, columns: u16, rows: u16, palette: &Palette, buff
     // The mark is the first thing to go when the grid cannot hold both: the
     // hints are what the screen is for, and a wordmark clipped to fit says less
     // than no wordmark at all. The extra row is the gap under it.
-    let logo_rows = if logo_cells > 0 && logo_cells <= columns && height + logo_height + 2 < rows {
+    let logo_rows = if logo_cells > 0 && logo_cells <= columns && height + logo_height + 1 < rows {
         logo_height + 1
     } else {
         0
     };
 
     let accent = ground.fg(color_or_default(hint.accent, palette));
-    let x = (columns - widest) / 2;
-    let top = (rows.saturating_sub(1).saturating_sub(height + logo_rows)) / 2;
+    let x = area.x + (columns - widest) / 2;
+    let top = area.y + (rows.saturating_sub(height + logo_rows)) / 2;
     if logo_rows > 0 {
-        // Centred on the grid rather than over the block below it, because the
+        // Centred on the pane rather than over the block below it, because the
         // block's own width is an accident of the longest description.
-        let logo_x = (columns - logo_cells) / 2;
+        let logo_x = area.x + (columns - logo_cells) / 2;
         for (offset, line) in hint.logo.iter().enumerate() {
             let Ok(offset) = u16::try_from(offset) else {
                 break;
             };
             write(
                 line,
-                Rect::new(logo_x, top + offset, columns - logo_x, 1),
+                Rect::new(logo_x, top + offset, area.x + columns - logo_x, 1),
                 accent,
                 buffer,
             );
@@ -655,7 +721,7 @@ fn render_hint(hint: &HintView, columns: u16, rows: u16, palette: &Palette, buff
             Rect::new(
                 x + hint.key_cells + 2,
                 y,
-                columns - x - hint.key_cells - 2,
+                (area.x + columns).saturating_sub(x + hint.key_cells + 2),
                 1,
             ),
             ground,
@@ -825,7 +891,7 @@ fn render_overlay(
     // one at all: a transparent session still lets the terminal's background
     // through the box, but the box's own text is the theme's rather than
     // whatever the code underneath happened to be coloured (SPEC §24.1).
-    let editor = snapshot.editor.as_ref();
+    let editor = snapshot.editor();
     let ground = Style::default().fg(color_or_default(
         editor.and_then(|editor| editor.foreground),
         palette,
@@ -868,8 +934,7 @@ fn render_overlay(
     // buffer uses — and nothing else: no bar, no caret, so every row starts at
     // the same column (SPEC §24.1).
     let selection = snapshot
-        .editor
-        .as_ref()
+        .editor()
         .and_then(|editor| editor.selection_background)
         .map(|color| ground.bg(palette.color(color)));
 
@@ -1120,9 +1185,6 @@ fn render_status(
     }
     if status.rewrapping {
         transient.push("wrapping…".to_owned());
-    }
-    if let Some((index, count)) = status.panes {
-        transient.push(format!("pane {index}/{count}"));
     }
     if status.empty {
         transient.push("no buffer".to_owned());
@@ -1446,6 +1508,12 @@ mod tests {
         Palette::new(ColorDepth::TrueColor, hsla(0.0, 0.0, 0.0, 1.0), false)
     }
 
+    fn set_tabs(snapshot: &mut ViewSnapshot, tabs: TabStripView) {
+        if let Some(pane) = snapshot.panes.first_mut() {
+            pane.tabs = Some(tabs);
+        }
+    }
+
     fn grid(snapshot: &ViewSnapshot) -> Vec<String> {
         let mut buffer = Buffer::empty(Rect::new(0, 0, snapshot.columns, snapshot.rows));
         render(snapshot, &palette(), &mut buffer);
@@ -1464,21 +1532,28 @@ mod tests {
             .collect()
     }
 
+    /// One pane filling the grid above the status line, which is what a session
+    /// with no split looks like (SPEC §25.1).
     fn snapshot_of(columns: u16, rows: u16, lines: &[&str]) -> ViewSnapshot {
         ViewSnapshot {
             columns,
             rows,
-            editor: Some(EditorView {
-                text_rect: CellRect::new(0, 0, columns, rows.saturating_sub(1)),
-                rows: lines
-                    .iter()
-                    .enumerate()
-                    .map(|(index, line)| RowView::new(index as u32, (*line).to_owned()))
-                    .collect(),
-                max_display_row: lines.len().saturating_sub(1) as u32,
-                soft_wrapped: true,
+            panes: vec![PaneView {
+                rect: CellRect::new(0, 0, columns, rows.saturating_sub(1)),
+                active: true,
+                editor: Some(EditorView {
+                    text_rect: CellRect::new(0, 0, columns, rows.saturating_sub(1)),
+                    rows: lines
+                        .iter()
+                        .enumerate()
+                        .map(|(index, line)| RowView::new(index as u32, (*line).to_owned()))
+                        .collect(),
+                    max_display_row: lines.len().saturating_sub(1) as u32,
+                    soft_wrapped: true,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            }],
             ..Default::default()
         }
     }
@@ -1510,7 +1585,7 @@ mod tests {
     #[test]
     fn horizontal_scroll_skips_leading_cells() {
         let mut snapshot = snapshot_of(4, 2, &["abcdefgh"]);
-        if let Some(editor) = snapshot.editor.as_mut() {
+        if let Some(editor) = snapshot.editor_mut() {
             editor.scroll_columns = 3;
         }
         assert_eq!(grid(&snapshot)[0], "defg");
@@ -1636,7 +1711,7 @@ mod tests {
     #[test]
     fn line_numbers_are_right_aligned_one_cell_clear_of_the_text() {
         let mut snapshot = snapshot_of(10, 2, &["fn main"]);
-        if let Some(editor) = snapshot.editor.as_mut() {
+        if let Some(editor) = snapshot.editor_mut() {
             editor.gutter_rect = CellRect::new(0, 0, 4, 1);
             editor.text_rect = CellRect::new(4, 0, 6, 1);
             editor.rows[0].gutter = GutterView {
@@ -1650,7 +1725,7 @@ mod tests {
     #[test]
     fn a_diff_marker_takes_the_leftmost_gutter_cell() {
         let mut snapshot = snapshot_of(10, 2, &["x"]);
-        if let Some(editor) = snapshot.editor.as_mut() {
+        if let Some(editor) = snapshot.editor_mut() {
             editor.gutter_rect = CellRect::new(0, 0, 4, 1);
             editor.text_rect = CellRect::new(4, 0, 6, 1);
             editor.rows[0].gutter = GutterView {
@@ -1665,7 +1740,7 @@ mod tests {
     #[test]
     fn selections_recolour_cells_without_replacing_their_text() {
         let mut snapshot = snapshot_of(8, 2, &["abcdef"]);
-        if let Some(editor) = snapshot.editor.as_mut() {
+        if let Some(editor) = snapshot.editor_mut() {
             editor.rows[0].spans = vec![StyledSpan {
                 range: 0..6,
                 style: SpanStyle {
@@ -1693,7 +1768,7 @@ mod tests {
     #[test]
     fn secondary_cursors_are_drawn_as_inverted_cells() {
         let mut snapshot = snapshot_of(8, 2, &["abcdef"]);
-        if let Some(editor) = snapshot.editor.as_mut() {
+        if let Some(editor) = snapshot.editor_mut() {
             editor.secondary_cursors = vec![CellPoint { column: 2, row: 0 }];
         }
         let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
@@ -1752,14 +1827,12 @@ mod tests {
 
     #[test]
     fn reserved_rows_grow_with_the_lines_ted_owns() {
-        assert_eq!(reserved_rows(false, false, 0, 0), 1);
-        assert_eq!(reserved_rows(true, false, 0, 0), 2);
-        assert_eq!(reserved_rows(true, false, 3, 0), 5);
+        assert_eq!(reserved_rows(false, false, 0), 1);
+        assert_eq!(reserved_rows(true, false, 0), 2);
+        assert_eq!(reserved_rows(true, false, 3), 5);
         // A prompt is two rows: the question and its answers.
-        assert_eq!(reserved_rows(false, true, 0, 0), 3);
-        assert_eq!(reserved_rows(true, true, 3, 0), 7);
-        // And the tab strip is the one row `ted` keeps above the editor.
-        assert_eq!(reserved_rows(false, false, 0, 1), 2);
+        assert_eq!(reserved_rows(false, true, 0), 3);
+        assert_eq!(reserved_rows(true, true, 3), 7);
     }
 
     #[test]
@@ -1870,7 +1943,7 @@ mod tests {
         let syntax = hsla(0.6, 0.7, 0.6, 1.0);
         let text = hsla(0.0, 0.0, 0.9, 1.0);
         let mut snapshot = snapshot_of(40, 12, &["fn main() {}"]);
-        if let Some(editor) = snapshot.editor.as_mut() {
+        if let Some(editor) = snapshot.editor_mut() {
             editor.foreground = Some(text);
             editor.rows[0].spans = vec![StyledSpan {
                 range: 0..12,
@@ -1986,7 +2059,7 @@ mod tests {
     fn the_selected_row_is_a_background_tint_and_nothing_else() {
         let mut snapshot = snapshot_of(40, 12, &["x"]);
         let selection = hsla(0.6, 0.5, 0.3, 1.0);
-        if let Some(editor) = snapshot.editor.as_mut() {
+        if let Some(editor) = snapshot.editor_mut() {
             editor.selection_background = Some(selection);
         }
         snapshot.overlay = Some(finder(
@@ -2007,28 +2080,86 @@ mod tests {
         assert!(grid[4].starts_with("│ two.rs"), "{:?}", grid[4]);
     }
 
+    /// SPEC §25.1 and §25.3: each pane is painted at its own rect, and the pane
+    /// that has another one beside it carries a rule down its last column.
     #[test]
-    fn the_tab_strip_takes_the_top_row_and_marks_unsaved_work() {
+    fn two_panes_are_painted_at_their_own_rects_with_a_rule_between_them() {
+        let pane = |x: u16, width: u16, active: bool, divider: bool, line: &str| PaneView {
+            rect: CellRect::new(x, 0, width, 4),
+            active,
+            divider,
+            tabs: Some(TabStripView {
+                rect: CellRect::new(x, 0, width, 1),
+                focused: active,
+                tabs: vec![TabView {
+                    label: line.to_owned(),
+                    modified: false,
+                }],
+                ..Default::default()
+            }),
+            editor: Some(EditorView {
+                text_rect: CellRect::new(x, 1, width.saturating_sub(u16::from(divider)), 3),
+                rows: vec![RowView::new(0, line.to_owned())],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let snapshot = ViewSnapshot {
+            columns: 20,
+            rows: 5,
+            window: CellRect::new(0, 0, 20, 4),
+            panes: vec![
+                pane(0, 10, false, true, "left"),
+                pane(10, 10, true, false, "right"),
+            ],
+            ..Default::default()
+        };
+
+        let grid = grid(&snapshot);
+        assert_eq!(grid[0], " left    │ right    ");
+        assert_eq!(grid[1], "left     │right     ");
+        // The rule runs the pane's whole height, and only the pane that has
+        // something on the other side of it has one.
+        assert!(
+            grid.iter()
+                .take(4)
+                .all(|row| row.chars().nth(9) == Some('│'))
+        );
+        assert!(
+            grid.iter()
+                .take(4)
+                .all(|row| row.chars().nth(19) != Some('│')),
+            "the rightmost pane ruled itself off from the grid's edge: {grid:?}"
+        );
+    }
+
+    #[test]
+    fn the_tab_strip_takes_the_panes_top_row_and_marks_unsaved_work() {
         let mut snapshot = snapshot_of(40, 6, &["fn main() {}"]);
-        // The editor was already shifted down by the strip's row when the
-        // projection was built (SPEC §24.7).
-        if let Some(editor) = snapshot.editor.as_mut() {
+        // Zed's own layout inset the item by the strip's row, so the editor
+        // reported a rect a row further down (SPEC §25.2).
+        if let Some(editor) = snapshot.editor_mut() {
             editor.text_rect = CellRect::new(0, 1, 40, 4);
         }
-        snapshot.tabs = Some(TabStripView {
-            tabs: vec![
-                TabView {
-                    label: "snapshot.rs".to_owned(),
-                    modified: false,
-                },
-                TabView {
-                    label: "frame.rs".to_owned(),
-                    modified: true,
-                },
-            ],
-            active: 1,
-            ..Default::default()
-        });
+        set_tabs(
+            &mut snapshot,
+            TabStripView {
+                rect: CellRect::new(0, 0, 40, 1),
+                focused: true,
+                tabs: vec![
+                    TabView {
+                        label: "snapshot.rs".to_owned(),
+                        modified: false,
+                    },
+                    TabView {
+                        label: "frame.rs".to_owned(),
+                        modified: true,
+                    },
+                ],
+                active: 1,
+                ..Default::default()
+            },
+        );
         let grid = grid(&snapshot);
         assert_eq!(grid[0].trim_end(), " snapshot.rs │ frame.rs •");
         assert_eq!(grid[1].trim_end(), "fn main() {}");
@@ -2037,17 +2168,22 @@ mod tests {
     #[test]
     fn the_strip_scrolls_rather_than_eliding_its_middle() {
         let mut snapshot = snapshot_of(24, 4, &["x"]);
-        snapshot.tabs = Some(TabStripView {
-            tabs: (0..5)
-                .map(|index| TabView {
-                    label: format!("file{index}.rs"),
-                    modified: false,
-                })
-                .collect(),
-            active: 4,
-            first: 3,
-            ..Default::default()
-        });
+        set_tabs(
+            &mut snapshot,
+            TabStripView {
+                rect: CellRect::new(0, 0, 24, 1),
+                focused: true,
+                tabs: (0..5)
+                    .map(|index| TabView {
+                        label: format!("file{index}.rs"),
+                        modified: false,
+                    })
+                    .collect(),
+                active: 4,
+                first: 3,
+                ..Default::default()
+            },
+        );
         let grid = grid(&snapshot);
         assert_eq!(grid[0].trim_end(), " file3.rs │ file4.rs");
     }
@@ -2228,8 +2364,32 @@ mod tests {
         assert!(!rest.modifier.contains(Modifier::BOLD));
     }
 
-    fn hint_view(logo: &'static [&'static str]) -> HintView {
+    /// The screen an empty pane sits on, filling a pane that is the whole grid
+    /// above the status line.
+    fn hint_snapshot(columns: u16, rows: u16, logo: &'static [&'static str]) -> ViewSnapshot {
+        ViewSnapshot {
+            columns,
+            rows,
+            status: StatusView {
+                empty: true,
+                ..Default::default()
+            },
+            panes: vec![PaneView {
+                rect: CellRect::new(0, 0, columns, rows.saturating_sub(1)),
+                active: true,
+                hint: Some(hint_view(
+                    CellRect::new(0, 0, columns, rows.saturating_sub(1)),
+                    logo,
+                )),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn hint_view(rect: CellRect, logo: &'static [&'static str]) -> HintView {
         HintView {
+            rect,
             logo,
             rows: vec![
                 HintRow {
@@ -2252,16 +2412,7 @@ mod tests {
     /// the ways out of it rather than leaving a blank grid.
     #[test]
     fn an_empty_pane_names_the_ways_out_of_it() {
-        let snapshot = ViewSnapshot {
-            columns: 30,
-            rows: 8,
-            status: StatusView {
-                empty: true,
-                ..Default::default()
-            },
-            hint: Some(hint_view(&[])),
-            ..Default::default()
-        };
+        let snapshot = hint_snapshot(30, 8, &[]);
 
         let grid = grid(&snapshot);
         assert!(
@@ -2281,16 +2432,7 @@ mod tests {
     /// separated from them by a row.
     #[test]
     fn the_wordmark_stands_over_the_hints() {
-        let snapshot = ViewSnapshot {
-            columns: 30,
-            rows: 10,
-            status: StatusView {
-                empty: true,
-                ..Default::default()
-            },
-            hint: Some(hint_view(&["▀▀▀", " █ ", " █ "])),
-            ..Default::default()
-        };
+        let snapshot = hint_snapshot(30, 10, &["▀▀▀", " █ ", " █ "]);
 
         let grid = grid(&snapshot);
         assert_eq!(grid[1].trim_end(), "             ▀▀▀");
@@ -2306,16 +2448,7 @@ mod tests {
     /// not for the mark keeps them and drops it (SPEC §24.7).
     #[test]
     fn a_short_grid_keeps_the_hints_and_drops_the_wordmark() {
-        let snapshot = ViewSnapshot {
-            columns: 20,
-            rows: 5,
-            status: StatusView {
-                empty: true,
-                ..Default::default()
-            },
-            hint: Some(hint_view(&["▀▀▀", " █ ", " █ "])),
-            ..Default::default()
-        };
+        let snapshot = hint_snapshot(20, 5, &["▀▀▀", " █ ", " █ "]);
 
         let grid = grid(&snapshot);
         assert!(
@@ -2393,7 +2526,7 @@ mod tests {
     fn a_diagnostic_underline_keeps_the_colour_its_severity_gave_it() {
         let mut snapshot = snapshot_of(12, 3, &["let x = 1;"]);
         let error = hsla(0.0, 0.8, 0.5, 1.0);
-        if let Some(editor) = snapshot.editor.as_mut() {
+        if let Some(editor) = snapshot.editor_mut() {
             editor.rows[0].spans = vec![StyledSpan {
                 range: 0..10,
                 style: SpanStyle {
@@ -2449,7 +2582,7 @@ mod tests {
         let placeholder = hsla(0.0, 0.0, 0.6, 1.0);
         let placeholder_background = hsla(0.0, 0.0, 0.2, 1.0);
         let mut snapshot = snapshot_of(30, 3, &["‹block ted cannot render›"]);
-        if let Some(editor) = snapshot.editor.as_mut() {
+        if let Some(editor) = snapshot.editor_mut() {
             editor.rows[0].kind = RowKind::Block;
             editor.rows[0].background = Some(placeholder_background);
             editor.rows[0].spans = vec![StyledSpan {
@@ -2474,7 +2607,7 @@ mod tests {
 
     fn gutter_snapshot(columns: u16, rows: u16, gutter_width: u16, line: &str) -> ViewSnapshot {
         let mut snapshot = snapshot_of(columns, rows, &[line]);
-        if let Some(editor) = snapshot.editor.as_mut() {
+        if let Some(editor) = snapshot.editor_mut() {
             editor.gutter_rect = CellRect::new(0, 0, gutter_width, rows.saturating_sub(1));
             editor.text_rect = CellRect::new(
                 gutter_width,
@@ -2489,13 +2622,13 @@ mod tests {
     #[test]
     fn a_fold_chevron_points_right_when_folded_and_down_when_foldable() {
         let mut snapshot = gutter_snapshot(20, 2, 6, "x");
-        if let Some(editor) = snapshot.editor.as_mut() {
+        if let Some(editor) = snapshot.editor_mut() {
             editor.fold_gutter_cells = 2;
             editor.rows[0].gutter.crease = Some(CreaseState::Folded);
         }
         assert_eq!(grid(&snapshot)[0].chars().nth(5), Some('▸'));
 
-        if let Some(editor) = snapshot.editor.as_mut() {
+        if let Some(editor) = snapshot.editor_mut() {
             editor.rows[0].gutter.crease = Some(CreaseState::Foldable);
         }
         assert_eq!(grid(&snapshot)[0].chars().nth(5), Some('▾'));
@@ -2506,7 +2639,7 @@ mod tests {
     #[test]
     fn no_chevron_is_painted_when_the_gutter_reserved_no_room_for_one() {
         let mut snapshot = gutter_snapshot(20, 2, 6, "x");
-        if let Some(editor) = snapshot.editor.as_mut() {
+        if let Some(editor) = snapshot.editor_mut() {
             editor.fold_gutter_cells = 0;
             editor.rows[0].gutter.crease = Some(CreaseState::Folded);
         }
@@ -2521,7 +2654,7 @@ mod tests {
         let added = hsla(0.3, 0.5, 0.4, 1.0);
         let added_background = hsla(0.3, 0.3, 0.15, 1.0);
         let mut snapshot = gutter_snapshot(20, 2, 6, "let x = 1;");
-        if let Some(editor) = snapshot.editor.as_mut() {
+        if let Some(editor) = snapshot.editor_mut() {
             editor.rows[0].background = Some(added_background);
             editor.rows[0].gutter.diff = Some(DiffMarker::Added);
             editor.rows[0].gutter.diff_foreground = Some(added);
@@ -2561,7 +2694,7 @@ mod tests {
 
         let cell_backgrounds = |marker_background| {
             let mut snapshot = gutter_snapshot(20, 2, 6, "let x = 1;");
-            if let Some(editor) = snapshot.editor.as_mut() {
+            if let Some(editor) = snapshot.editor_mut() {
                 editor.rows[0].background = Some(tint);
                 editor.rows[0].gutter.diff = Some(DiffMarker::Added);
                 editor.rows[0].gutter.diff_background = marker_background;

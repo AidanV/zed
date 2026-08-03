@@ -150,6 +150,26 @@ impl Terminal {
         }
     }
 
+    /// Settles until the screen says `ready`, without typing anything.
+    ///
+    /// What a child process puts on the screen arrives when it arrives — the
+    /// terminal panel's shell has its own start-up to do before it answers
+    /// (SPEC §25.5) — so the wait is for the content rather than for a frame.
+    fn settle_until(&mut self, ready: impl Fn(&Screen) -> bool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if ready(&self.screen) {
+                return true;
+            }
+            match self.output.recv_timeout(Duration::from_millis(50)) {
+                Ok(chunk) => self.feed(&chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        ready(&self.screen)
+    }
+
     /// Types without waiting for the screen to settle. While a child owns the
     /// terminal `ted` paints nothing, so there is no frame to wait for and the
     /// keys are not `ted`'s to answer.
@@ -257,9 +277,36 @@ impl Terminal {
         self.screen.row(index)
     }
 
+    /// A row of the buffer, counted from the first line of text rather than from
+    /// the top of the grid.
+    ///
+    /// From M4 every pane carries its own tab strip in the row Zed's layout
+    /// leaves at the top of it, whether the pane holds one item or five
+    /// (SPEC §25.2) — so the text starts one row down, in every pane, always.
+    fn text_row(&self, index: u16) -> String {
+        self.screen.row(index + TAB_STRIP_ROWS)
+    }
+
     /// The row `ted` reserves for its status line, which is always the last one.
     fn status(&self) -> String {
         self.screen.row(self.rows - 1)
+    }
+
+    /// Where the terminal's own cursor was left, which is where `ted` parked it
+    /// at the end of the frame — and so which pane holds the keyboard
+    /// (SPEC §25.3).
+    fn cursor(&self) -> (u16, u16) {
+        self.screen.cursor
+    }
+
+    /// The column the rule between two side-by-side panes is painted in, from a
+    /// row of text rather than from a strip, since a strip has rules of its own
+    /// between its tabs (SPEC §25.3).
+    fn divider_column(&self) -> Option<u16> {
+        self.text_row(0)
+            .chars()
+            .position(|character| character == '│')
+            .and_then(|column| u16::try_from(column).ok())
     }
 
     fn exited(&mut self, timeout: Duration) -> bool {
@@ -536,6 +583,9 @@ impl Drop for Fixture {
     }
 }
 
+/// The row every pane spends on its own strip (SPEC §25.2).
+const TAB_STRIP_ROWS: u16 = 1;
+
 fn open(name: &str, contents: &str) -> anyhow::Result<(Fixture, Terminal)> {
     open_with(name, contents, &[])
 }
@@ -600,9 +650,9 @@ fn the_command_palette_is_projected_rather_than_replaced() -> anyhow::Result<()>
         "dismissing the palette quit ted"
     );
     assert!(
-        terminal.row(0).ends_with("fn main() {}"),
+        terminal.text_row(0).ends_with("fn main() {}"),
         "the buffer was not repainted under the box: {:?}",
-        terminal.row(0)
+        terminal.text_row(0)
     );
     Ok(())
 }
@@ -633,12 +683,10 @@ fn the_finder_opens_a_file_by_name() -> anyhow::Result<()> {
         "the chosen file is not the active tab: {:?}",
         terminal.row(0)
     );
-    // Row 1, not row 0: two items in the pane means a tab strip, and the
-    // editor's rows start under it (SPEC §24.7).
     assert!(
-        terminal.row(1).ends_with("fn beta() {}"),
+        terminal.text_row(0).ends_with("fn beta() {}"),
         "the chosen file did not open: {:?}",
-        terminal.row(1)
+        terminal.text_row(0)
     );
     Ok(())
 }
@@ -663,9 +711,9 @@ fn escape_dismisses_the_finder_and_changes_nothing() -> anyhow::Result<()> {
         terminal.status()
     );
     assert!(
-        terminal.row(0).ends_with("fn main() {}"),
+        terminal.text_row(0).ends_with("fn main() {}"),
         "the buffer was not repainted under the box: {:?}",
-        terminal.row(0)
+        terminal.text_row(0)
     );
     Ok(())
 }
@@ -688,9 +736,9 @@ fn the_tab_strip_and_the_switcher_show_what_else_is_open() -> anyhow::Result<()>
         "the tab strip does not show both items: {strip:?}"
     );
     assert!(
-        terminal.row(1).ends_with("fn beta() {}"),
-        "the editor was not shifted down by the strip: {:?}",
-        terminal.row(1)
+        terminal.text_row(0).ends_with("fn beta() {}"),
+        "the editor is not under its own strip: {:?}",
+        terminal.text_row(0)
     );
 
     terminal.send(":ls\r");
@@ -708,22 +756,28 @@ fn the_tab_strip_and_the_switcher_show_what_else_is_open() -> anyhow::Result<()>
     // The selection starts on the second row, so `enter` goes back.
     terminal.send("\r");
     assert!(
-        terminal.row(1).ends_with("fn main() {}"),
+        terminal.text_row(0).ends_with("fn main() {}"),
         "the switcher did not switch: {:?}",
-        terminal.row(1)
+        terminal.text_row(0)
     );
 
-    // `:q` closes a tab and the rest take its place (SPEC §24.7); with one item
-    // left there is nothing for a strip to say.
+    // `:q` closes a tab and the rest take its place (SPEC §24.7). The strip
+    // stays: from M4 it is the pane's own row and appears for one item too, so
+    // the file that is left is still named somewhere (SPEC §25.2).
     terminal.send(":q\r");
     assert!(
         !terminal.exited(Duration::from_millis(500)),
         "closing one of two items quit ted"
     );
     assert!(
-        terminal.row(0).ends_with("fn beta() {}"),
-        "the strip did not go when the second item did: {:?}",
-        terminal.row(0)
+        terminal.text_row(0).ends_with("fn beta() {}"),
+        "the remaining item did not take the closed one's place: {:?}",
+        terminal.text_row(0)
+    );
+    let strip = terminal.row(0);
+    assert!(
+        strip.contains("beta.rs") && !strip.contains("main.rs"),
+        "the strip did not follow the close: {strip:?}"
     );
     Ok(())
 }
@@ -735,18 +789,18 @@ fn the_tab_strip_and_the_switcher_show_what_else_is_open() -> anyhow::Result<()>
 #[test]
 fn shift_k_with_nothing_to_say_puts_nothing_on_screen() -> anyhow::Result<()> {
     let (_fixture, mut terminal) = open("hover", "alpha\nbeta\n")?;
-    let before = terminal.row(0);
+    let before = terminal.text_row(0);
 
     terminal.send("K");
     assert_eq!(
-        terminal.row(0),
+        terminal.text_row(0),
         before,
         "something was painted over the code"
     );
     assert!(
-        terminal.row(1).ends_with("beta"),
+        terminal.text_row(1).ends_with("beta"),
         "the row under the cursor was covered: {:?}",
-        terminal.row(1)
+        terminal.text_row(1)
     );
 
     terminal.send("j");
@@ -813,14 +867,14 @@ fn a_file_is_drawn_with_a_gutter_and_a_status_line() -> anyhow::Result<()> {
     let (_fixture, terminal) = open("draw", "fn main() {\n    let x = 1;\n}\n")?;
 
     assert!(
-        terminal.row(0).ends_with("fn main() {"),
+        terminal.text_row(0).ends_with("fn main() {"),
         "first row was {:?}",
-        terminal.row(0)
+        terminal.text_row(0)
     );
     assert!(
-        terminal.row(0).trim_start().starts_with('1'),
+        terminal.text_row(0).trim_start().starts_with('1'),
         "no line number in the gutter: {:?}",
-        terminal.row(0)
+        terminal.text_row(0)
     );
     let status = terminal.status();
     assert!(status.starts_with("NORMAL"), "status was {status:?}");
@@ -943,30 +997,32 @@ fn the_gutter_marks_what_git_says_changed() -> anyhow::Result<()> {
     // The diff is loaded on a background task after the first frame, so the
     // markers arrive on a later one. A keystroke gives that frame something to
     // be, and `send_until` waits for it rather than for the first quiet screen.
-    terminal.send_until("j", |screen| screen.row(1).trim_start().starts_with('~'));
+    terminal.send_until("j", |screen| {
+        screen.row(1 + TAB_STRIP_ROWS).trim_start().starts_with('~')
+    });
 
-    let marker = |row: u16| terminal.row(row).chars().next().unwrap_or(' ');
-    assert_eq!(marker(1), '~', "modified row: {:?}", terminal.row(1));
+    let marker = |row: u16| terminal.text_row(row).chars().next().unwrap_or(' ');
+    assert_eq!(marker(1), '~', "modified row: {:?}", terminal.text_row(1));
     // The wrapped remainder of that same row: one hunk, so the marker covers
     // every display row it occupies rather than only the first.
     assert_eq!(
         marker(2),
         '~',
         "wrapped continuation: {:?}",
-        terminal.row(2)
+        terminal.text_row(2)
     );
-    assert_eq!(marker(5), '+', "added row: {:?}", terminal.row(5));
+    assert_eq!(marker(5), '+', "added row: {:?}", terminal.text_row(5));
     // A deletion leaves no row of its own, so its marker goes on the row that
     // closed over it — `epsilon`, which followed the deleted `delta`.
     assert_eq!(
         marker(4),
         '-',
         "row after the deletion: {:?}",
-        terminal.row(4)
+        terminal.text_row(4)
     );
     // An untouched row keeps a blank gutter.
-    assert_eq!(marker(0), ' ', "unchanged row: {:?}", terminal.row(0));
-    assert_eq!(marker(3), ' ', "unchanged row: {:?}", terminal.row(3));
+    assert_eq!(marker(0), ' ', "unchanged row: {:?}", terminal.text_row(0));
+    assert_eq!(marker(3), ' ', "unchanged row: {:?}", terminal.text_row(3));
     Ok(())
 }
 
@@ -987,14 +1043,16 @@ fn a_collapsed_hunk_colours_its_marker_and_leaves_the_line_alone() -> anyhow::Re
 
     let mut terminal = Terminal::open(&fixture.file(), &fixture.data_dir(), &["."])?;
     terminal.settle(STARTUP);
-    terminal.send_until("j", |screen| screen.row(1).trim_start().starts_with('~'));
+    terminal.send_until("j", |screen| {
+        screen.row(1 + TAB_STRIP_ROWS).trim_start().starts_with('~')
+    });
 
     // Both rows are modifications, so any difference between them is the
     // staging and nothing else.
-    assert_eq!(terminal.row(1).chars().next(), Some('~'));
-    assert_eq!(terminal.row(3).chars().next(), Some('~'));
-    let staged = terminal.screen.background_at(0, 1);
-    let unstaged = terminal.screen.background_at(0, 3);
+    assert_eq!(terminal.text_row(1).chars().next(), Some('~'));
+    assert_eq!(terminal.text_row(3).chars().next(), Some('~'));
+    let staged = terminal.screen.background_at(0, 1 + TAB_STRIP_ROWS);
+    let unstaged = terminal.screen.background_at(0, 3 + TAB_STRIP_ROWS);
 
     // The unstaged marker is the only coloured cell in its row.
     let Some((red, green, blue)) = unstaged else {
@@ -1017,16 +1075,16 @@ fn a_collapsed_hunk_colours_its_marker_and_leaves_the_line_alone() -> anyhow::Re
     // line changed, and the line itself is left as it would be unchanged. The
     // gutter cell beside the marker, a text cell, and the same two cells on a
     // row git never saw change, all agree.
-    let unchanged_gutter = terminal.screen.background_at(1, 0);
-    let unchanged_text = terminal.screen.background_at(10, 0);
+    let unchanged_gutter = terminal.screen.background_at(1, TAB_STRIP_ROWS);
+    let unchanged_text = terminal.screen.background_at(10, TAB_STRIP_ROWS);
     for row in [1, 3] {
         assert_eq!(
-            terminal.screen.background_at(1, row),
+            terminal.screen.background_at(1, row + TAB_STRIP_ROWS),
             unchanged_gutter,
             "row {row}'s gutter was tinted past its marker"
         );
         assert_eq!(
-            terminal.screen.background_at(10, row),
+            terminal.screen.background_at(10, row + TAB_STRIP_ROWS),
             unchanged_text,
             "row {row}'s text was tinted"
         );
@@ -1047,44 +1105,46 @@ fn an_expanded_modification_is_marked_as_a_deletion_and_an_addition() -> anyhow:
 
     let mut terminal = Terminal::open(&fixture.file(), &fixture.data_dir(), &["."])?;
     terminal.settle(STARTUP);
-    terminal.send_until("j", |screen| screen.row(1).trim_start().starts_with('~'));
+    terminal.send_until("j", |screen| {
+        screen.row(1 + TAB_STRIP_ROWS).trim_start().starts_with('~')
+    });
     // Collapsed, one row stands for both sides of the change, and its text is
     // no more highlighted than an unchanged row's.
-    assert_eq!(terminal.row(1).chars().next(), Some('~'));
+    assert_eq!(terminal.text_row(1).chars().next(), Some('~'));
     assert_eq!(
-        terminal.screen.background_at(10, 1),
-        terminal.screen.background_at(10, 0)
+        terminal.screen.background_at(10, 1 + TAB_STRIP_ROWS),
+        terminal.screen.background_at(10, TAB_STRIP_ROWS)
     );
 
     // Through the `:` line's action-name fallback, since `ted` binds no key of
     // its own to this (SPEC §24.3).
     terminal.send_until(":expand all diff hunks\r", |screen| {
-        screen.row(1).trim_start().starts_with('-')
+        screen.row(1 + TAB_STRIP_ROWS).trim_start().starts_with('-')
     });
 
     // The committed `beta` above the working tree's `CHANGED`, each marked for
     // what it is rather than both marked `~`.
     assert!(
-        terminal.row(1).starts_with('-') && terminal.row(1).contains("beta"),
+        terminal.text_row(1).starts_with('-') && terminal.text_row(1).contains("beta"),
         "deleted side: {:?}",
-        terminal.row(1)
+        terminal.text_row(1)
     );
     assert!(
-        terminal.row(2).starts_with('+') && terminal.row(2).contains("CHANGED"),
+        terminal.text_row(2).starts_with('+') && terminal.text_row(2).contains("CHANGED"),
         "added side: {:?}",
-        terminal.row(2)
+        terminal.text_row(2)
     );
     // Expanded, the rows *are* the changed text, so each is tinted across its
     // width — the highlight a collapsed hunk deliberately does not paint. The
     // two sides carry different tints because they are different changes.
-    let deleted = terminal.screen.background_at(10, 1);
-    let added = terminal.screen.background_at(10, 2);
+    let deleted = terminal.screen.background_at(10, 1 + TAB_STRIP_ROWS);
+    let added = terminal.screen.background_at(10, 2 + TAB_STRIP_ROWS);
     assert!(deleted.is_some(), "the deleted row should be tinted");
     assert!(added.is_some(), "the added row should be tinted");
     assert_ne!(deleted, added, "both sides were tinted the same");
     assert_ne!(
         deleted,
-        terminal.screen.background_at(10, 0),
+        terminal.screen.background_at(10, TAB_STRIP_ROWS),
         "an expanded row should not look like an unchanged one"
     );
     Ok(())
@@ -1138,9 +1198,9 @@ fn colon_w_saves_through_vims_interceptor() -> anyhow::Result<()> {
     // in the file rather than a no-op.
     terminal.send("x");
     assert!(
-        terminal.row(0).ends_with("lpha"),
+        terminal.text_row(0).ends_with("lpha"),
         "the edit did not land: {:?}",
-        terminal.row(0)
+        terminal.text_row(0)
     );
 
     terminal.send(":");
@@ -1220,9 +1280,9 @@ fn colon_q_on_a_dirty_buffer_asks_before_quitting() -> anyhow::Result<()> {
     // `x` deletes a character, which is what makes the close prompt.
     terminal.send("x");
     assert!(
-        terminal.row(0).ends_with("lpha"),
+        terminal.text_row(0).ends_with("lpha"),
         "the edit did not land: {:?}",
-        terminal.row(0)
+        terminal.text_row(0)
     );
 
     // `:q` closes a dirty item through a `window.prompt`. Without a projection
@@ -1281,9 +1341,9 @@ fn escape_cancels_the_save_prompt_and_leaves_the_buffer_alone() -> anyhow::Resul
         "cancelling the prompt quit anyway"
     );
     assert!(
-        terminal.row(0).ends_with("lpha"),
+        terminal.text_row(0).ends_with("lpha"),
         "the edit was undone by cancelling: {:?}",
-        terminal.row(0)
+        terminal.text_row(0)
     );
     assert_eq!(fixture.contents(), "alpha\nbeta\n");
 
@@ -1302,19 +1362,20 @@ fn escape_cancels_the_save_prompt_and_leaves_the_buffer_alone() -> anyhow::Resul
 fn resizing_the_terminal_relays_out_the_editor() -> anyhow::Result<()> {
     // 60 columns of text: it fits on one row at 80 columns and cannot at 30.
     let (_fixture, mut terminal) = open("resize", &format!("{}\n", "ab ".repeat(20)))?;
-    // Row 1 is buffer line 2's gutter, so the test for "did it wrap" is whether
-    // row 1 carries any of the *text*, not whether it is blank.
+    // The second row of text is buffer line 2's gutter, so the test for "did it
+    // wrap" is whether that row carries any of the *text*, not whether it is
+    // blank.
     assert!(
-        !terminal.row(1).contains("ab"),
+        !terminal.text_row(1).contains("ab"),
         "the line wrapped before the resize: {:?}",
-        terminal.row(1)
+        terminal.text_row(1)
     );
 
     terminal.resize(30, ROWS);
     assert!(
-        terminal.row(1).contains("ab"),
+        terminal.text_row(1).contains("ab"),
         "the line did not rewrap after the resize: {:?}",
-        terminal.row(1)
+        terminal.text_row(1)
     );
     // The status line follows the grid's new last row, not the old one.
     assert!(
@@ -1343,9 +1404,9 @@ fn no_vim_types_printable_characters_straight_into_the_buffer() -> anyhow::Resul
         terminal.row(ROWS - 2)
     );
     assert!(
-        terminal.row(0).ends_with("h:alpha"),
+        terminal.text_row(0).ends_with("h:alpha"),
         "the characters were not inserted: {:?}",
-        terminal.row(0)
+        terminal.text_row(0)
     );
     // The file itself is untouched until something saves it.
     assert_eq!(fixture.contents(), "alpha\n");
@@ -1378,9 +1439,9 @@ fn a_suspended_child_owns_the_input_and_ted_takes_the_terminal_back() -> anyhow:
     // painted over it, so a resume that did not force a full repaint would
     // leave the grid blank.
     assert!(
-        terminal.row(0).ends_with("alpha"),
+        terminal.text_row(0).ends_with("alpha"),
         "the buffer was not repainted after the child: {:?}",
-        terminal.row(0)
+        terminal.text_row(0)
     );
     // `hello` as vim motions ends in `o`, which opens a line and enters insert
     // mode, so a leaked keystroke cannot hide here.
@@ -1393,9 +1454,9 @@ fn a_suspended_child_owns_the_input_and_ted_takes_the_terminal_back() -> anyhow:
     // second row still being `beta` is what says none of the child's keystrokes
     // were ted's.
     assert!(
-        terminal.row(1).ends_with("beta"),
+        terminal.text_row(1).ends_with("beta"),
         "the child's input edited the buffer: {:?}",
-        terminal.row(1)
+        terminal.text_row(1)
     );
 
     let transcript = terminal.transcript_since(mark);
@@ -1448,9 +1509,9 @@ fn a_resize_while_suspended_is_recovered_and_a_failure_is_reported() -> anyhow::
         terminal.status()
     );
     assert!(
-        terminal.row(1).contains("ab"),
+        terminal.text_row(1).contains("ab"),
         "the editor was not relaid out at the new size: {:?}",
-        terminal.row(1)
+        terminal.text_row(1)
     );
     // A non-zero exit is reported rather than swallowed; the notification line
     // sits directly above the status line.
@@ -1548,10 +1609,10 @@ fn explore_opens_what_the_file_manager_chose() -> anyhow::Result<()> {
 
     // A tab is not the file: which of the two ends up active is not something
     // one call to `open_paths` promises, so cycle the pane and look for the
-    // contents. Row 1, because the strip has row 0.
+    // contents.
     let mut drawn = Vec::new();
     for _ in 0..3 {
-        drawn.push(terminal.row(1));
+        drawn.push(terminal.text_row(0));
         terminal.send(":bnext\r");
     }
     assert!(
@@ -1648,5 +1709,180 @@ fn the_terminal_is_restored_when_ted_exits() -> anyhow::Result<()> {
         .exit_status(Duration::from_secs(10))
         .context("ted is still running after ctrl-c")?;
     assert!(status.success(), "ted exited badly: {status:?}");
+    Ok(())
+}
+
+/// `ctrl-w`, which vim uses as the prefix for everything about windows.
+const CTRL_W: &str = "\u{17}";
+
+/// `ctrl-`` as the Kitty protocol encodes it, which is what the default keymap
+/// binds `terminal_panel::Toggle` to (SPEC §8.2, §25.5).
+const CTRL_BACKTICK: &str = "\u{1b}[96;5u";
+
+/// SPEC §25.1 and §25.3: the pane tree is painted where the tree laid it out,
+/// with a rule down the edge of every pane that has another pane beside it.
+#[test]
+fn a_vsplit_puts_two_panes_side_by_side_with_a_rule_between_them() -> anyhow::Result<()> {
+    let (_fixture, mut terminal) = open("split", "fn main() {}\n")?;
+
+    terminal.send_until(&format!("{CTRL_W}v"), |screen| screen.row(1).contains('│'));
+    let divider = terminal
+        .divider_column()
+        .context("no rule between the panes")?;
+    // Neither at the grid's edge nor at its very start: two panes of roughly
+    // half the grid each, which is what the axis divided it into.
+    assert!(
+        (COLUMNS / 4..COLUMNS * 3 / 4).contains(&divider),
+        "the rule is not between two halves: {divider} of {COLUMNS}"
+    );
+
+    // The same file in both panes, each with its own gutter, and each strip
+    // naming it — the strip is the pane's row now, not the grid's (SPEC §25.2).
+    let text = terminal.text_row(0);
+    assert_eq!(
+        text.matches("fn main() {}").count(),
+        2,
+        "the split does not show the file twice: {text:?}"
+    );
+    let strip = terminal.row(0);
+    assert_eq!(
+        strip.matches("main.rs").count(),
+        2,
+        "each pane should carry its own strip: {strip:?}"
+    );
+    // And nothing of either pane crosses the rule.
+    assert_eq!(
+        text.chars().filter(|character| *character == '│').count(),
+        1,
+        "a pane painted past its own edge: {text:?}"
+    );
+    Ok(())
+}
+
+/// SPEC §25.3: the live pane is the one with the cursor in it, and `ctrl-w`
+/// moves the keyboard across the rule.
+#[test]
+fn ctrl_w_moves_the_keyboard_across_the_rule() -> anyhow::Result<()> {
+    let (_fixture, mut terminal) = open("split-focus", "fn main() {}\n")?;
+
+    terminal.send_until(&format!("{CTRL_W}v"), |screen| screen.row(1).contains('│'));
+    let divider = terminal
+        .divider_column()
+        .context("no rule between the panes")?;
+    // A vertical split opens the new pane to the right and focuses it.
+    assert!(
+        terminal.cursor().0 > divider,
+        "the cursor is not in the pane the split opened: {:?}",
+        terminal.cursor()
+    );
+
+    terminal.send_until(&format!("{CTRL_W}h"), |screen| screen.cursor.0 < divider);
+    assert!(
+        terminal.cursor().0 < divider,
+        "ctrl-w h did not cross the rule: {:?}",
+        terminal.cursor()
+    );
+
+    terminal.send_until(&format!("{CTRL_W}l"), |screen| screen.cursor.0 > divider);
+    assert!(
+        terminal.cursor().0 > divider,
+        "ctrl-w l did not cross back: {:?}",
+        terminal.cursor()
+    );
+    Ok(())
+}
+
+/// SPEC §14.3: pane resizing is in pixels, and under §5 a pixel column is a
+/// cell — so `ctrl-w >` widens the pane by exactly one column.
+#[test]
+fn ctrl_w_widens_a_pane_by_exactly_one_column() -> anyhow::Result<()> {
+    let (_fixture, mut terminal) = open("split-resize", "fn main() {}\n")?;
+
+    terminal.send_until(&format!("{CTRL_W}v"), |screen| screen.row(1).contains('│'));
+    let before = terminal
+        .divider_column()
+        .context("no rule between the panes")?;
+
+    // The active pane is the right one, and `ctrl-w <` narrows the active pane
+    // — so its left edge, and the rule with it, moves one column right.
+    terminal.send_until(&format!("{CTRL_W}<"), |screen| {
+        screen
+            .row(1)
+            .chars()
+            .position(|character| character == '│')
+            .is_some_and(|column| u16::try_from(column).is_ok_and(|column| column != before))
+    });
+    let after = terminal
+        .divider_column()
+        .context("the rule went missing after the resize")?;
+    assert_eq!(
+        after,
+        before + 1,
+        "a resize moved the rule by something other than a column"
+    );
+    Ok(())
+}
+
+/// SPEC §25.5: a terminal beside the editor, projected from the emulator's own
+/// grid — and `ctrl-c` in it belongs to what is running there rather than to
+/// `ted`.
+#[test]
+fn the_terminal_panel_runs_a_command_and_keeps_ctrl_c() -> anyhow::Result<()> {
+    let (_fixture, mut terminal) = open("panel", "fn main() {}\n")?;
+
+    terminal.type_keys(CTRL_BACKTICK);
+    anyhow::ensure!(
+        terminal.settle_until(
+            |screen| (0..screen.rows)
+                .any(|row| screen.row(row).contains('$') || screen.row(row).contains('%')),
+            Duration::from_secs(15),
+        ),
+        "no shell prompt appeared in the panel:\n{}",
+        (0..terminal.rows)
+            .map(|row| terminal.row(row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    terminal.type_keys("echo the-panel-lives\r");
+    anyhow::ensure!(
+        terminal.settle_until(
+            |screen| (0..screen.rows).any(|row| {
+                let row = screen.row(row);
+                row.contains("the-panel-lives") && !row.contains("echo")
+            }),
+            Duration::from_secs(15),
+        ),
+        "the command's output never reached the panel:\n{}",
+        (0..terminal.rows)
+            .map(|row| terminal.row(row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // The editor is still there above it: a panel is a dock, not a takeover.
+    assert!(
+        terminal.text_row(0).contains("fn main()"),
+        "the editor went when the panel came: {:?}",
+        terminal.text_row(0)
+    );
+
+    // `ctrl-c` while the panel has the keyboard interrupts what is running in
+    // it. Nothing is running, so the shell simply prints a new prompt — what
+    // matters is that `ted` is still here afterwards.
+    terminal.send("\u{3}");
+    assert!(
+        !terminal.exited(Duration::from_millis(750)),
+        "ctrl-c in the terminal panel ended the session"
+    );
+
+    // Back in the editor, it means what it always meant.
+    terminal.send(CTRL_BACKTICK);
+    terminal.settle(Duration::from_millis(500));
+    terminal.send("\u{3}");
+    assert!(
+        terminal.exited(Duration::from_secs(5)),
+        "ctrl-c outside the panel did not end the session"
+    );
     Ok(())
 }

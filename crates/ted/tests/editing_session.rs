@@ -93,7 +93,7 @@ impl Session {
 
         // The editor gets the grid minus the one row `ted` reserves for its own
         // status line (SPEC §10.2), which is what the window is sized to.
-        let editor_rows = rows - reserved_rows(false, false, 0, 0);
+        let editor_rows = rows - reserved_rows(false, false, 0);
         let text = text.to_owned();
         let window = cx
             .open_window(grid_size(columns, editor_rows), move |window, cx| {
@@ -167,7 +167,7 @@ impl Session {
                     &editor,
                     columns,
                     rows,
-                    reserved_rows(false, false, 0, 0),
+                    reserved_rows(false, false, 0),
                     window,
                     cx,
                 )
@@ -200,7 +200,14 @@ impl Session {
     /// The text half of a rendered row, i.e. the part at and after the rect
     /// the editor reported for its text (SPEC §10.2).
     fn row_text(&mut self, row: usize) -> String {
-        let text_x = usize::from(self.snapshot().editor.expect("no editor view").text_rect.x);
+        let text_x = usize::from(
+            self.snapshot()
+                .editor()
+                .cloned()
+                .expect("no editor view")
+                .text_rect
+                .x,
+        );
         let grid = self.grid();
         let row = grid.get(row).cloned().unwrap_or_default();
         row.chars()
@@ -231,7 +238,8 @@ fn a_file_renders_with_line_numbers_and_the_cursor_on_the_first_cell() {
 
     let numbers: Vec<Option<u32>> = session
         .snapshot()
-        .editor
+        .editor()
+        .cloned()
         .expect("no editor view")
         .rows
         .iter()
@@ -243,7 +251,7 @@ fn a_file_renders_with_line_numbers_and_the_cursor_on_the_first_cell() {
     assert_eq!(snapshot.status.mode.as_deref(), Some("NORMAL"));
     assert_eq!(snapshot.status.position, Some((1, 1)));
     // The text rect starts where the gutter ends, and the cursor sits in it.
-    let editor = snapshot.editor.expect("no editor view");
+    let editor = snapshot.editor().cloned().expect("no editor view");
     assert_eq!(
         snapshot.cursor.expect("no cursor").column,
         editor.text_rect.x
@@ -324,7 +332,11 @@ fn visual_mode_reports_a_selection_over_the_cells_it_covers() {
     session.keys("v l l");
     assert_eq!(session.mode().as_deref(), Some("VISUAL"));
 
-    let editor = session.snapshot().editor.expect("no editor view");
+    let editor = session
+        .snapshot()
+        .editor()
+        .cloned()
+        .expect("no editor view");
     assert_eq!(editor.selections.len(), 1);
     let selection = editor.selections[0];
     assert_eq!(selection.display_row, 0);
@@ -340,7 +352,11 @@ fn visual_line_mode_selects_whole_rows() {
     // character `v` would until the projection expands it.
     session.keys("shift-v");
     assert_eq!(session.mode().as_deref(), Some("VISUAL LINE"));
-    let editor = session.snapshot().editor.expect("no editor view");
+    let editor = session
+        .snapshot()
+        .editor()
+        .cloned()
+        .expect("no editor view");
     assert_eq!(editor.selections.len(), 1);
     assert_eq!(editor.selections[0].display_row, 0);
     assert_eq!(
@@ -353,7 +369,11 @@ fn visual_line_mode_selects_whole_rows() {
     );
 
     session.keys("j");
-    let editor = session.snapshot().editor.expect("no editor view");
+    let editor = session
+        .snapshot()
+        .editor()
+        .cloned()
+        .expect("no editor view");
     let rows: Vec<u32> = editor
         .selections
         .iter()
@@ -377,7 +397,7 @@ fn visual_block_selects_a_rectangle_and_puts_a_cursor_on_each_row() {
     assert_eq!(session.mode().as_deref(), Some("VISUAL BLOCK"));
 
     let snapshot = session.snapshot();
-    let editor = snapshot.editor.clone().expect("no editor view");
+    let editor = snapshot.editor().cloned().expect("no editor view");
     let spans: Vec<(u32, u16, u16)> = editor
         .selections
         .iter()
@@ -460,7 +480,7 @@ fn a_second_cursor_lands_on_the_row_its_own_match_is_on() {
 
     session.keys("g l");
     let snapshot = session.snapshot();
-    let editor = snapshot.editor.clone().expect("no editor view");
+    let editor = snapshot.editor().cloned().expect("no editor view");
     assert_eq!(editor.secondary_cursors.len(), 1);
     assert_eq!(
         editor.secondary_cursors[0].row, editor.text_rect.y,
@@ -480,7 +500,8 @@ fn wide_characters_put_the_cursor_on_the_cell_not_the_byte() {
     let mut session = Session::open(24, 6, "日本語\n");
     let text_x = session
         .snapshot()
-        .editor
+        .editor()
+        .cloned()
         .expect("no editor view")
         .text_rect
         .x;
@@ -506,7 +527,7 @@ fn soft_wrap_breaks_at_the_column_the_editor_reports() {
     let mut session = Session::open(columns, 8, &format!("{}\n", "a".repeat(90)));
 
     let snapshot = session.snapshot();
-    let editor = snapshot.editor.expect("no editor view");
+    let editor = snapshot.editor().cloned().expect("no editor view");
     let wrap_columns = editor.text_rect.width;
     assert!(wrap_columns > 0 && wrap_columns < columns);
 
@@ -541,13 +562,21 @@ fn scrolling_is_the_editors_and_the_snapshot_only_mirrors_it() {
     let mut session = Session::open(24, 12, &text);
 
     // The window is 11 rows, so the first screen is display rows 0..11.
-    let first = session.snapshot().editor.expect("no editor view");
+    let first = session
+        .snapshot()
+        .editor()
+        .cloned()
+        .expect("no editor view");
     assert_eq!(first.rows.first().map(|row| row.display_row), Some(0));
 
     // `G` jumps to the last line and the editor autoscrolls; `ted` keeps no
     // scroll offset of its own (SPEC §15).
     session.keys("shift-g");
-    let last = session.snapshot().editor.expect("no editor view");
+    let last = session
+        .snapshot()
+        .editor()
+        .cloned()
+        .expect("no editor view");
     assert_eq!(
         session.snapshot().status.position.map(|(row, _)| row),
         Some(60)
@@ -565,7 +594,11 @@ fn scrolling_is_the_editors_and_the_snapshot_only_mirrors_it() {
     );
 
     session.keys("g g");
-    let back = session.snapshot().editor.expect("no editor view");
+    let back = session
+        .snapshot()
+        .editor()
+        .cloned()
+        .expect("no editor view");
     assert_eq!(back.rows.first().map(|row| row.display_row), Some(0));
 }
 
@@ -596,7 +629,11 @@ fn ctrl_d_and_ctrl_u_move_by_the_terminals_own_row_count() {
 #[test]
 fn every_row_is_covered_by_its_spans_exactly_once() {
     let mut session = Session::open(40, 8, "fn main() {\n    let x = 1;\n}\n");
-    let editor = session.snapshot().editor.expect("no editor view");
+    let editor = session
+        .snapshot()
+        .editor()
+        .cloned()
+        .expect("no editor view");
 
     for row in &editor.rows {
         let mut offset = 0usize;

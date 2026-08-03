@@ -15,13 +15,17 @@ use anyhow::{Context as _, Result};
 use client::{Client, UserStore};
 use editor::Editor;
 use fs::{Fs, RealFs};
-use gpui::{Action as _, App, AppContext as _, Entity, Task, UpdateGlobal as _, WindowHandle};
+use gpui::{
+    Action as _, App, AppContext as _, Entity, IntoElement as _, Styled as _, Task,
+    UpdateGlobal as _, Window, WindowHandle,
+};
 use language::LanguageRegistry;
 use node_runtime::{NodeBinaryOptions, NodeRuntime};
 use project::project_settings::ProjectSettings;
 use search::{BufferSearchBar, project_search::ProjectSearchBar};
 use session::{AppSession, Session};
 use settings::{KeybindSource, KeymapFile, Settings as _, SettingsStore};
+use terminal_view::terminal_panel::TerminalPanel;
 use theme::ActiveTheme as _;
 use theme_settings::ThemeSettings;
 use util::ResultExt as _;
@@ -43,12 +47,32 @@ use crate::platform::terminal_window_options;
 /// pane is a state it sits in, and ending the session is the frame loop's to do
 /// (SPEC §24.7). The rest is cosmetic — `ted` paints whatever cell rect the
 /// editor reports (SPEC §10.2), so hiding chrome only widens that rect.
+///
+/// The tab bar is the one piece of chrome that is *on* from M4: `ted` replaces
+/// the element with one exactly a cell tall ([`install_pane_tab_bars`]) and
+/// paints its own strip into the row Zed's layout then leaves in each pane
+/// (SPEC §25.2). The terminal panel's line height is pinned for the same reason
+/// the buffer's is — the panel's pty is sized from the element's bounds divided
+/// by it, so anything but 1.0 would size the child in something other than
+/// `ted`'s own cells (SPEC §25.5) — and its height is pinned because the
+/// panel's own default is 320 pixels, which is a fifth of a GUI window and
+/// twenty rows of a terminal's twenty-four. That is the GUI-scale assumption
+/// §22 warns about, and the answer is the one §5 gives everywhere else: say it
+/// in cells. A resize the user makes afterwards is serialised with the
+/// workspace and wins over this.
 const SETTINGS_OVERRIDE: &str = r#"
     "buffer_font_size": 16,
     "buffer_line_height": { "custom": 1.0 },
     "soft_wrap": "editor_width",
     "when_closing_with_no_tabs": "keep_window_open",
-    "tab_bar": { "show": false },
+    "tab_bar": { "show": true },
+    "terminal": {
+        "font_size": 16,
+        "line_height": { "custom": 1.0 },
+        "default_height": TERMINAL_PANEL_HEIGHT,
+        "toolbar": { "breadcrumbs": false },
+        "scrollbar": { "show": "never" }
+    },
     "status_bar": { "experimental.show": false },
     "toolbar": {
         "breadcrumbs": false,
@@ -115,13 +139,22 @@ impl Backend {
             .all(|pane| pane.read(cx).items_len() == 0)
     }
 
-    /// The one row `ted` paints *above* the editor, and only when the pane has
-    /// more than one item for it to show (SPEC §24.7). The single answer both
-    /// the reserved-row count and the projection go by, so the window's size and
-    /// the rects painted inside it cannot disagree about it.
-    pub fn tab_rows(&self, cx: &App) -> u16 {
-        let items = self.workspace.read(cx).active_pane().read(cx).items_len();
-        u16::from(items > 1)
+    /// The terminal panel, once it has been loaded and added to the dock
+    /// (SPEC §25.5). `None` in a session where loading it failed, which costs
+    /// the panel and nothing else.
+    pub fn terminal_panel(&self, cx: &App) -> Option<Entity<TerminalPanel>> {
+        self.workspace.read(cx).panel::<TerminalPanel>(cx)
+    }
+
+    /// Whether the keyboard is in the terminal panel rather than in a pane.
+    ///
+    /// The frame loop asks because `ctrl-c` belongs to whatever owns the
+    /// keyboard, and a shell in the panel needs it to mean what it means in a
+    /// shell rather than "end the session" (SPEC §25.5).
+    pub fn terminal_has_focus(&self, window: &Window, cx: &App) -> bool {
+        use gpui::Focusable as _;
+        self.terminal_panel(cx)
+            .is_some_and(|panel| panel.focus_handle(cx).contains_focused(window, cx))
     }
 
     pub fn active_pane_search_bar(&self, cx: &App) -> Option<Entity<BufferSearchBar>> {
@@ -137,7 +170,7 @@ impl Backend {
 
 /// `vim` selects both the settings layer and the keymap layered on top of
 /// the base one, so it has to be known before either is applied.
-pub fn init(vim: bool, cx: &mut App) -> Result<Arc<AppState>> {
+pub fn init(vim: bool, rows: u16, cx: &mut App) -> Result<Arc<AppState>> {
     zlog::init();
     release_channel::init(semver::Version::new(0, 0, 0), cx);
     gpui_tokio::init(cx);
@@ -156,7 +189,7 @@ pub fn init(vim: bool, cx: &mut App) -> Result<Arc<AppState>> {
     SettingsStore::update_global(cx, |store, cx| {
         store.watch_settings_files(fs.clone(), cx, |_, _, _| {});
     });
-    apply_settings_override(vim, cx)?;
+    apply_settings_override(vim, rows, cx)?;
 
     theme_settings::init(theme::LoadThemes::All(Box::new(assets::Assets)), cx);
     if let Err(error) = assets::Assets.load_fonts(cx) {
@@ -209,6 +242,9 @@ pub fn init(vim: bool, cx: &mut App) -> Result<Arc<AppState>> {
     // delegate answers in plain text, so `ted` paints the real modal's matches.
     outline::init(cx);
     project_symbols::init(cx);
+    // Registers the dock and the actions that open it; the panel itself is
+    // loaded per window, in `open` (SPEC §25.5).
+    terminal_view::init(cx);
     if vim {
         vim::init(cx);
     }
@@ -222,10 +258,11 @@ pub fn init(vim: bool, cx: &mut App) -> Result<Arc<AppState>> {
     // something else happens to touch settings later (opening a file with a
     // language does; opening a plain-text one does not), and until it is, `:w`
     // and `:q` fall through to matching action names and quietly do nothing.
-    apply_settings_override(vim, cx)?;
+    apply_settings_override(vim, rows, cx)?;
 
     hide_filtered_actions(cx);
     install_pane_search_bars(cx);
+    install_pane_tab_bars(cx);
     load_keymap(vim, cx)?;
     verify_pinned_metrics(cx).map(|()| app_state)
 }
@@ -249,6 +286,32 @@ pub fn open(
             workspace: opened.workspace,
             vim,
         };
+
+        // Loaded here rather than in `init`, because the panel is a view over a
+        // window that does not exist until the workspace is open. It stays
+        // closed until something asks for it — loading it only registers the
+        // dock it would appear in (SPEC §25.5).
+        let panel = cx
+            .update_window(backend.window.into(), {
+                let workspace = backend.workspace.downgrade();
+                move |_, window, cx| TerminalPanel::load(workspace, window.to_async(cx))
+            })?
+            .await;
+        match panel {
+            Ok(panel) => {
+                cx.update_window(backend.window.into(), {
+                    let workspace = backend.workspace.clone();
+                    move |_, window, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.add_panel(panel, window, cx);
+                        });
+                    }
+                })?;
+            }
+            // A terminal `ted` cannot open is a feature missing from the
+            // session, not a session that failed to start.
+            Err(error) => log::warn!("the terminal panel could not be loaded: {error}"),
+        }
 
         // Focus explicitly once the workspace exists: combined with
         // `TerminalWindow::is_active() == true`, this is what makes the editor
@@ -365,6 +428,33 @@ fn install_pane_search_bars(cx: &mut App) {
     .detach();
 }
 
+/// Takes one cell row out of every pane for the strip `ted` paints there
+/// (SPEC §25.2).
+///
+/// The strip itself is `ted`'s, because Zed's tab bar is a row of icons and
+/// buttons a cell grid has no way to draw. The *space* for it cannot be: a row
+/// withheld from the top of the window reaches only the topmost pane, and a
+/// split needs the row inside each pane, wherever that pane is. So the element
+/// installed here paints nothing and is exactly a cell tall, Zed's own layout
+/// insets each pane's item by it, and the strip goes in the row it leaves —
+/// which `ted` finds at the top of the pane's reported bounds like every other
+/// rect in the projection.
+///
+/// Every `Pane` in the process, not just the workspace's: the terminal panel's
+/// pane (SPEC §25.5) is a `Pane` too, and it gets its strip the same way.
+fn install_pane_tab_bars(cx: &mut App) {
+    cx.observe_new(|pane: &mut Pane, _, cx: &mut gpui::Context<Pane>| {
+        pane.set_render_tab_bar(cx, |_, _, _| {
+            gpui::div()
+                .w_full()
+                .h(cell::CELL_HEIGHT)
+                .flex_none()
+                .into_any_element()
+        });
+    })
+    .detach();
+}
+
 fn add_search_bars(
     pane: &Entity<Pane>,
     window: &mut gpui::Window,
@@ -400,8 +490,19 @@ fn node_runtime(client: &Arc<Client>, cx: &mut App) -> NodeRuntime {
     NodeRuntime::new(client.http_client(), None, receiver)
 }
 
-fn apply_settings_override(vim: bool, cx: &mut App) -> Result<()> {
-    let overrides = format!("{{ \"vim_mode\": {vim},{SETTINGS_OVERRIDE} }}");
+/// A third of the grid, and never fewer than five rows: the panel is worth
+/// having only if what is above it is still an editor (SPEC §25.5).
+fn terminal_panel_height(rows: u16) -> f32 {
+    const MINIMUM_ROWS: u16 = 5;
+    f32::from((rows / 3).max(MINIMUM_ROWS)) * f32::from(cell::CELL_HEIGHT)
+}
+
+fn apply_settings_override(vim: bool, rows: u16, cx: &mut App) -> Result<()> {
+    let settings = SETTINGS_OVERRIDE.replace(
+        "TERMINAL_PANEL_HEIGHT",
+        &terminal_panel_height(rows).to_string(),
+    );
+    let overrides = format!("{{ \"vim_mode\": {vim},{settings} }}");
     SettingsStore::update_global(cx, |store, cx| store.set_server_settings(&overrides, cx))
         .context("ted's settings override failed to parse")
 }

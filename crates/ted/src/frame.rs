@@ -78,10 +78,7 @@ pub fn run(options: Options) -> Result<()> {
     enter_terminal_mode()?;
     install_panic_hook();
 
-    set_window_grid(
-        columns,
-        rows.saturating_sub(reserved_rows(false, false, 0, 0)),
-    );
+    set_window_grid(columns, rows.saturating_sub(reserved_rows(false, false, 0)));
     let platform = std::rc::Rc::new(TerminalPlatform::new(columns, rows));
     let result = std::rc::Rc::new(std::cell::RefCell::new(Ok(())));
 
@@ -111,7 +108,7 @@ fn start(
     platform: std::rc::Rc<TerminalPlatform>,
     cx: &mut App,
 ) -> Result<()> {
-    let app_state = bootstrap::init(options.vim, cx)?;
+    let app_state = bootstrap::init(options.vim, rows, cx)?;
 
     let opening = bootstrap::open(options.paths.clone(), options.vim, app_state, cx);
     let background = cx.theme().colors().editor_background;
@@ -269,6 +266,11 @@ async fn drive(
         // A modal is on screen and answering keys, so `ctrl-c` belongs to it —
         // it is `esc` by another name there, not a way out of `ted`.
         let modal_is_open = session.overlay.is_none() && overlay.is_some();
+        // The panel's grid, and whether the keyboard is in it. Both are read
+        // once here: what is painted and what `ctrl-c` means have to agree about
+        // who owns the keyboard (SPEC §25.5).
+        let terminal = terminal_panel(&session, cx);
+        let terminal_has_focus = terminal.as_ref().is_some_and(|terminal| terminal.focused);
 
         // Before anything is projected, so the colours in the snapshot and the
         // background they are composited over come from the same theme. The
@@ -284,13 +286,12 @@ async fn drive(
         // A line appearing or disappearing changes how much of the grid the
         // window may use, and that is a resize like any other (SPEC §10.2). An
         // open overlay is not one of them: it floats over the editor's cells
-        // (SPEC §24.1).
-        let top_rows = cx.update(|cx| session.backend.tab_rows(cx));
+        // (SPEC §24.1), and neither is a tab strip, which from M4 is a row
+        // inside the pane rather than one withheld from the window (SPEC §25.2).
         let wanted = reserved_rows(
             command_line.is_some(),
             prompt.is_some(),
             notifications.len(),
-            top_rows,
         );
         if wanted != reserved {
             reserved = wanted;
@@ -307,12 +308,10 @@ async fn drive(
         // which is a normal way to quit rather than a failure.
         let Ok(snapshot) = build_snapshot(
             &session,
-            Reserved {
-                rows: reserved,
-                top_rows,
-            },
+            reserved,
             command_line,
             overlay,
+            terminal,
             prompt,
             notifications,
             cx,
@@ -355,12 +354,15 @@ async fn drive(
             // The escape hatch, and the only way out without vim. With a command
             // line or a list open it dismisses that instead, which is both what
             // vim does and what stops a stray `:` or `ctrl-p` from stranding the
-            // user.
+            // user. With the terminal panel focused it is the shell's: a
+            // terminal beside the editor is only worth having if the key that
+            // interrupts a command still does (SPEC §25.5).
             Event::Key(key)
                 if is_quit(&key)
                     && session.command_line.is_none()
                     && session.overlay.is_none()
-                    && !modal_is_open =>
+                    && !modal_is_open
+                    && !terminal_has_focus =>
             {
                 return Ok(());
             }
@@ -425,7 +427,7 @@ async fn drive(
                     && session.command_line.is_none()
                     && !modal_is_open =>
             {
-                let Some(input) = session.mouse.translate(&mouse, top_rows) else {
+                let Some(input) = session.mouse.translate(&mouse) else {
                     continue;
                 };
                 cx.update_window(session.backend.window.into(), |_, window, cx| {
@@ -784,20 +786,12 @@ fn backend_notifications(session: &Session, cx: &mut AsyncApp) -> Vec<String> {
     .unwrap_or_default()
 }
 
-/// How much of the grid `ted` kept for itself this frame, and how much of that
-/// sits above the editor — which the projection needs separately, because rows
-/// withheld at the top also shift every rect the editor reports (SPEC §24.7).
-#[derive(Clone, Copy)]
-struct Reserved {
-    rows: u16,
-    top_rows: u16,
-}
-
 fn build_snapshot(
     session: &Session,
-    reserved: Reserved,
+    reserved: u16,
     command_line: Option<CommandLineView>,
     overlay: Option<crate::snapshot::OverlayView>,
+    terminal: Option<crate::terminal::TerminalPanelView>,
     prompt: Option<PromptView>,
     notifications: Vec<String>,
     cx: &mut AsyncApp,
@@ -821,8 +815,7 @@ fn build_snapshot(
             crate::snapshot::Frame {
                 columns: session.columns,
                 rows: session.rows,
-                reserved_rows: reserved.rows,
-                top_rows: reserved.top_rows,
+                reserved_rows: reserved,
                 command_line,
                 overlay,
                 hover: session
@@ -833,6 +826,7 @@ fn build_snapshot(
                 prompt,
                 notifications,
                 vim: session.backend.vim,
+                terminal,
                 workspace: &session.backend.workspace,
             },
             window,
@@ -888,6 +882,24 @@ async fn open_surface(session: &mut Session, surface: Surface, cx: &mut AsyncApp
                 .filter(|panel| !panel.is_empty());
         }
     }
+}
+
+/// The terminal panel's grid, when the dock holding it is open (SPEC §25.5).
+///
+/// Read through `ted`'s own projection of the emulator rather than through the
+/// editor projection: a terminal's cells are already terminal cells, and putting
+/// them through a display map would be measuring what has already been measured.
+fn terminal_panel(
+    session: &Session,
+    cx: &mut AsyncApp,
+) -> Option<crate::terminal::TerminalPanelView> {
+    cx.update_window(session.backend.window.into(), |_, window, cx| {
+        let panel = session.backend.terminal_panel(cx)?;
+        let focused = session.backend.terminal_has_focus(window, cx);
+        crate::terminal::read(&panel, focused, cx)
+    })
+    .ok()
+    .flatten()
 }
 
 /// The list for whatever modal the workspace has open (SPEC §13.1). Nothing is
