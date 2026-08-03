@@ -176,6 +176,13 @@ impl CodeContextMenu {
         }
     }
 
+    pub(crate) fn contents(&self, style: &EditorStyle) -> ContextMenuContents {
+        match self {
+            CodeContextMenu::Completions(menu) => menu.contents(style),
+            CodeContextMenu::CodeActions(menu) => menu.contents(),
+        }
+    }
+
     pub fn render(
         &self,
         style: &EditorStyle,
@@ -241,6 +248,45 @@ pub enum ContextMenuOrigin {
     Cursor,
     GutterIndicator(DisplayRow),
     QuickActionBar,
+}
+
+/// The open menu as plain data: what it would paint, without the element tree
+/// that paints it. For embedders that lay the menu out themselves.
+pub struct ContextMenuContents {
+    pub origin: ContextMenuOrigin,
+    /// Index into `entries`. Non-selectable entries are never selected.
+    pub selected: usize,
+    pub entries: Vec<ContextMenuEntry>,
+}
+
+pub enum ContextMenuEntry {
+    Completion(CompletionEntry),
+    /// A non-selectable label above a group of completions.
+    GroupHeader(SharedString),
+    /// A non-selectable rule between two groups.
+    Divider,
+    CodeAction(CodeActionEntry),
+}
+
+pub struct CompletionEntry {
+    /// The label exactly as `CodeLabel` holds it. `filter_range` is the part
+    /// the query filters against; everything after it is the entry's signature.
+    pub label: String,
+    pub filter_range: Range<usize>,
+    /// `styled_runs_for_code_label`'s output, collected — the same syntax
+    /// colouring the rendered menu uses.
+    pub runs: Vec<(Range<usize>, HighlightStyle)>,
+    /// Byte offsets the query matched, relative to the *filter* text — add
+    /// `filter_range.start` to land in `label`.
+    pub matched: Vec<usize>,
+    pub kind: Option<lsp::CompletionItemKind>,
+}
+
+pub struct CodeActionEntry {
+    pub title: String,
+    /// The LSP kind string ("quickfix", "refactor.extract", ...) when the
+    /// action carries one.
+    pub kind: Option<String>,
 }
 
 pub struct CompletionsMenu {
@@ -871,6 +917,51 @@ impl CompletionsMenu {
 
     fn origin(&self) -> ContextMenuOrigin {
         ContextMenuOrigin::Cursor
+    }
+
+    fn contents(&self, style: &EditorStyle) -> ContextMenuContents {
+        let completions = self.completions.borrow();
+        let entries = self
+            .entries
+            .borrow()
+            .iter()
+            .map(|entry| match entry {
+                CompletionMenuEntry::Match(string_match) => {
+                    // A candidate id with no completion behind it should not
+                    // happen, but dropping the entry would shift every index
+                    // after it and leave `selected` pointing at the wrong row —
+                    // so it degrades to something unselectable in place.
+                    let Some(completion) = completions.get(string_match.candidate_id) else {
+                        return ContextMenuEntry::Divider;
+                    };
+                    let kind = match &completion.source {
+                        CompletionSource::Lsp { lsp_completion, .. } => lsp_completion.kind,
+                        _ => None,
+                    };
+                    ContextMenuEntry::Completion(CompletionEntry {
+                        label: completion.label.text.clone(),
+                        filter_range: completion.label.filter_range.clone(),
+                        runs: styled_runs_for_code_label(
+                            &completion.label,
+                            &style.syntax,
+                            &style.local_player,
+                        )
+                        .collect(),
+                        matched: string_match.positions.clone(),
+                        kind,
+                    })
+                }
+                CompletionMenuEntry::GroupHeader(label) => {
+                    ContextMenuEntry::GroupHeader(label.clone())
+                }
+                CompletionMenuEntry::Divider => ContextMenuEntry::Divider,
+            })
+            .collect();
+        ContextMenuContents {
+            origin: self.origin(),
+            selected: self.selected_item,
+            entries,
+        }
     }
 
     fn render(
@@ -1934,6 +2025,30 @@ impl CodeActionsMenu {
             }
             Some(CodeActionSource::QuickActionBar) => ContextMenuOrigin::QuickActionBar,
             None => ContextMenuOrigin::Cursor,
+        }
+    }
+
+    fn contents(&self) -> ContextMenuContents {
+        let entries = self
+            .actions
+            .iter()
+            .map(|action| {
+                let title = action.menu_label();
+                let kind = match &action {
+                    CodeActionsItem::CodeAction { action, .. } => action
+                        .lsp_action
+                        .action_kind()
+                        .map(|kind| kind.as_str().to_owned()),
+                    CodeActionsItem::Task(..) => Some("task".to_owned()),
+                    CodeActionsItem::DebugScenario(_) => Some("debug".to_owned()),
+                };
+                ContextMenuEntry::CodeAction(CodeActionEntry { title, kind })
+            })
+            .collect();
+        ContextMenuContents {
+            origin: self.origin(),
+            selected: self.selected_item,
+            entries,
         }
     }
 

@@ -629,9 +629,16 @@ fn the_finder_opens_a_file_by_name() -> anyhow::Result<()> {
 
     terminal.send("\r");
     assert!(
-        terminal.status().contains("beta.rs"),
+        terminal.row(0).contains("beta.rs"),
+        "the chosen file is not the active tab: {:?}",
+        terminal.row(0)
+    );
+    // Row 1, not row 0: two items in the pane means a tab strip, and the
+    // editor's rows start under it (SPEC §24.7).
+    assert!(
+        terminal.row(1).ends_with("fn beta() {}"),
         "the chosen file did not open: {:?}",
-        terminal.status()
+        terminal.row(1)
     );
     Ok(())
 }
@@ -651,7 +658,7 @@ fn escape_dismisses_the_finder_and_changes_nothing() -> anyhow::Result<()> {
         "dismissing the finder quit ted"
     );
     assert!(
-        terminal.status().contains("main.rs"),
+        terminal.status().starts_with("NORMAL"),
         "the editor did not come back: {:?}",
         terminal.status()
     );
@@ -701,9 +708,9 @@ fn the_tab_strip_and_the_switcher_show_what_else_is_open() -> anyhow::Result<()>
     // The selection starts on the second row, so `enter` goes back.
     terminal.send("\r");
     assert!(
-        terminal.status().contains("main.rs"),
+        terminal.row(1).ends_with("fn main() {}"),
         "the switcher did not switch: {:?}",
-        terminal.status()
+        terminal.row(1)
     );
 
     // `:q` closes a tab and the rest take its place (SPEC §24.7); with one item
@@ -816,11 +823,73 @@ fn a_file_is_drawn_with_a_gutter_and_a_status_line() -> anyhow::Result<()> {
         terminal.row(0)
     );
     let status = terminal.status();
-    assert!(
-        status.starts_with("NORMAL main.rs"),
-        "status was {status:?}"
-    );
+    assert!(status.starts_with("NORMAL"), "status was {status:?}");
     assert!(status.trim_end().ends_with("1:1"), "status was {status:?}");
+    // No path on the bar: the tab strip names the file, and a bar that repeated
+    // it would spend its width saying twice what is said once (SPEC §21/M3.5).
+    assert!(!status.contains("main.rs"), "status was {status:?}");
+    Ok(())
+}
+
+/// SPEC §24.5 and §21/M3.5: `ctrl-g` takes the bar over with vim's location
+/// string rather than opening a surface or claiming the notification line, and
+/// the next keystroke gives the bar back — which `Vim::action` already arranges,
+/// so `ted` needs no dismissal of its own.
+#[test]
+fn ctrl_g_takes_the_status_line_over_until_the_next_key() -> anyhow::Result<()> {
+    let (_fixture, mut terminal) = open("location", "alpha\nbeta\ngamma\n")?;
+
+    terminal.send_until("\u{7}", |screen| {
+        screen.row(screen.rows - 1).contains("lines")
+    });
+    // Vim's string verbatim, whatever it says: the name is relative to the
+    // worktree root and a lone file is its own root, so what is asserted here is
+    // the takeover rather than vim's own choice of words.
+    let status = terminal.status();
+    assert!(status.contains("lines"), "status was {status:?}");
+    assert!(status.contains("--0%--"), "status was {status:?}");
+    // The whole row, so nothing that normally stands on the bar is left on it.
+    assert!(!status.contains("NORMAL"), "status was {status:?}");
+
+    terminal.send("j");
+    let status = terminal.status();
+    assert!(status.starts_with("NORMAL"), "status was {status:?}");
+    assert!(!status.contains("lines"), "status was {status:?}");
+    Ok(())
+}
+
+/// SPEC §24.7: closing the last item leaves a state `ted` sits in rather than
+/// ending the session, and the screen it sits on names the ways out. Quitting
+/// is then explicit — a second `:q`.
+#[test]
+fn an_empty_pane_is_a_state_ted_sits_in_and_quitting_is_explicit() -> anyhow::Result<()> {
+    let (_fixture, mut terminal) = open("empty", "fn main() {}\n")?;
+
+    terminal.send_until(":q\r", |screen| {
+        (0..screen.rows).any(|row| screen.row(row).contains("quit ted"))
+    });
+    assert!(
+        !terminal.exited(Duration::from_millis(500)),
+        "closing the last buffer ended the session"
+    );
+    let screen = (0..terminal.rows)
+        .map(|row| terminal.row(row))
+        .collect::<Vec<_>>();
+    assert!(
+        screen.iter().any(|row| row.contains("quit ted")),
+        "the hint screen does not name the way out: {screen:?}"
+    );
+    assert!(
+        terminal.status().contains("no buffer"),
+        "the bar went silent instead of saying there is nothing open: {:?}",
+        terminal.status()
+    );
+
+    terminal.send(":q\r");
+    assert!(
+        terminal.exited(Duration::from_secs(5)),
+        "a second `:q` did not quit"
+    );
     Ok(())
 }
 
@@ -876,11 +945,21 @@ fn the_gutter_marks_what_git_says_changed() -> anyhow::Result<()> {
     assert_eq!(marker(1), '~', "modified row: {:?}", terminal.row(1));
     // The wrapped remainder of that same row: one hunk, so the marker covers
     // every display row it occupies rather than only the first.
-    assert_eq!(marker(2), '~', "wrapped continuation: {:?}", terminal.row(2));
+    assert_eq!(
+        marker(2),
+        '~',
+        "wrapped continuation: {:?}",
+        terminal.row(2)
+    );
     assert_eq!(marker(5), '+', "added row: {:?}", terminal.row(5));
     // A deletion leaves no row of its own, so its marker goes on the row that
     // closed over it — `epsilon`, which followed the deleted `delta`.
-    assert_eq!(marker(4), '-', "row after the deletion: {:?}", terminal.row(4));
+    assert_eq!(
+        marker(4),
+        '-',
+        "row after the deletion: {:?}",
+        terminal.row(4)
+    );
     // An untouched row keeps a blank gutter.
     assert_eq!(marker(0), ' ', "unchanged row: {:?}", terminal.row(0));
     assert_eq!(marker(3), ' ', "unchanged row: {:?}", terminal.row(3));
@@ -1055,9 +1134,9 @@ fn colon_w_saves_through_vims_interceptor() -> anyhow::Result<()> {
     // in the file rather than a no-op.
     terminal.send("x");
     assert!(
-        terminal.status().contains("[+]"),
-        "the buffer is not marked dirty: {:?}",
-        terminal.status()
+        terminal.row(0).ends_with("lpha"),
+        "the edit did not land: {:?}",
+        terminal.row(0)
     );
 
     terminal.send(":");
@@ -1069,11 +1148,6 @@ fn colon_w_saves_through_vims_interceptor() -> anyhow::Result<()> {
 
     terminal.send("w\r");
     assert_eq!(fixture.contents(), "lpha\nbeta\n");
-    assert!(
-        !terminal.status().contains("[+]"),
-        "the buffer is still dirty after :w: {:?}",
-        terminal.status()
-    );
     Ok(())
 }
 
@@ -1122,8 +1196,11 @@ fn a_colon_typed_into_the_search_bar_is_text_not_a_command() -> anyhow::Result<(
 fn colon_q_quits() -> anyhow::Result<()> {
     let (_fixture, mut terminal) = open("quit", "alpha\n")?;
 
-    // `:q` maps to `workspace::CloseActiveItem`, which in GUI Zed would leave an
-    // empty window; in a terminal the empty workspace *is* the exit condition.
+    // `:q` maps to `workspace::CloseActiveItem`. The first closes the buffer and
+    // leaves the hint screen; the second finds the pane already empty and takes
+    // `Pane::close_active_item`'s `CloseWindow` path, which is the explicit quit
+    // SPEC §24.7 asks for.
+    terminal.send(":q\r");
     terminal.send(":q\r");
     let status = terminal
         .exit_status(Duration::from_secs(10))
@@ -1139,9 +1216,9 @@ fn colon_q_on_a_dirty_buffer_asks_before_quitting() -> anyhow::Result<()> {
     // `x` deletes a character, which is what makes the close prompt.
     terminal.send("x");
     assert!(
-        terminal.status().contains("[+]"),
-        "the buffer is not marked dirty: {:?}",
-        terminal.status()
+        terminal.row(0).ends_with("lpha"),
+        "the edit did not land: {:?}",
+        terminal.row(0)
     );
 
     // `:q` closes a dirty item through a `window.prompt`. Without a projection
@@ -1159,9 +1236,16 @@ fn colon_q_on_a_dirty_buffer_asks_before_quitting() -> anyhow::Result<()> {
         "ted quit without waiting for an answer"
     );
 
-    // Answer 2, "Don't Save": the edit is discarded, the item closes, and the
-    // empty workspace is the exit condition (SPEC §14.3).
+    // Answer 2, "Don't Save": the edit is discarded and the item closes, which
+    // leaves the empty pane `ted` now sits in rather than ending the session —
+    // so quitting takes a second, explicit `:q` (SPEC §24.7).
     terminal.send("2");
+    assert!(
+        !terminal.exited(Duration::from_millis(500)),
+        "discarding the edit ended the session"
+    );
+
+    terminal.send(":q\r");
     let status = terminal
         .exit_status(Duration::from_secs(10))
         .context("ted is still running after answering the save prompt")?;
@@ -1193,9 +1277,9 @@ fn escape_cancels_the_save_prompt_and_leaves_the_buffer_alone() -> anyhow::Resul
         "cancelling the prompt quit anyway"
     );
     assert!(
-        terminal.status().contains("[+]"),
-        "the buffer stopped being dirty after cancelling: {:?}",
-        terminal.status()
+        terminal.row(0).ends_with("lpha"),
+        "the edit was undone by cancelling: {:?}",
+        terminal.row(0)
     );
     assert_eq!(fixture.contents(), "alpha\nbeta\n");
 
@@ -1230,7 +1314,7 @@ fn resizing_the_terminal_relays_out_the_editor() -> anyhow::Result<()> {
     );
     // The status line follows the grid's new last row, not the old one.
     assert!(
-        terminal.status().starts_with("NORMAL main.rs"),
+        terminal.status().starts_with("NORMAL"),
         "status was {:?}",
         terminal.status()
     );
@@ -1245,7 +1329,7 @@ fn no_vim_types_printable_characters_straight_into_the_buffer() -> anyhow::Resul
 
     terminal.send("h:");
     assert!(
-        terminal.status().starts_with("main.rs"),
+        !terminal.status().contains("NORMAL"),
         "a mode is being reported without vim: {:?}",
         terminal.status()
     );
@@ -1298,12 +1382,16 @@ fn a_suspended_child_owns_the_input_and_ted_takes_the_terminal_back() -> anyhow:
     // mode, so a leaked keystroke cannot hide here.
     let status = terminal.status();
     assert!(
-        status.starts_with("NORMAL main.rs"),
+        status.starts_with("NORMAL"),
         "the child's input reached ted: {status:?}"
     );
+    // `o` would have opened a line under `alpha` and pushed `beta` down, so the
+    // second row still being `beta` is what says none of the child's keystrokes
+    // were ted's.
     assert!(
-        !status.contains("[+]"),
-        "the child's input edited the buffer: {status:?}"
+        terminal.row(1).ends_with("beta"),
+        "the child's input edited the buffer: {:?}",
+        terminal.row(1)
     );
 
     let transcript = terminal.transcript_since(mark);
@@ -1351,7 +1439,7 @@ fn a_resize_while_suspended_is_recovered_and_a_failure_is_reported() -> anyhow::
     }
 
     assert!(
-        terminal.status().starts_with("NORMAL main.rs"),
+        terminal.status().starts_with("NORMAL"),
         "the status line is not on the new last row: {:?}",
         terminal.status()
     );
@@ -1428,21 +1516,17 @@ fn explore_opens_what_the_file_manager_chose() -> anyhow::Result<()> {
     // so `ted` takes the screen back without a prompt (SPEC §7.1).
     terminal.settle(AFTER_KEYS);
 
-    // Which of the two ends up active is not something one call to `open_paths`
-    // promises, so cycle the pane and assert on what is in it. `main.rs` is
-    // still there too, so three steps see everything.
-    //
-    // Row 1, not row 0: three items in the pane means a tab strip, and the
-    // editor's rows start under it (SPEC §24.7).
-    let mut opened = Vec::new();
-    for _ in 0..3 {
-        opened.push((terminal.status(), terminal.row(1)));
-        terminal.send(":bnext\r");
-    }
-
+    // Three items in the pane means a tab strip on row 0 naming every one of
+    // them, which is where the file's name lives now that the status line
+    // carries no path (SPEC §21/M3.5, §24.7).
+    let strip = terminal.row(0);
     assert!(
-        opened.iter().any(|(status, _)| status.contains("first.rs")),
-        "the first chosen file was not opened: {opened:#?}"
+        strip.contains("first.rs"),
+        "the first chosen file was not opened: {strip:?}"
+    );
+    assert!(
+        strip.contains("second.rs"),
+        "the second chosen file was not opened: {strip:?}"
     );
     // A chosen file is named by its name, wherever it came from. `ted` was
     // given `main.rs`, so neither of these is inside a worktree yet and each
@@ -1453,21 +1537,22 @@ fn explore_opens_what_the_file_manager_chose() -> anyhow::Result<()> {
         .expect("the fixture has a directory")
         .display()
         .to_string();
-    for (status, _) in &opened {
-        assert!(
-            !status.contains(&directory),
-            "a chosen file was named by its absolute path: {status:?}"
-        );
-    }
-    let Some((_, drawn)) = opened
-        .iter()
-        .find(|(status, _)| status.contains("second.rs"))
-    else {
-        panic!("the second chosen file was not opened: {opened:#?}");
-    };
     assert!(
-        drawn.contains("fn second()"),
-        "the chosen file's contents were not drawn: {drawn:?}"
+        !strip.contains(&directory),
+        "a chosen file was named by its absolute path: {strip:?}"
+    );
+
+    // A tab is not the file: which of the two ends up active is not something
+    // one call to `open_paths` promises, so cycle the pane and look for the
+    // contents. Row 1, because the strip has row 0.
+    let mut drawn = Vec::new();
+    for _ in 0..3 {
+        drawn.push(terminal.row(1));
+        terminal.send(":bnext\r");
+    }
+    assert!(
+        drawn.iter().any(|row| row.contains("fn second()")),
+        "the chosen file's contents were never drawn: {drawn:#?}"
     );
     Ok(())
 }
@@ -1496,7 +1581,7 @@ fn explore_reports_a_file_manager_that_is_not_installed() -> anyhow::Result<()> 
         "ted gave up the alternate screen for a child it could not run"
     );
     assert!(
-        terminal.status().starts_with("NORMAL main.rs"),
+        terminal.status().starts_with("NORMAL"),
         "the buffer was not still on screen: {:?}",
         terminal.status()
     );
@@ -1521,7 +1606,7 @@ fn a_malformed_ted_json_is_reported_rather_than_ignored() -> anyhow::Result<()> 
     );
     // Reported, not fatal: there is still an editor under the notification.
     assert!(
-        terminal.status().starts_with("NORMAL main.rs"),
+        terminal.status().starts_with("NORMAL"),
         "ted did not start with an unusable config: {:?}",
         terminal.status()
     );

@@ -140,7 +140,7 @@ use client::{Collaborator, ParticipantIndex, parse_zed_link};
 use clock::ReplicaId;
 use code_context_menus::{
     AvailableCodeAction, CodeActionContents, CodeActionsItem, CodeActionsMenu, CodeContextMenu,
-    CompletionsMenu, ContextMenuOrigin,
+    CompletionsMenu, ContextMenuContents, ContextMenuOrigin,
 };
 use code_lens::CodeLensState;
 use collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -4617,6 +4617,22 @@ impl Editor {
             .borrow()
             .as_ref()
             .map(|menu| menu.origin())
+    }
+
+    /// The open context menu (completions or code actions) as plain data. The
+    /// rendered menu is an element tree an embedder without GPUI painting
+    /// cannot use, so this is the same content laid out as data instead —
+    /// `styled_runs_for_code_label` is what colours the labels in the
+    /// rendered menu too.
+    pub fn context_menu_contents(&self) -> Option<ContextMenuContents> {
+        if !self.context_menu_visible() {
+            return None;
+        }
+        let style = self.style.as_ref()?;
+        self.context_menu
+            .borrow()
+            .as_ref()
+            .map(|menu| menu.contents(style))
     }
 
     pub fn set_context_menu_options(&mut self, options: ContextMenuOptions) {

@@ -20,6 +20,14 @@ use workspace::{Pane, Workspace};
 
 use crate::cell::{CELL_HEIGHT, CELL_WIDTH, cluster_cells, text_cells};
 
+/// How tall the completions box may grow, and how wide each of its columns may
+/// get (SPEC §24.9). The height is a function of the entry count alone, so
+/// these are the only things that bound it.
+const MENU_MAX_ROWS: u16 = 12;
+const MENU_MIN_WIDTH: u16 = 20;
+const MENU_MAX_LABEL_CELLS: u16 = 40;
+const MENU_MAX_SIGNATURE_CELLS: u16 = 40;
+
 /// A rectangle in terminal cells.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CellRect {
@@ -75,6 +83,12 @@ pub struct ViewSnapshot {
     /// The railed panel `shift-k` opens (SPEC §24.8), painted over the editor
     /// like an overlay and dismissed by the next key.
     pub hover: Option<HoverView>,
+    /// The language server's completions, or the code actions deployed from the
+    /// gutter — one box, because they are one `editor` field (SPEC §24.9).
+    pub menu: Option<MenuView>,
+    /// The screen an empty pane sits on (SPEC §24.7). Mutually exclusive with
+    /// `editor`: it is what is painted when there is no item to paint.
+    pub hint: Option<HintView>,
     pub prompt: Option<PromptView>,
     pub notifications: Vec<String>,
     /// Where to park the terminal's hardware cursor. SPEC §7 places the real
@@ -210,6 +224,36 @@ pub struct StyledSpan {
     /// row's text exists once and `byte_to_cell` indexes it directly.
     pub range: Range<usize>,
     pub style: SpanStyle,
+}
+
+/// Text together with the styling of its own slices.
+///
+/// What a `RowView` is for the buffer, this is for everything `ted` paints over
+/// it that is more than one colour: a completion's syntax-coloured label
+/// (SPEC §24.9) and a rendered markdown line in the hover panel (SPEC §24.8).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StyledText {
+    pub text: String,
+    /// Byte ranges within `text`, in order. Gaps take the surface's own style,
+    /// so plain prose costs no spans at all.
+    pub spans: Vec<StyledSpan>,
+}
+
+impl StyledText {
+    pub fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            spans: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub fn cell_width(&self) -> u16 {
+        text_cells(&self.text).min(u32::from(u16::MAX)) as u16
+    }
 }
 
 /// A resolved text style: theme colours and the attributes a terminal can
@@ -461,7 +505,90 @@ pub struct HoverBlock {
     pub rail: Option<Hsla>,
     /// Already wrapped to the panel's width, because wrapping is a decision
     /// about cells and belongs on this side of the projection.
-    pub lines: Vec<String>,
+    pub lines: Vec<StyledText>,
+}
+
+/// The box the language server's completions and the code-action menu are both
+/// painted into (SPEC §24.9).
+///
+/// One widget, because upstream they are one `editor` field: a menu that is open
+/// is open in exactly one of the two shapes, and the difference between them is
+/// which columns its rows carry.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MenuView {
+    /// Already resolved against the editor's text rect — below the anchor when
+    /// the rows are there, above it when they are not.
+    pub rect: CellRect,
+    pub rows: Vec<MenuRow>,
+    pub selected: Option<usize>,
+    /// The first row painted, scrolled far enough that the selection is on
+    /// screen.
+    pub first: usize,
+    /// Where the kind and signature columns start inside the box's text area.
+    /// Computed once from the widest label rather than per row, so the columns
+    /// line up down the box.
+    pub kind_column: u16,
+    pub signature_column: u16,
+    pub background: Option<Hsla>,
+    pub foreground: Option<Hsla>,
+    pub selection_background: Option<Hsla>,
+    pub border: Option<Hsla>,
+}
+
+/// One row of the box. Only `Entry` can be selected: a header and a rule are
+/// things the menu says about its entries rather than entries themselves.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MenuRow {
+    Entry {
+        /// The label column, syntax-coloured by `styled_runs_for_code_label`.
+        label: StyledText,
+        /// Byte offsets within `label.text` the query matched, bolded on top of
+        /// the colour: colour says what kind of thing an entry is, weight says
+        /// why it matched.
+        matched: Vec<usize>,
+        /// A word — `fn`, `const`, `struct` — because a word needs no legend
+        /// and the column is narrow either way. `None` for a code action, which
+        /// has no kind to put in a column.
+        kind: Option<String>,
+        /// Everything past the label, already faded by the same call that
+        /// coloured it. Empty for a code action.
+        signature: StyledText,
+    },
+    /// A group's name, above the completions in it.
+    Header(String),
+    /// A rule between two groups.
+    Divider,
+}
+
+impl MenuRow {
+    pub fn is_selectable(&self) -> bool {
+        matches!(self, MenuRow::Entry { .. })
+    }
+}
+
+/// What `ted` paints where the editor would be when the pane has nothing open
+/// (SPEC §24.7).
+///
+/// An empty pane is a state `ted` sits in rather than an exit condition, so the
+/// screen names the ways out of it instead of leaving the user in front of a
+/// blank grid wondering whether the session is still alive.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HintView {
+    pub rows: Vec<HintRow>,
+    /// The widest key, so the renderer can right-align the column without
+    /// measuring the rows twice.
+    pub key_cells: u16,
+    pub background: Option<Hsla>,
+    pub foreground: Option<Hsla>,
+    /// The keys' own colour, which is the only thing on the screen that is not
+    /// prose.
+    pub accent: Option<Hsla>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HintRow {
+    pub key: String,
+    pub description: String,
 }
 
 /// One thing the language server had to say about the cursor's position, before
@@ -469,17 +596,53 @@ pub struct HoverBlock {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HoverContent {
     pub rail: Option<Hsla>,
-    pub text: String,
+    pub lines: Vec<HoverLine>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// A line of the panel as the markdown renderer produced it, before it has been
+/// broken to the panel's width (SPEC §24.8).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HoverLine {
+    pub text: StyledText,
+    /// Prose wraps. A fenced code line and a box-drawn table row are laid out
+    /// already and are clipped instead: breaking either would say something the
+    /// document does not.
+    pub wrap: bool,
+    /// Cells to indent the continuation of a wrapped line by, so a list item's
+    /// second line lines up under its text rather than under its bullet.
+    pub indent: u16,
+}
+
+impl HoverLine {
+    /// A line that wraps and continues at the left edge, which is what ordinary
+    /// prose does and most of a doc comment is.
+    pub fn prose(text: StyledText) -> Self {
+        Self {
+            text,
+            wrap: true,
+            indent: 0,
+        }
+    }
+}
+
+/// The sparse bar (SPEC §21/M3.5).
+///
+/// Three things stand on it — the mode, the project's diagnostic counts, and the
+/// cursor's line and column — and everything else appears in the middle of the
+/// row only while it is true, so the row is mostly empty most of the time.
+///
+/// No path: the tab strip (§24.7) names the file already, and a bar that
+/// repeated it would spend its width saying twice what is said once.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct StatusView {
     pub mode: Option<String>,
-    pub path: Option<String>,
-    pub dirty: bool,
     /// One-based line and column of the primary cursor, as a user expects to
     /// read them.
     pub position: Option<(u32, u32)>,
+    /// The project's errors and warnings, coloured by severity. Project-wide
+    /// rather than per-file, because that is what `Project::diagnostic_summary`
+    /// returns and what Zed's own status bar shows (SPEC §24.8).
+    pub diagnostics: Option<DiagnosticCounts>,
     /// Multi-keystroke bindings in flight, e.g. `d2` while `d2w` is being typed
     /// (SPEC §8.3).
     pub pending_keys: Option<String>,
@@ -489,6 +652,39 @@ pub struct StatusView {
     pub panes: Option<(usize, usize)>,
     /// A wrap pass still running after a resize on a large file (SPEC §10.2).
     pub rewrapping: bool,
+    /// Whether the pane has nothing open at all. The bar says so rather than
+    /// going silent, because the hint screen behind it is a state `ted` sits in
+    /// and not a failure (SPEC §24.7).
+    pub empty: bool,
+    /// Text that replaces the whole row: vim's `ctrl-g` location string until
+    /// the next keystroke (SPEC §24.5), or a message `ted` has no other row to
+    /// put anywhere. The only thing on the bar that elides when the grid is
+    /// narrow.
+    pub takeover: Option<String>,
+    /// The bar's own surface. `None` falls back to inverting whatever is behind
+    /// it, which is what the pre-theme frames — "terminal too small" — get.
+    pub background: Option<Hsla>,
+    pub foreground: Option<Hsla>,
+}
+
+/// What the project has to say about itself, in two numbers.
+///
+/// The colours travel with the counts because severity is carried by colour and
+/// nothing else here, the same decision the buffer's underlines take
+/// (SPEC §24.8) — so a bar that dropped them would show two numbers that mean
+/// the same thing.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DiagnosticCounts {
+    pub errors: usize,
+    pub warnings: usize,
+    pub error_color: Option<Hsla>,
+    pub warning_color: Option<Hsla>,
+}
+
+impl DiagnosticCounts {
+    pub fn is_empty(self) -> bool {
+        self.errors == 0 && self.warnings == 0
+    }
 }
 
 /// `ted`'s own `:` or `/` line (SPEC §13.2). The query is `ted`'s to render;
@@ -548,6 +744,10 @@ pub struct Frame<'a> {
     pub hover: Vec<HoverContent>,
     pub prompt: Option<PromptView>,
     pub notifications: Vec<String>,
+    /// Whether this session has vim attached. The hint screen an empty pane
+    /// sits on names the ways out of it (SPEC §24.7), and without vim there is
+    /// no `:` line for three of them to be typed into (SPEC §24.5).
+    pub vim: bool,
     pub workspace: &'a Entity<Workspace>,
 }
 
@@ -577,24 +777,20 @@ pub fn build(frame: Frame<'_>, window: &mut Window, cx: &mut App) -> ViewSnapsho
         .then(|| tab_strip(&active_pane, frame.columns, window, cx))
         .flatten();
 
+    let colors = cx.theme().colors();
     let mut status = StatusView {
         // Surfaced only when there is more than one, because M1 renders just
         // the active pane (SPEC §14.3).
         panes: (panes > 1).then_some((pane_index, panes)),
-        pending_keys: window
-            .pending_input_keystrokes()
-            .filter(|keystrokes| !keystrokes.is_empty())
-            .map(|keystrokes| {
-                keystrokes
-                    .iter()
-                    .map(|keystroke| keystroke.unparse())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            }),
+        pending_keys: pending_keys(window),
+        diagnostics: Some(diagnostic_counts(frame.workspace, cx)),
+        background: Some(colors.status_bar_background),
+        foreground: Some(colors.text),
         ..Default::default()
     };
 
     let Some(item) = workspace.active_item(cx) else {
+        status.empty = true;
         return ViewSnapshot {
             columns: frame.columns,
             rows: frame.rows,
@@ -602,16 +798,12 @@ pub fn build(frame: Frame<'_>, window: &mut Window, cx: &mut App) -> ViewSnapsho
             status,
             command_line: frame.command_line,
             overlay,
+            hint: Some(hint_screen(frame.vim, window, cx)),
             prompt: frame.prompt,
             notifications,
             ..Default::default()
         };
     };
-    // `tab_content_text` rather than the project path: opening a single file
-    // makes it its own worktree root, and the path relative to that root is the
-    // empty string.
-    status.path = Some(item.tab_content_text(0, cx).to_string());
-    status.dirty = item.is_dirty(cx);
 
     let Some(editor) = item.act_as::<Editor>(cx) else {
         return ViewSnapshot {
@@ -638,6 +830,11 @@ pub fn build(frame: Frame<'_>, window: &mut Window, cx: &mut App) -> ViewSnapsho
     status.mode = snapshot.status.mode.take();
     status.position = snapshot.status.position;
     status.rewrapping = snapshot.status.rewrapping;
+    // Read here rather than in `for_editor` because it is a workspace-level
+    // decision how long the takeover lasts, and `vim::Vim::action` already
+    // clears the label on the next action outside a dot replay — so the bar
+    // comes back on its own with no dismissal logic here (SPEC §24.5).
+    status.takeover = vim::status_label(editor.read(cx), cx).map(|label| label.to_string());
 
     // The one addition SPEC §24.7 calls for, applied to the text rect, the
     // gutter rect and the cursor together: applying it to two of the three puts
@@ -654,6 +851,100 @@ pub fn build(frame: Frame<'_>, window: &mut Window, cx: &mut App) -> ViewSnapsho
     snapshot
 }
 
+fn pending_keys(window: &Window) -> Option<String> {
+    window
+        .pending_input_keystrokes()
+        .filter(|keystrokes| !keystrokes.is_empty())
+        .map(|keystrokes| {
+            keystrokes
+                .iter()
+                .map(|keystroke| keystroke.unparse())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+}
+
+/// The project's errors and warnings, project-wide, which is both what the call
+/// returns and what Zed's own status bar shows (SPEC §24.8).
+fn diagnostic_counts(workspace: &Entity<Workspace>, cx: &App) -> DiagnosticCounts {
+    let summary = workspace
+        .read(cx)
+        .project()
+        .read(cx)
+        .diagnostic_summary(false, cx);
+    let status = cx.theme().status();
+    DiagnosticCounts {
+        errors: summary.error_count,
+        warnings: summary.warning_count,
+        error_color: Some(status.error),
+        warning_color: Some(status.warning),
+    }
+}
+
+/// The ways out of an empty pane, named (SPEC §24.7).
+///
+/// The finder's keystroke is read back from the keymap rather than written down
+/// here, because a hint that names a binding the user has rebound is worse than
+/// no hint. Everything else is typed into the `:` line, which a `--no-vim`
+/// session does not have at all (SPEC §24.5) — so without vim the screen offers
+/// the finder and the one key that always works.
+fn hint_screen(vim: bool, window: &Window, cx: &App) -> HintView {
+    let mut rows = Vec::new();
+    if let Some(keystrokes) = binding_for(&workspace::ToggleFileFinder::default(), window) {
+        rows.push(HintRow {
+            key: keystrokes,
+            description: "find a file".to_owned(),
+        });
+    }
+    if vim {
+        rows.extend([
+            HintRow {
+                key: ":e <path>".to_owned(),
+                description: "open a file by name".to_owned(),
+            },
+            HintRow {
+                key: ":Explore".to_owned(),
+                description: "browse the project".to_owned(),
+            },
+            HintRow {
+                key: ":q".to_owned(),
+                description: "quit ted".to_owned(),
+            },
+        ]);
+    } else {
+        rows.push(HintRow {
+            key: "ctrl-c".to_owned(),
+            description: "quit ted".to_owned(),
+        });
+    }
+
+    let key_cells = rows
+        .iter()
+        .map(|row| text_cells(&row.key).min(u32::from(u16::MAX)) as u16)
+        .max()
+        .unwrap_or(0);
+    let colors = cx.theme().colors();
+    HintView {
+        rows,
+        key_cells,
+        background: Some(colors.editor_background),
+        foreground: Some(colors.text_muted),
+        accent: Some(colors.text_accent),
+    }
+}
+
+fn binding_for(action: &dyn gpui::Action, window: &Window) -> Option<String> {
+    let binding = window.highest_precedence_binding_for_action(action)?;
+    Some(
+        binding
+            .keystrokes()
+            .iter()
+            .map(|keystroke| keystroke.inner().unparse())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 fn shift_down(snapshot: &mut ViewSnapshot, rows: u16) {
     if rows == 0 {
         return;
@@ -667,6 +958,9 @@ fn shift_down(snapshot: &mut ViewSnapshot, rows: u16) {
         for cursor in &mut editor.secondary_cursors {
             cursor.row += rows;
         }
+    }
+    if let Some(menu) = snapshot.menu.as_mut() {
+        menu.rect.y += rows;
     }
     if let Some(cursor) = snapshot.cursor.as_mut() {
         cursor.row += rows;
@@ -699,6 +993,9 @@ pub fn for_editor(
         _ => CursorShape::Block,
     };
 
+    let menu = crate::menu::read(editor, cx)
+        .and_then(|contents| place_menu(contents, &view.editor, cursor, cx));
+
     ViewSnapshot {
         columns,
         rows,
@@ -707,22 +1004,154 @@ pub fn for_editor(
             mode,
             position: view.primary_position,
             rewrapping: view.rewrapping,
-            pending_keys: window
-                .pending_input_keystrokes()
-                .filter(|keystrokes| !keystrokes.is_empty())
-                .map(|keystrokes| {
-                    keystrokes
-                        .iter()
-                        .map(|keystroke| keystroke.unparse())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                }),
+            pending_keys: pending_keys(window),
             ..Default::default()
         },
+        menu,
         cursor,
         cursor_shape,
         ..Default::default()
     }
+}
+
+/// Where the completions box goes: below the anchor when the rows are there,
+/// above it when they are not, clamped to the editor's text rect (SPEC §24.9).
+///
+/// The anchor is the cursor for completions and the gutter's own row for code
+/// actions, which is how actions deploy from the indicator rather than from
+/// wherever the cursor happens to be sitting.
+fn place_menu(
+    contents: crate::menu::Contents,
+    editor: &EditorView,
+    cursor: Option<CellPoint>,
+    cx: &App,
+) -> Option<MenuView> {
+    if contents.rows.is_empty() {
+        return None;
+    }
+    let text_rect = editor.text_rect;
+    let anchor = match contents.anchor {
+        crate::menu::Anchor::Cursor => cursor?,
+        crate::menu::Anchor::GutterRow(display_row) => {
+            let offset = editor
+                .rows
+                .iter()
+                .position(|row| row.display_row == display_row)?;
+            CellPoint {
+                column: text_rect.x,
+                row: text_rect.y.saturating_add(u16::try_from(offset).ok()?),
+            }
+        }
+    };
+
+    let (label_cells, kind_cells, signature_cells) = menu_columns(&contents.rows);
+    // One space between each pair of columns, and a border either side.
+    let gaps = u16::from(kind_cells > 0) + u16::from(signature_cells > 0);
+    let inner = label_cells
+        .saturating_add(kind_cells)
+        .saturating_add(signature_cells)
+        .saturating_add(gaps)
+        .max(1);
+    let width = inner
+        .saturating_add(2)
+        .min(text_rect.width)
+        .max(MENU_MIN_WIDTH.min(text_rect.width));
+    if width < 3 {
+        return None;
+    }
+
+    // The box's height follows the entry count alone, which is what keeping
+    // documentation out of it buys: the box does not resize under the eye as
+    // the selection moves (SPEC §24.9).
+    let wanted = contents
+        .rows
+        .len()
+        .min(usize::from(MENU_MAX_ROWS))
+        .min(usize::from(u16::MAX)) as u16;
+    let bottom = text_rect.y.saturating_add(text_rect.height);
+    let below = bottom.saturating_sub(anchor.row.saturating_add(1));
+    let above = anchor.row.saturating_sub(text_rect.y);
+    let chrome = 2;
+    let (y, height) = if wanted + chrome <= below {
+        (anchor.row + 1, wanted + chrome)
+    } else if wanted + chrome <= above {
+        (anchor.row - (wanted + chrome), wanted + chrome)
+    } else if below >= above {
+        (anchor.row.saturating_add(1), below)
+    } else {
+        (text_rect.y, above)
+    };
+    if height <= chrome {
+        return None;
+    }
+    let visible = usize::from(height - chrome);
+
+    let x = anchor
+        .column
+        .min(text_rect.x + text_rect.width.saturating_sub(width));
+    let colors = cx.theme().colors();
+    Some(MenuView {
+        rect: CellRect::new(x, y, width, height),
+        first: first_visible_menu_row(contents.selected, contents.rows.len(), visible),
+        rows: contents.rows,
+        selected: contents.selected,
+        kind_column: label_cells.saturating_add(1),
+        signature_column: label_cells
+            .saturating_add(kind_cells)
+            .saturating_add(gaps.min(2)),
+        background: Some(colors.elevated_surface_background),
+        foreground: Some(colors.text),
+        selection_background: Some(colors.element_selected),
+        border: Some(colors.border),
+    })
+}
+
+/// The width each of the three columns needs, capped so one absurd signature
+/// cannot push the box past what the text rect can hold.
+fn menu_columns(rows: &[MenuRow]) -> (u16, u16, u16) {
+    let mut label = 0u16;
+    let mut kind = 0u16;
+    let mut signature = 0u16;
+    for row in rows {
+        match row {
+            MenuRow::Entry {
+                label: text,
+                kind: word,
+                signature: rest,
+                ..
+            } => {
+                label = label.max(text.cell_width());
+                kind = kind.max(
+                    word.as_deref()
+                        .map(|word| text_cells(word).min(u32::from(u16::MAX)) as u16)
+                        .unwrap_or(0),
+                );
+                signature = signature.max(rest.cell_width());
+            }
+            MenuRow::Header(text) => {
+                label = label.max(text_cells(text).min(u32::from(u16::MAX)) as u16);
+            }
+            MenuRow::Divider => {}
+        }
+    }
+    (
+        label.min(MENU_MAX_LABEL_CELLS),
+        kind,
+        signature.min(MENU_MAX_SIGNATURE_CELLS),
+    )
+}
+
+/// The first row painted, scrolled far enough that the selection is on screen.
+fn first_visible_menu_row(selected: Option<usize>, total: usize, visible: usize) -> usize {
+    let Some(selected) = selected else {
+        return 0;
+    };
+    if visible == 0 || total <= visible {
+        return 0;
+    }
+    selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(total - visible)
 }
 
 /// The pane's items along the top, and where the strip has to start so the
@@ -821,9 +1250,11 @@ fn place_hover(
         // A blank railed row between blocks, so a diagnostic and the
         // documentation under it are never read as one message.
         if index > 0 {
-            lines.push(String::new());
+            lines.push(StyledText::default());
         }
-        lines.extend(wrap_to_cells(&content.text, inner));
+        for line in &content.lines {
+            lines.extend(wrap_hover_line(line, inner));
+        }
         total = total.saturating_add(lines.len().min(usize::from(u16::MAX)) as u16);
         blocks.push(HoverBlock {
             rail: content.rail,
@@ -858,45 +1289,128 @@ fn place_hover(
     })
 }
 
-/// Breaks text at `width` cells, at a space where there is one and mid-word
-/// where there is not. Explicit newlines are honoured first, so a message that
-/// arrived with its own line structure keeps it.
-fn wrap_to_cells(text: &str, width: usize) -> Vec<String> {
+/// One rendered line broken to the panel's width.
+///
+/// A line the markdown renderer marked unwrappable — a fenced code line, a row
+/// of a box-drawn table — is clipped instead: breaking either would say
+/// something the document does not (SPEC §24.8).
+fn wrap_hover_line(line: &HoverLine, width: usize) -> Vec<StyledText> {
     if width == 0 {
         return Vec::new();
     }
-    let mut lines = Vec::new();
-    for paragraph in text.split('\n') {
-        let mut line = String::new();
-        let mut cells = 0usize;
-        for word in paragraph.split(' ') {
-            let word_cells = text_cells(word) as usize;
-            if !line.is_empty() && cells + 1 + word_cells > width {
-                lines.push(std::mem::take(&mut line));
-                cells = 0;
-            }
-            if !line.is_empty() {
-                line.push(' ');
-                cells += 1;
-            }
-            if word_cells > width {
-                for cluster in word.graphemes(true) {
-                    let cluster_cells = cluster_cells(cluster) as usize;
-                    if cells + cluster_cells > width {
-                        lines.push(std::mem::take(&mut line));
-                        cells = 0;
-                    }
-                    line.push_str(cluster);
-                    cells += cluster_cells;
-                }
-                continue;
-            }
-            line.push_str(word);
-            cells += word_cells;
-        }
-        lines.push(line);
+    if !line.wrap {
+        return vec![slice_styled(&line.text, clip_range(&line.text.text, width))];
     }
+
+    // The continuation is indented, so it has that many fewer cells to fill —
+    // wrapping both to the full width and then indenting would push the tail of
+    // every continued line off the panel.
+    let indent = usize::from(line.indent).min(width.saturating_sub(1));
+    let rest_width = width.saturating_sub(indent).max(1);
+    wrap_ranges(&line.text.text, width, rest_width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, range)| {
+            let sliced = slice_styled(&line.text, range);
+            if index == 0 || indent == 0 {
+                sliced
+            } else {
+                indent_styled(sliced, indent)
+            }
+        })
+        .collect()
+}
+
+/// The bytes covering the first `width` cells, which is what a line that may
+/// not be broken keeps.
+fn clip_range(text: &str, width: usize) -> Range<usize> {
+    let mut cells = 0usize;
+    for (offset, cluster) in text.grapheme_indices(true) {
+        let next = cells + cluster_cells(cluster) as usize;
+        if next > width {
+            return 0..offset;
+        }
+        cells = next;
+    }
+    0..text.len()
+}
+
+/// Breaks one line at a space where there is one and mid-word where there is
+/// not, as byte ranges into `text`.
+///
+/// Ranges rather than owned strings because a wrapped line's *styling* has to be
+/// cut at exactly the boundaries its text was, and a `String` has forgotten
+/// where it came from by the time the spans are sliced.
+fn wrap_ranges(text: &str, first_width: usize, rest_width: usize) -> Vec<Range<usize>> {
+    if first_width == 0 {
+        return vec![0..text.len()];
+    }
+    let mut lines = Vec::new();
+    let mut width = first_width;
+    let mut start = 0usize;
+    let mut cells = 0usize;
+    // The last space this line could be broken at, and the offset just past it,
+    // so the space itself belongs to neither line.
+    let mut space: Option<(usize, usize)> = None;
+
+    for (offset, cluster) in text.grapheme_indices(true) {
+        let cluster_cells = cluster_cells(cluster) as usize;
+        if cells + cluster_cells > width && offset > start {
+            let (end, next) = match space.filter(|(at, _)| *at > start) {
+                Some((at, after)) => (at, after),
+                None => (offset, offset),
+            };
+            lines.push(start..end);
+            start = next;
+            width = rest_width.max(1);
+            cells = text_cells(text.get(start..offset).unwrap_or_default()) as usize;
+            space = None;
+        }
+        if cluster == " " {
+            space = Some((offset, offset + cluster.len()));
+        }
+        cells += cluster_cells;
+    }
+    lines.push(start..text.len());
     lines
+}
+
+/// A byte range of a styled line, with the spans cut to the same range and
+/// rebased on it.
+fn slice_styled(text: &StyledText, range: Range<usize>) -> StyledText {
+    let sliced = text.text.get(range.clone()).unwrap_or_default().to_owned();
+    let spans = text
+        .spans
+        .iter()
+        .filter_map(|span| {
+            let start = span.range.start.max(range.start);
+            let end = span.range.end.min(range.end);
+            (start < end).then(|| StyledSpan {
+                range: start - range.start..end - range.start,
+                style: span.style,
+            })
+        })
+        .collect();
+    StyledText {
+        text: sliced,
+        spans,
+    }
+}
+
+fn indent_styled(text: StyledText, cells: usize) -> StyledText {
+    let indent = " ".repeat(cells);
+    let spans = text
+        .spans
+        .into_iter()
+        .map(|span| StyledSpan {
+            range: span.range.start + indent.len()..span.range.end + indent.len(),
+            style: span.style,
+        })
+        .collect();
+    StyledText {
+        text: indent + &text.text,
+        spans,
+    }
 }
 
 /// What the backend wants to tell the user that `ted` has no other place for.
@@ -1388,14 +1902,25 @@ fn span_style(
     highlight: Option<gpui::HighlightStyle>,
     editor_style: &editor::EditorStyle,
 ) -> SpanStyle {
+    style_from_highlight(highlight, editor_style.text.color)
+}
+
+/// A GPUI highlight as a terminal style, against the colour whatever surface it
+/// lands on would otherwise have painted.
+///
+/// The default colour is a parameter rather than the editor's, because the
+/// completions box is a surface of the theme's and a run that names no colour
+/// belongs to *it* — and because `fade_out` has nothing to fade without one, so
+/// a faded run with no base would arrive at full strength (SPEC §24.9).
+pub fn style_from_highlight(highlight: Option<gpui::HighlightStyle>, default: Hsla) -> SpanStyle {
     let Some(highlight) = highlight else {
         return SpanStyle {
-            foreground: Some(editor_style.text.color),
+            foreground: Some(default),
             ..Default::default()
         };
     };
 
-    let mut foreground = highlight.color.unwrap_or(editor_style.text.color);
+    let mut foreground = highlight.color.unwrap_or(default);
     // What Zed does with `Diagnostic::is_unnecessary`: dead code fades rather
     // than acquiring a marker of its own (SPEC §24.8). The palette composites
     // alpha against the editor background, so fading the alpha is all a terminal
@@ -1983,26 +2508,120 @@ mod tests {
         assert_eq!(first_visible_tab(&tabs, 2, 17), 1);
     }
 
+    fn wrapped(text: &str, width: usize) -> Vec<String> {
+        wrap_hover_line(&HoverLine::prose(StyledText::plain(text)), width)
+            .into_iter()
+            .map(|line| line.text)
+            .collect()
+    }
+
     #[test]
-    fn wrapping_breaks_at_spaces_and_keeps_the_lines_it_was_given() {
+    fn wrapping_breaks_at_spaces() {
         assert_eq!(
-            wrap_to_cells("this function takes 5 arguments", 20),
+            wrapped("this function takes 5 arguments", 20),
             vec!["this function takes", "5 arguments"]
-        );
-        assert_eq!(
-            wrap_to_cells("error E0061\nrust-analyzer", 40),
-            vec!["error E0061", "rust-analyzer"]
         );
     }
 
     #[test]
     fn a_word_wider_than_the_panel_is_broken_rather_than_clipped() {
         assert_eq!(
-            wrap_to_cells("std::collections::HashMap", 10),
+            wrapped("std::collections::HashMap", 10),
             vec!["std::colle", "ctions::Ha", "shMap"]
         );
         // Cells, not characters: a wide grapheme takes two of them.
-        assert_eq!(wrap_to_cells("日本語", 4), vec!["日本", "語"]);
+        assert_eq!(wrapped("日本語", 4), vec!["日本", "語"]);
+    }
+
+    /// SPEC §24.8: a fenced code line and a box-drawn table row are laid out
+    /// already, so they are clipped rather than broken.
+    #[test]
+    fn a_line_that_may_not_wrap_is_clipped_instead() {
+        let line = HoverLine {
+            text: StyledText::plain("fn build(frame: Frame) -> ViewSnapshot"),
+            wrap: false,
+            indent: 0,
+        };
+        let wrapped = wrap_hover_line(&line, 10);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0].text, "fn build(f");
+    }
+
+    /// A list item's continuation lines up under its text rather than under its
+    /// bullet, which is what the renderer's `indent` is for.
+    #[test]
+    fn a_continuation_is_indented_and_wraps_to_the_narrower_width() {
+        let line = HoverLine {
+            text: StyledText::plain("• one two three four"),
+            wrap: true,
+            indent: 2,
+        };
+        let wrapped = wrap_hover_line(&line, 10)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        assert_eq!(wrapped, vec!["• one two", "  three", "  four"]);
+    }
+
+    /// Wrapping cuts a line's styling at exactly the boundaries it cut the
+    /// text, which is the whole reason `wrap_ranges` reports ranges.
+    #[test]
+    fn a_wrapped_lines_spans_are_cut_and_rebased_with_its_text() {
+        let text = StyledText {
+            text: "alpha bravo charlie".to_owned(),
+            spans: vec![StyledSpan {
+                // "bravo charlie", spanning the break.
+                range: 6..19,
+                style: SpanStyle {
+                    bold: true,
+                    ..Default::default()
+                },
+            }],
+        };
+        let wrapped = wrap_hover_line(&HoverLine::prose(text), 12);
+        assert_eq!(wrapped[0].text, "alpha bravo");
+        assert_eq!(wrapped[0].spans[0].range, 6..11);
+        assert_eq!(wrapped[1].text, "charlie");
+        assert_eq!(wrapped[1].spans[0].range, 0..7);
+    }
+
+    #[test]
+    fn the_menu_scrolls_only_as_far_as_the_selection_needs() {
+        assert_eq!(first_visible_menu_row(Some(0), 20, 5), 0);
+        assert_eq!(first_visible_menu_row(Some(3), 20, 5), 0);
+        // The selection has just left the bottom of the box.
+        assert_eq!(first_visible_menu_row(Some(5), 20, 5), 1);
+        // And it never scrolls past the last row.
+        assert_eq!(first_visible_menu_row(Some(19), 20, 5), 15);
+        assert_eq!(first_visible_menu_row(None, 20, 5), 0);
+        // A box tall enough for everything never scrolls at all.
+        assert_eq!(first_visible_menu_row(Some(4), 5, 5), 0);
+    }
+
+    /// SPEC §24.9: the columns are computed once from the widest label rather
+    /// than per row, and capped so one absurd signature cannot push the box
+    /// past what the text rect can hold.
+    #[test]
+    fn the_menus_columns_are_the_widest_of_each_and_no_wider() {
+        let entry = |label: &str, kind: &str, signature: &str| MenuRow::Entry {
+            label: StyledText::plain(label),
+            matched: Vec::new(),
+            kind: Some(kind.to_owned()),
+            signature: StyledText::plain(signature),
+        };
+        let rows = vec![
+            entry("filter", "fn", "(self) -> Iter"),
+            entry("f", "const", "u8"),
+            MenuRow::Divider,
+        ];
+        assert_eq!(menu_columns(&rows), (6, 5, 14));
+
+        let long = "x".repeat(200);
+        let rows = vec![entry(&long, "fn", &long)];
+        assert_eq!(
+            menu_columns(&rows),
+            (MENU_MAX_LABEL_CELLS, 2, MENU_MAX_SIGNATURE_CELLS)
+        );
     }
 
     fn text_row(display_row: u32, text: &str) -> RowView {

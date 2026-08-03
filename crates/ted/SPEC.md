@@ -1,6 +1,6 @@
 # `ted` — a terminal UI for Zed
 
-**Status:** M0 through M3 implemented (§21). M3.5 is next
+**Status:** M0 through M3.5 implemented (§21). M4 is next
 **Scope:** a new crate + binary in this repository that presents Zed's editor as a
 full-screen terminal application, using Ratatui for presentation and Zed's own
 `editor` + `vim` + `workspace` + `project` crates for all behaviour.
@@ -1454,16 +1454,43 @@ only that no *further* work goes into terminals `ted` no longer aims at.
 project symbols, and the generic fallback is never hit in normal use.
 
 **M3.5 — The status line, and completions.** Two things M2 deliberately set
-aside, grouped because each is a design of its own rather than a feature to
-finish. The status line gets one: what it carries (mode, path, position,
-diagnostics counts, vim's location string from `ctrl-g`, pane and item
-indicators), how it behaves when the grid is narrow, and what belongs on it at
-all rather than on a surface of its own — every §24 question that ended "waits
-for the status line" lands here. Alongside it, the language-server completions
-popup (§24.9), signature help and the code-action menu, which arrive together
-behind one new `editor` reader (§20.2). This milestone also settles what
-"quit" means once the last item in a pane closes (§24.7): exiting on an empty
-pane is M2's placeholder, not the intended behaviour.
+aside, grouped because each was a design of its own rather than a feature to
+finish. Both designs are now settled — every §24 question that ended "waits for
+the status line" lands here, and §23 records the answers.
+
+**The status line is sparse.** Standing on it: the vim mode, the project's error
+and warning counts coloured by severity, and the primary cursor's line and
+column. Everything else appears in the middle of the row only while it is true —
+pending keys (§8.3), `wrapping…` (§10.2), the pane index when there is more than
+one (§14.3) — and leaves when it stops being true, so the row is mostly empty
+most of the time. **No path**: the tab strip (§24.7) already names the file, and
+a bar that repeated it would spend its width saying twice what is said once.
+`ctrl-g` takes the whole row over with vim's location string — path, line count,
+percentage, dirty flag — until the next keystroke restores it, which is also the
+only thing on the row that has to elide when the grid is narrow.
+
+**Completions and code actions arrive together, signature help does not.** The
+popup and the code-action menu are one `editor` field and one new reader (§20.2,
+§24.9). Signature help reads a *different* private field (`signature_help_state`,
+`crates/editor/src/editor.rs:1012`), needs an upstream reader of its own, and is
+**postponed past this milestone** rather than travelling with them — which is
+what leaves M3.5 needing exactly one addition to `editor`.
+
+The hover panel's markdown renderer lands here too (§24.8): emphasis, syntax-
+coloured fences, lists, box-drawn tables and links, replacing M2's flattening.
+And this milestone settles what "quit" means once the last item in a pane closes
+(§24.7): an empty pane becomes a state `ted` can sit in, with a hint screen and
+an explicit quit, replacing M2's exit-on-empty placeholder.
+
+**Landed as:** `status.rs`'s work went into the existing projection —
+`StatusView` lost its path and dirty flag and gained the counts, the `ctrl-g`
+takeover and the empty flag — alongside `crate::menu` (the reader for §24.9's
+box), `crate::markdown` (§24.8's renderer, pure, with the fences left for
+`crate::hover` to colour once it has resolved a language), and `HintView` for
+the empty pane. Two upstream additions, both as specified: `vim::status_label`
+and `Editor::context_menu_contents`. §23 records the four details the code had
+to answer that the design had left open, and one it opened: the bar now says
+nothing about unsaved work in a single-buffer session.
 
 **M4 — Layout.** Pane splits rendered as cell-space splits driven by reported
 bounds. No project panel: §13.4's external file manager covers browsing and file
@@ -1530,7 +1557,18 @@ connection (§13.4). Optionally move the frontend out of process across the
 | Overlay behaviour | **Floats over the editor and never reserves rows**, so the buffer behind it never relayouts — and therefore **grows to fit its matches**, downward from a fixed top edge, up to a cap. The query row never moves; only the bottom border does. The selected row is the theme's selection background and nothing else — no bar, no caret — and the editor behind is left undimmed. §24.1. |
 | Terminals `ted` targets | **kitty and Ghostty, with a complete font.** No ASCII fallback for box drawing and no capability checks around it. This also makes §8.2's legacy keyboard mode and §12's 16-colour tier work for terminals `ted` no longer aims at — both are M3 items and can be dropped rather than built. §24.1. |
 | Diagnostics | **Severity in the buffer, message on demand.** A straight coloured underline (not a curl, which would cost a hand-written Ratatui backend), severity by colour with no glyph, dead code dimmed, and nothing that moves the code being read. `shift-k` opens a railed panel over the editor carrying the diagnostic *and* the language server's documentation, the rail's colour saying which is which. §24.8. |
-| Status line, and completions | **Both out of M2** (§21/M3.5). The status line needs a design rather than another field, and the completions popup is the one M2 surface that needed an upstream `editor` change — deferring it leaves M2 requiring no change to any crate but `ted`. §24.9, §24.10. |
+| Status line, and completions | **Both out of M2** (§21/M3.5). The status line needed a design rather than another field, and the completions popup is the one M2 surface that needed an upstream `editor` change — deferring it leaves M2 requiring no change to any crate but `ted`. §24.9, §24.10. |
+| What the status line carries | **Sparse: mode, diagnostics counts, line:column** standing, and nothing else. Pending keys, `wrapping…` and the pane index appear mid-row only while true. **No path** — the tab strip (§24.7) names the file already. §21/M3.5. |
+| The path, and `ctrl-g` | **`ctrl-g` takes the bar over** with vim's location string until the next keystroke, rather than the path standing on the row or a second surface carrying it. It is the only thing on the bar that elides when the grid is narrow. §21/M3.5, §24.5. |
+| The completions popup | **Three columns — label, kind word, signature — and no documentation line.** Docs stay on `shift-k` in §24.8's railed panel, matching "severity in the buffer, message on demand". Labels take their syntax colour from `styled_runs_for_code_label` with the typed characters bold on top. §24.9. |
+| The code-action menu | **The same box as completions**, titles with a leading kind glyph, anchored at `context_menu_origin()`'s gutter indicator rather than at the cursor. One widget, because it is one `editor` field. §24.9. |
+| Signature help | **Postponed past M3.5.** It reads a different private field from the completions menu, so it needs its own upstream reader and unblocks nothing else — §24.9's "all three arrive together" was true of two of them. §24.9, §24.10. |
+| Quitting on an empty pane | **An empty pane is a state `ted` sits in**, showing a hint screen; quitting becomes explicit. `Backend::is_empty` stops meaning "exit". §24.7, §21/M3.5. |
+| Markdown in the hover panel | **Rendered in full** — emphasis, syntax-coloured fences, lists, box-drawn tables, underlined links — replacing M2's flattening. §24.8, §21/M3.5. |
+| What the `ctrl-g` takeover elides | **The middle of the string, keeping up to eighteen cells of tail.** The numbers are short and sit at the end, so what a narrow grid eats is the middle of the path — the part a reader can most easily do without, with the file's name at one end and its worktree at the other. §21/M3.5. |
+| A markdown block too wide for the panel | **Clipped, not wrapped or scrolled.** A fenced code line and a box-drawn table row are laid out already; breaking either says something the document does not, and a terminal panel has nowhere to scroll sideways to. Prose wraps, and a list item's continuation indents under its text. §24.8. |
+| How quitting on an empty pane reaches the frame loop | **`ted` ends the session itself** when something asked it to and every pane is empty — `:q` on an already-empty pane, or `:qa` once its save prompts are answered. Not by letting `Pane::close_active_item` ask the *window* to close: a terminal has no window to leave behind, and tearing one down under a `ted` that is already shutting down only strands the workspace's handles. §24.7. |
+| The `:` line on an empty pane | **Opens.** §13.2 opens it only from a vim mode, and there is no mode without a buffer — but there is also no buffer for `:` to be a character in, so it is a command. Without this the hint screen names three ways out that cannot be typed. §24.7. |
 | Where `ted`'s own settings live | **`ted.json`, beside `settings.json`**, read by `ted` alone — not a `ted` section in Zed's settings schema. `settings.json` is shared because its keys mean the same thing in both; a key only `ted` can act on does not, and putting it there would make one run of `ted` a permanent addition to a GUI user's configuration. Switching between GUI and TUI configures neither. §9. |
 
 ### Remaining
@@ -1544,10 +1582,13 @@ connection (§13.4). Optionally move the frontend out of process across the
    disagree on East Asian ambiguous-width. `ted` is self-consistent either way,
    but the *setting* needs a default chosen — narrow (matches most modern
    terminals) is the likely answer, with an override.
-4. **How much of a language server's markdown the hover panel should render.**
-   M2 flattens it to text (§24.8), which is enough to read a type signature and a
-   doc comment. What fences, emphasis and lists should look like in cells is a
-   small renderer of its own and travels with §21/M3.5.
+4. **What the sparse bar says about unsaved work, which M3.5 left it saying
+   nothing about.** §21 settled the bar as mode, counts and position "and
+   nothing else", on the reasoning that the tab strip names the file — but the
+   strip only appears once a pane holds more than one item (§24.7), so a session
+   with a single dirty buffer has no modified marker anywhere except `ctrl-g`'s
+   takeover. Either the strip appears for one item too, or `•` joins the
+   mid-row transients, or `ctrl-g` is deemed enough.
 
 ---
 
@@ -1945,7 +1986,11 @@ therefore does *not* do, so none of it is rediscovered later as a gap.
   `vim::ShowLocation` (`assets/keymaps/vim.json:75`), which writes
   `Vim::status_label` (`crates/vim/src/vim.rs:553`, set at
   `crates/vim/src/normal.rs:1027`) for a status-bar item `ted` does not render.
-  Nothing appears. That belongs to the status-line milestone (§21), not here.
+  Nothing appears in M2. **M3.5 decides it takes the status line over** — the
+  label replaces the row's contents rather than opening a surface or claiming the
+  notification line, and the next keystroke restores the bar. That last part needs
+  no work: `Vim::action` already clears the label on the next action outside a dot
+  replay (`vim.rs:1078`), so the bar comes back on its own. §21/M3.5.
 - **Without vim, `ctrl-g` is the one thing left to build**, because there is no
   `:` line at all in a `--no-vim` session (§13.2 opens it only from a vim mode)
   and `go_to_line::Toggle` would open a modal `ted` cannot paint. §24.2's table
@@ -2074,12 +2119,15 @@ details follow: a save prompt (§13.3) must name the file it is about, since the
 item being closed need not be the one last looked at; and `ctrl-c` is the only
 single-key way out while any item remains.
 
-**Deferred: what happens when the last one closes.** `ted` exits when every pane
-is empty (`Backend::is_empty`) — "no buffers" is how quit reaches the frame loop
-today. That conflates closing a file with ending a session, and a later milestone
-replaces it: an empty pane should be a state `ted` can sit in, with quitting made
-explicit. Not M2; recorded here so the current behaviour is understood as a
-placeholder rather than a decision.
+**Deferred to M3.5: what happens when the last one closes.** `ted` exits when
+every pane is empty (`Backend::is_empty`) — "no buffers" is how quit reaches the
+frame loop today. That conflates closing a file with ending a session. **Decided
+for M3.5: an empty pane is a state `ted` sits in**, painting a hint screen naming
+the few ways out of it — the finder, `:e`, `:Explore`, `:q` — while the status
+line keeps its mode and reports that there is no buffer. Quitting becomes
+explicit: `:q` from the empty state, `:qa`, or `ctrl-c`. `Backend::is_empty`
+stops being how quit reaches the frame loop, which is the whole mechanical
+change. Not M2; the current behaviour is a placeholder, not a decision.
 
 **Decided, in the strip's details:**
 
@@ -2210,27 +2258,31 @@ Navigation between diagnostics already works and is unaffected: `] d` / `[ d` an
 `g ]` / `g [` are bound to `editor::GoToDiagnostic` / `GoToPreviousDiagnostic` in
 `assets/keymaps/vim.json`, `f8` / `shift-f8` in the Linux keymap.
 
-**Markdown is flattened in M2 and rendered later.** `HoverBlock::kind` says
+**Markdown is flattened in M2 and rendered in M3.5.** `HoverBlock::kind` says
 whether a block is markdown or plain text; M2 strips the markup and lays out the
-text, which is enough to read a type signature and a doc comment. Turning fences,
-emphasis and lists into terminal styling is a small renderer of its own and
-travels with the other deferred work (§21/M3.5) — the flattened version is not a
-placeholder that gets thrown away, it is the same panel with a better text pass
-behind it.
+text, which is enough to read a type signature and a doc comment. The flattened
+version is not a placeholder that gets thrown away, it is the same panel with a
+better text pass behind it.
 
-**Direction wanted.**
+**Decided, for that pass (§21/M3.5): render all of it.** Emphasis and inline code
+become terminal attributes, fenced blocks get a dim ground and syntax colour,
+lists get bullets and indentation, headings go bold, links are underlined with
+the URL dimmed after them, and tables are ruled with box drawing. Tables are the
+only part that can want more width than the panel has; §23's remaining list
+carries what they do about it.
 
-- **Counts.** A tally of the project's errors and warnings —
-  `Project::diagnostic_summary(false, cx)` returns exactly `{ error_count,
-  warning_count }` (`crates/project/src/project.rs:5080`) — would live in the
-  status line, so it waits for that milestone with everything else that would go
-  there.
+**Decided: the counts go on the status line.** A tally of the project's errors
+and warnings — `Project::diagnostic_summary(false, cx)` returns exactly `{
+error_count, warning_count }` (`crates/project/src/project.rs:5080`) — is one of
+the two things standing on M3.5's sparse bar, coloured by severity, project-wide
+rather than per-file because that is what the call returns and what Zed's own
+status bar shows. §21/M3.5.
 
-### 24.9 Completions from the language server — deferred
+### 24.9 Completions from the language server — deferred to M3.5
 
 **Deferred past M2**, and with it the one upstream change M2 would otherwise have
-required. What is settled is the shape: an outlined box at the cursor, placed
-where Zed places its menu, as text.
+required. The shape is settled: an outlined box at the cursor, placed where Zed
+places its menu, as text.
 
 ```
   39     let reserved = reserved_rows(command_line.is_some(), prompt);
@@ -2287,17 +2339,39 @@ the cursor, flips above when the rows are not there, and clamps to the text
 rect. `context_menu_origin()` still matters for the anchor that is not the cursor
 (`GutterIndicator(DisplayRow)`, which is how code actions deploy).
 
-**Blocked on the same reader:** signature help (`Editor::signature_help_state`,
-private, with no public reader at all — `editor.rs:1012`) and the code-action
-menu (the same `context_menu` field). All three arrive together or not at all,
-which is another reason they travel to a later milestone as one piece.
+**Blocked on the same reader: the code-action menu**, which is the same
+`context_menu` field, so one reader unblocks both and they arrive together in
+M3.5. **Signature help is not.** It reads `Editor::signature_help_state`
+(`editor.rs:1012`), a different private field with no public reader at all, so it
+needs an upstream ask of its own and unblocks nothing else — it is **postponed
+past M3.5** rather than travelling with these two. Keeping it out is what leaves
+M3.5 needing exactly one addition to `editor`.
 
-**Still open when it is picked up.** Whether the box carries a documentation line
-under the list or nothing; whether the kind is a word (`fn`, `const`), a glyph or
-a colour; whether the signature column earns its width; whether labels take their
-syntax colour from `styled_runs_for_code_label` (free, and matches the GUI) or
-stay plain with only the matched characters emphasised; and what to paint when
-the open menu is code actions rather than completions.
+**Decided, when it is picked up (§21/M3.5).**
+
+- **Three columns: label, kind, signature.** The kind is a *word* — `fn`,
+  `const`, `struct` — not a glyph and not a colour, because a word needs no
+  legend and the column is narrow either way. The signature column takes the
+  remaining width and truncates.
+- **No documentation line in the box.** Documentation is what `shift-k` is for
+  (§24.8), and the same rule that keeps diagnostic messages out of the buffer
+  keeps doc prose out of a menu that is being typed through. It also keeps the
+  box's height a function of the entry count alone, so the box does not resize
+  under the eye as the selection moves.
+- **Labels carry their syntax colour** from `editor::styled_runs_for_code_label`
+  (`editor.rs:12118`) — free, and the same call the GUI menu makes — **with the
+  typed characters bold on top.** Two orthogonal signals: colour says what kind
+  of thing an entry is, weight says why it matched. The bold offsets are
+  `StringMatch::positions` off each `CompletionMenuEntry::Match`
+  (`code_context_menus.rs:73`) — byte offsets into the *filter* text
+  (`crates/fuzzy/src/matcher.rs:170`), so they shift by `CodeLabel::filter_range.start`
+  to land on the label — and from there they go through `byte_to_cell_table` like
+  every other offset in §24.1.
+- **Code actions paint into the same box**, titles only, each with a leading
+  glyph for its kind — quickfix, refactor, source. No kind column and no
+  signature column, since an action has neither. When `context_menu_origin()`
+  reports `GutterIndicator(DisplayRow)` the box anchors there rather than at the
+  cursor, which is how actions deploy from the gutter.
 
 ### 24.10 What M2 leaves out, what it needs upstream, and when it is done
 
@@ -2305,23 +2379,26 @@ the open menu is code actions rather than completions.
 
 | Left out | Where it goes |
 |---|---|
-| Language-server completions, signature help, code actions (§24.9) | a later milestone, together, since one reader unblocks all three |
-| Markdown rendering in the hover panel (§24.8) | the same milestone; M2 flattens the text |
-| The status line's design — counts, `ctrl-g`'s location string, an item counter, anything else that would live there | its own milestone (§21) |
-| What "quit" means once the last item closes (§24.7) | the same milestone; `ted` exits on an empty pane until then |
+| Language-server completions and code actions (§24.9) | M3.5, together, since one reader unblocks both |
+| Signature help (§24.9) | past M3.5 — a second private field, a second upstream reader, and nothing else waiting on it |
+| Markdown rendering in the hover panel (§24.8) | M3.5, rendered in full; M2 flattens the text |
+| The status line's design — counts, `ctrl-g`'s location string, anything else that would live there | M3.5, decided in §21: sparse, no path, `ctrl-g` takes the row over |
+| What "quit" means once the last item closes (§24.7) | M3.5; `ted` exits on an empty pane until then |
 | Mirror-strategy projection of Zed's pickers (§13.1) | M3 — every list in §24 is `ted`'s own until then |
 | Project-wide search, outline and project-symbol pickers, mouse | M3 |
 | Rendered pane splits | M4 |
 | Edit predictions | not deferred so much as absent: §9 does not wire `edit_prediction` into the bootstrap at all |
 
 **Upstream changes.** With completions deferred, **M2 requires no change to any
-crate but `ted`**. What remains is one dependency flag and three proposals:
+crate but `ted`**. What remains is one dependency flag, three readers later
+milestones need, and two proposals:
 
 | Crate | Change | Status |
 |---|---|---|
 | `ratatui` feature | enable `underline-color` in the workspace dependency | done; severity-coloured underlines (§24.8) reach the terminal through it |
-| `editor` | a public reader for the completions menu | deferred with §24.9 |
-| `vim` | `pub fn status_label(editor, cx)`, in the shape of `vim::mode` | deferred with the status line (§24.5) |
+| `editor` | `Editor::context_menu_contents()`, returning the open menu's entries and selection as plain data (`ContextMenuContents` in `code_context_menus.rs`) | done in M3.5 (§24.9); the only addition to `editor` the milestone needed |
+| `editor` | a public reader for `signature_help_state` | postponed past M3.5 with the feature (§24.9) |
+| `vim` | `pub fn status_label(editor, cx) -> Option<SharedString>`, in the shape of `vim::mode` — the field is already `pub` (`vim.rs:553`), so this is a free function reaching it through `VimAddon`, not a visibility change | done in M3.5 with `ctrl-g` (§24.5) |
 | `vim` | `:b <name>` / `:b <n>`, absent from the command table | proposal; expressible as `ActivateItem`, so §13.4 puts it upstream rather than in `ted`'s host table (§24.6) |
 | `vim` | `row:column` in the `:` range parser | proposal, so `:42:8` means the same in both (§24.5) |
 

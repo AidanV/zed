@@ -38,12 +38,16 @@ use crate::platform::terminal_window_options;
 ///
 /// `buffer_font_size` and `buffer_line_height` are what make [`crate::cell`]'s
 /// constants true; `soft_wrap` is what makes wrap boundaries a function of the
-/// terminal width. The rest is cosmetic — `ted` paints whatever cell rect the
+/// terminal width; and `when_closing_with_no_tabs` keeps a close on an empty
+/// pane from asking the *window* to close, which `ted` has no use for — an empty
+/// pane is a state it sits in, and ending the session is the frame loop's to do
+/// (SPEC §24.7). The rest is cosmetic — `ted` paints whatever cell rect the
 /// editor reports (SPEC §10.2), so hiding chrome only widens that rect.
 const SETTINGS_OVERRIDE: &str = r#"
     "buffer_font_size": 16,
     "buffer_line_height": { "custom": 1.0 },
     "soft_wrap": "editor_width",
+    "when_closing_with_no_tabs": "keep_window_open",
     "tab_bar": { "show": false },
     "status_bar": { "experimental.show": false },
     "toolbar": {
@@ -79,6 +83,10 @@ fn filtered_action_names() -> [&'static str; 3] {
 pub struct Backend {
     pub window: WindowHandle<MultiWorkspace>,
     pub workspace: Entity<Workspace>,
+    /// Whether vim is attached. The hint screen an empty pane sits on names the
+    /// ways out of it, and three of the four are typed into a `:` line a
+    /// `--no-vim` session does not have (SPEC §24.7, §24.5).
+    pub vim: bool,
 }
 
 impl Backend {
@@ -94,10 +102,11 @@ impl Backend {
 
     /// Whether every pane is empty.
     ///
-    /// This is `ted`'s exit condition, and it is what makes `:q` mean "quit":
-    /// vim's interceptor maps `:q` to `workspace::CloseActiveItem`, which in
-    /// GUI Zed leaves an empty window behind. A terminal has no empty window to
-    /// leave behind (SPEC §14.3).
+    /// No longer an exit condition on its own. Through M3 this was how `:q`
+    /// reached the frame loop, which conflated closing a file with ending a
+    /// session; M3.5 makes the empty pane a state `ted` sits in and quitting
+    /// explicit (SPEC §24.7). It is now half of that test: the session ends
+    /// when every pane is empty *and* something asked for it to.
     pub fn is_empty(&self, cx: &App) -> bool {
         self.workspace
             .read(cx)
@@ -226,13 +235,19 @@ pub fn init(vim: bool, cx: &mut App) -> Result<Arc<AppState>> {
 ///
 /// `Workspace::new_local` rather than hand-rolled window creation, so workspace
 /// serialisation, worktree trust and project restoration all behave (SPEC §9).
-pub fn open(paths: Vec<PathBuf>, app_state: Arc<AppState>, cx: &mut App) -> Task<Result<Backend>> {
+pub fn open(
+    paths: Vec<PathBuf>,
+    vim: bool,
+    app_state: Arc<AppState>,
+    cx: &mut App,
+) -> Task<Result<Backend>> {
     let task = Workspace::new_local(paths, app_state, None, None, None, OpenMode::Activate, cx);
     cx.spawn(async move |cx| {
         let opened = task.await?;
         let backend = Backend {
             window: opened.window,
             workspace: opened.workspace,
+            vim,
         };
 
         // Focus explicitly once the workspace exists: combined with

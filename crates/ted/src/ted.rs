@@ -11,6 +11,8 @@ pub mod explore;
 pub mod frame;
 pub mod hover;
 pub mod input;
+pub mod markdown;
+pub mod menu;
 pub mod mirror;
 pub mod overlay;
 pub mod palette;

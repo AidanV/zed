@@ -508,6 +508,21 @@ pub fn mode(editor: &Editor, cx: &App) -> Option<Mode> {
     Some(editor.addon::<VimAddon>()?.entity.read(cx).mode)
 }
 
+/// What `vim::ShowLocation` (`ctrl-g`) writes. `Vim::action` clears it on the
+/// next action outside a dot replay, so callers need no dismissal logic of
+/// their own.
+///
+/// Exists for embedders that render their own status line instead of
+/// `ModeIndicator`, which reaches the same state through `VimAddon` directly.
+pub fn status_label(editor: &Editor, cx: &App) -> Option<SharedString> {
+    editor
+        .addon::<VimAddon>()?
+        .entity
+        .read(cx)
+        .status_label
+        .clone()
+}
+
 /// The range prefix vim's own `:` bindings seed the command palette with:
 /// `'<,'>` in visual modes, `.` or `.,.+n` for a pending count, empty
 /// otherwise. Consumes the pending count and forced-motion flag exactly as

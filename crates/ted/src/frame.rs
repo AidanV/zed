@@ -113,7 +113,7 @@ fn start(
 ) -> Result<()> {
     let app_state = bootstrap::init(options.vim, cx)?;
 
-    let opening = bootstrap::open(options.paths.clone(), app_state, cx);
+    let opening = bootstrap::open(options.paths.clone(), options.vim, app_state, cx);
     let background = cx.theme().colors().editor_background;
     let palette = Palette::new(ColorDepth::detect(), background, options.opaque_background);
 
@@ -172,6 +172,12 @@ struct Session {
     /// transient (SPEC §13.3). Notifications the *backend* raised are read fresh
     /// each frame by `snapshot::backend_notifications`.
     messages: Vec<String>,
+    /// Set by `:qa`, which closes every item and leaves the window standing —
+    /// an empty workspace in a GUI, and the session over in a terminal. Cleared
+    /// on the next keystroke, so a cancelled save prompt does not leave the
+    /// session primed to quit the next time a pane happens to empty
+    /// (SPEC §24.7).
+    quit_when_empty: bool,
     busy_frames: u32,
 }
 
@@ -215,14 +221,17 @@ async fn drive(
         hover: None,
         mouse: Mouse::default(),
         messages: complaint.into_iter().collect(),
+        quit_when_empty: false,
         busy_frames: BUSY_FRAMES_AFTER_INPUT,
     };
     let mut reserved = u16::MAX;
 
     loop {
-        // `:q` closes the active item rather than the window, so an empty
-        // workspace is what "quit" looks like from here (SPEC §14.3).
-        if cx.update(|cx| session.backend.is_empty(cx)) {
+        // An empty workspace is a state `ted` sits in rather than an exit
+        // (SPEC §24.7), so nothing is checked here — the loop ends when the
+        // *window* closes, which is what `:q` on an empty pane and `:qa` both
+        // arrange, or when `ctrl-c` breaks out below.
+        if session.quit_when_empty && cx.update(|cx| session.backend.is_empty(cx)) {
             return Ok(());
         }
 
@@ -491,8 +500,9 @@ async fn handle_key(
     cx: &mut AsyncApp,
 ) -> Result<Option<HostCommand>> {
     // The panel dismisses on the next key, whatever that key goes on to do
-    // (SPEC §24.8).
+    // (SPEC §24.8), and so does `:qa`'s standing intent to quit.
     session.hover = None;
+    session.quit_when_empty = false;
 
     // Exactly one owner per keystroke, and `ted`'s own surfaces sit in front of
     // GPUI: a key that reaches an overlay never reaches the dispatch tree
@@ -506,10 +516,13 @@ async fn handle_key(
     }
 
     if opens_command_line(session, &key, cx) {
-        let Some(editor) = active_editor(session, cx) else {
-            return Ok(None);
+        // No editor means an empty pane, and a `:` line with no range in front
+        // of it: the prefix is vim's pending count and visual range, neither of
+        // which exists without a buffer to have selected in.
+        let prefix = match active_editor(session, cx) {
+            Some(editor) => cx.update(|cx| crate::command_line::prefix_for(&editor, cx)),
+            None => String::new(),
         };
-        let prefix = cx.update(|cx| crate::command_line::prefix_for(&editor, cx));
         let mut command_line = CommandLine::new(prefix);
         command_line
             .refresh(session.backend.workspace.downgrade(), cx)
@@ -591,6 +604,24 @@ async fn handle_command_line_key(
                 // an action no keymap pass ever saw, and dispatching it would
                 // open a modal `ted` cannot paint.
                 Some(Effect::Dispatch(action)) => {
+                    // What "quit" means once the pane is empty (SPEC §24.7).
+                    // `:qa` empties every pane and the session ends when it
+                    // has, so the intent is recorded before the dispatch and
+                    // outlives whatever save prompt answering it needs.
+                    session.quit_when_empty |=
+                        action.as_any().is::<workspace::CloseAllItemsAndPanes>();
+                    // `:q` on a pane that is *already* empty ends the session
+                    // outright, and is not dispatched at all: the action would
+                    // reach `Pane::close_active_item`'s "ask the window to
+                    // close" path, and a terminal has no window to leave
+                    // behind — tearing one down under a `ted` that is already
+                    // shutting down only loses the workspace's handles.
+                    if action.as_any().is::<workspace::CloseActiveItem>()
+                        && cx.update(|cx| session.backend.is_empty(cx))
+                    {
+                        session.quit_when_empty = true;
+                        return Ok(None);
+                    }
                     match crate::actions::surface_for(action.as_ref()) {
                         Some(surface) => open_surface(session, surface, cx).await,
                         None => {
@@ -622,7 +653,10 @@ fn opens_command_line(session: &Session, key: &KeyEvent, cx: &mut AsyncApp) -> b
         return false;
     }
     let Some(editor) = active_editor(session, cx) else {
-        return false;
+        // An empty pane has no buffer for `:` to be a character in, so it is a
+        // command — which is what makes the hint screen's `:e`, `:Explore` and
+        // `:q` reachable at all (SPEC §24.7).
+        return session.backend.vim && cx.update(|cx| session.backend.is_empty(cx));
     };
 
     cx.update_window(session.backend.window.into(), |_, window, cx| {
@@ -773,7 +807,7 @@ fn build_snapshot(
             columns: session.columns,
             rows: session.rows,
             status: StatusView {
-                path: Some(format!(
+                takeover: Some(format!(
                     "terminal too small (need {MINIMUM_COLUMNS}x{MINIMUM_ROWS})"
                 )),
                 ..Default::default()
@@ -798,6 +832,7 @@ fn build_snapshot(
                     .unwrap_or_default(),
                 prompt,
                 notifications,
+                vim: session.backend.vim,
                 workspace: &session.backend.workspace,
             },
             window,

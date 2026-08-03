@@ -13,9 +13,9 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use crate::cell::{cluster_cells, text_cells};
 use crate::palette::Palette;
 use crate::snapshot::{
-    CellPoint, CellRect, CommandLineView, CreaseState, CursorShape, EditorView, HoverView,
-    MatchedText, OverlayPlacement, OverlayView, PromptView, RowView, SpanStyle, StatusView,
-    TabStripView, ViewSnapshot, tab_cells,
+    CellPoint, CellRect, CommandLineView, CreaseState, CursorShape, EditorView, HintView,
+    HoverView, MatchedText, MenuRow, MenuView, OverlayPlacement, OverlayView, PromptView, RowView,
+    SpanStyle, StatusView, StyledText, TabStripView, ViewSnapshot, tab_cells,
 };
 
 /// A prompt is always exactly this tall — the question on one row, the numbered
@@ -55,6 +55,11 @@ pub fn render(snapshot: &ViewSnapshot, palette: &Palette, buffer: &mut Buffer) {
     if let Some(editor) = &snapshot.editor {
         render_editor(editor, palette, buffer);
     }
+    // Mutually exclusive with the editor: this is what is painted when there is
+    // no item to paint (SPEC §24.7).
+    if let Some(hint) = &snapshot.hint {
+        render_hint(hint, snapshot.columns, snapshot.rows, palette, buffer);
+    }
     if let Some(tabs) = &snapshot.tabs {
         render_tabs(tabs, snapshot.columns, palette, buffer);
     }
@@ -63,6 +68,9 @@ pub fn render(snapshot: &ViewSnapshot, palette: &Palette, buffer: &mut Buffer) {
     if let Some(hover) = &snapshot.hover {
         render_hover(hover, palette, buffer);
     }
+    if let Some(menu) = &snapshot.menu {
+        render_menu(menu, palette, buffer);
+    }
     if let Some(overlay) = &snapshot.overlay {
         render_overlay(overlay, snapshot, palette, buffer);
     }
@@ -70,7 +78,13 @@ pub fn render(snapshot: &ViewSnapshot, palette: &Palette, buffer: &mut Buffer) {
     let Some(status_row) = snapshot.rows.checked_sub(1) else {
         return;
     };
-    render_status(&snapshot.status, snapshot.columns, status_row, buffer);
+    render_status(
+        &snapshot.status,
+        snapshot.columns,
+        status_row,
+        palette,
+        buffer,
+    );
 
     let mut next_row = status_row;
     if let Some(command_line) = &snapshot.command_line {
@@ -444,14 +458,231 @@ fn render_hover(hover: &HoverView, palette: &Palette, buffer: &mut Buffer) {
             }
             write("▌", Rect::new(area.x, y, 1, 1), rail, buffer);
             if area.width > 2 {
-                write(
+                write_styled(
                     line,
                     Rect::new(area.x + 2, y, area.width - 2, 1),
                     ground,
+                    palette,
                     buffer,
                 );
             }
             y += 1;
+        }
+    }
+}
+
+/// The completions box, and the code-action menu in the same box (SPEC §24.9).
+///
+/// Three columns for a completion — label, kind word, signature — and one for an
+/// action, whose leading glyph is already part of its label. No documentation
+/// row: that is what `shift-k` is for, and leaving it out is what keeps the
+/// box's height a function of the entry count alone.
+fn render_menu(menu: &MenuView, palette: &Palette, buffer: &mut Buffer) {
+    let area = clamp(menu.rect, buffer.area);
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+
+    let ground = Style::default()
+        .fg(color_or_default(menu.foreground, palette))
+        .bg(color_or_default(menu.background, palette));
+    fill(area, ground, buffer);
+    render_border(
+        area,
+        None,
+        ground.fg(color_or_default(menu.border, palette)),
+        buffer,
+    );
+
+    let content = Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1);
+    let selection = menu
+        .selection_background
+        .map(|color| ground.bg(palette.color(color)));
+
+    for offset in 0..usize::from(area.height.saturating_sub(2)) {
+        let Some(row) = menu.rows.get(menu.first + offset) else {
+            break;
+        };
+        let Ok(offset) = u16::try_from(offset) else {
+            break;
+        };
+        let y = area.y + 1 + offset;
+
+        let selected = menu.selected == Some(menu.first + usize::from(offset));
+        let style = match (selected, selection) {
+            (true, Some(selection)) => selection,
+            (true, None) => ground.add_modifier(Modifier::REVERSED),
+            (false, _) => ground,
+        };
+        fill(Rect::new(content.x, y, content.width, 1), style, buffer);
+
+        match row {
+            MenuRow::Divider => render_rule(area, y, ground, buffer),
+            MenuRow::Header(label) => {
+                write(
+                    label,
+                    Rect::new(content.x, y, content.width, 1),
+                    style.add_modifier(Modifier::DIM),
+                    buffer,
+                );
+            }
+            MenuRow::Entry {
+                label,
+                matched,
+                kind,
+                signature,
+            } => {
+                let label_width = menu.kind_column.saturating_sub(1).min(content.width);
+                write_styled(
+                    label,
+                    Rect::new(content.x, y, label_width, 1),
+                    style,
+                    palette,
+                    buffer,
+                );
+                embolden(
+                    matched,
+                    &label.text,
+                    Rect::new(content.x, y, label_width, 1),
+                    buffer,
+                );
+                if let Some(kind) = kind
+                    && menu.kind_column < content.width
+                {
+                    write(
+                        kind,
+                        Rect::new(
+                            content.x + menu.kind_column,
+                            y,
+                            content.width - menu.kind_column,
+                            1,
+                        ),
+                        style.add_modifier(Modifier::DIM),
+                        buffer,
+                    );
+                }
+                if !signature.is_empty() && menu.signature_column < content.width {
+                    write_styled(
+                        signature,
+                        Rect::new(
+                            content.x + menu.signature_column,
+                            y,
+                            content.width - menu.signature_column,
+                            1,
+                        ),
+                        style,
+                        palette,
+                        buffer,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The screen an empty pane sits on (SPEC §24.7): the ways out of it, centred,
+/// keys in one column and what they do in the next.
+fn render_hint(hint: &HintView, columns: u16, rows: u16, palette: &Palette, buffer: &mut Buffer) {
+    let ground = Style::default()
+        .fg(color_or_default(hint.foreground, palette))
+        .bg(color_or_default(hint.background, palette));
+    // The whole grid above the status line, because there is no editor behind
+    // this to have filled it in already.
+    fill(
+        Rect::new(0, 0, columns, rows.saturating_sub(1)),
+        ground,
+        buffer,
+    );
+
+    let widest = hint
+        .rows
+        .iter()
+        .map(|row| {
+            hint.key_cells + 2 + text_cells(&row.description).min(u32::from(u16::MAX)) as u16
+        })
+        .max()
+        .unwrap_or(0);
+    let height = hint.rows.len().min(usize::from(u16::MAX)) as u16;
+    if widest == 0 || widest > columns || height + 1 >= rows {
+        return;
+    }
+
+    let x = (columns - widest) / 2;
+    let top = (rows.saturating_sub(1).saturating_sub(height)) / 2;
+    let accent = ground.fg(color_or_default(hint.accent, palette));
+    for (offset, row) in hint.rows.iter().enumerate() {
+        let Ok(offset) = u16::try_from(offset) else {
+            break;
+        };
+        let y = top + offset;
+        write_right(&row.key, x, hint.key_cells, y, accent, buffer);
+        write(
+            &row.description,
+            Rect::new(
+                x + hint.key_cells + 2,
+                y,
+                columns - x - hint.key_cells - 2,
+                1,
+            ),
+            ground,
+            buffer,
+        );
+    }
+}
+
+/// Writes styled text, then paints each span over the cells its byte range
+/// covers.
+///
+/// Two passes rather than one run at a time, because `Cell::set_style` merges:
+/// a span that names only a colour keeps the boldness `base` gave the row, and a
+/// span that names only weight keeps its colour.
+fn write_styled(
+    text: &StyledText,
+    area: Rect,
+    base: Style,
+    palette: &Palette,
+    buffer: &mut Buffer,
+) {
+    write(&text.text, area, base, buffer);
+    if text.spans.is_empty() {
+        return;
+    }
+
+    let table = crate::snapshot::byte_to_cell_table(&text.text);
+    for span in &text.spans {
+        let Some(&start) = table.get(span.range.start) else {
+            continue;
+        };
+        let end = table
+            .get(span.range.end)
+            .copied()
+            .unwrap_or_else(|| table.last().copied().unwrap_or(start));
+        let style = terminal_style(&span.style, palette);
+        for column in start..end.min(area.width) {
+            if let Some(cell) = buffer.cell_mut((area.x + column, area.y)) {
+                cell.set_style(style);
+            }
+        }
+    }
+}
+
+/// Bolds the cells a query matched, over whatever colour is already on them:
+/// colour says what kind of thing an entry is, weight says why it matched
+/// (SPEC §24.9).
+fn embolden(matched: &[usize], text: &str, area: Rect, buffer: &mut Buffer) {
+    if matched.is_empty() {
+        return;
+    }
+    let table = crate::snapshot::byte_to_cell_table(text);
+    for byte in matched {
+        let Some(&column) = table.get(*byte) else {
+            continue;
+        };
+        if column >= area.width {
+            continue;
+        }
+        if let Some(cell) = buffer.cell_mut((area.x + column, area.y)) {
+            cell.modifier.insert(Modifier::BOLD);
         }
     }
 }
@@ -775,46 +1006,170 @@ fn command_line_row(snapshot: &ViewSnapshot) -> Option<u16> {
     snapshot.rows.checked_sub(2)
 }
 
-fn render_status(status: &StatusView, columns: u16, row: u16, buffer: &mut Buffer) {
+/// The sparse bar (SPEC §21/M3.5): the mode and the diagnostic counts at the
+/// left, the cursor's position at the right, and whatever happens to be true in
+/// the middle — so the row is mostly empty most of the time.
+fn render_status(
+    status: &StatusView,
+    columns: u16,
+    row: u16,
+    palette: &Palette,
+    buffer: &mut Buffer,
+) {
     if columns == 0 {
         return;
     }
 
-    let mut line = String::new();
+    let area = Rect::new(0, row, columns, 1);
+    let ground = match (status.background, status.foreground) {
+        (Some(background), Some(foreground)) => Style::default()
+            .bg(palette.color(background))
+            .fg(palette.color(foreground)),
+        // A frame taken before there is a theme to read — "terminal too small"
+        // is the only one — has no colours to be legible in, and inverting
+        // whatever is behind the row is the one thing that always is.
+        _ => Style::default().add_modifier(Modifier::REVERSED),
+    };
+    fill(area, ground, buffer);
+
+    // The whole row, and the only thing on the bar that has to elide when the
+    // grid is narrow (SPEC §24.5).
+    if let Some(takeover) = &status.takeover {
+        write(&elide_middle(takeover, columns), area, ground, buffer);
+        return;
+    }
+
+    let mut left = 0u16;
     if let Some(mode) = &status.mode {
-        line.push_str(mode);
-        line.push(' ');
+        left = write_run(
+            mode,
+            left,
+            area,
+            ground.add_modifier(Modifier::BOLD),
+            buffer,
+        );
+        left = left.saturating_add(1);
     }
-    line.push_str(status.path.as_deref().unwrap_or("[No Name]"));
-    if status.dirty {
-        line.push_str(" [+]");
+    // Severity by colour and a neutral glyph, the same decision the buffer's
+    // underlines take (SPEC §24.8) — so the two never disagree about what an
+    // error looks like, and a project with nothing wrong with it says nothing.
+    if let Some(counts) = status.diagnostics.filter(|counts| !counts.is_empty()) {
+        for (count, color) in [
+            (counts.errors, counts.error_color),
+            (counts.warnings, counts.warning_color),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            let style = ground.fg(color_or_default(color, palette));
+            left = write_run(&format!("● {count}"), left, area, style, buffer);
+            left = left.saturating_add(1);
+        }
     }
-    if let Some((index, count)) = status.panes {
-        line.push_str(&format!(" [pane {index}/{count}]"));
+
+    let position = status
+        .position
+        .map(|(line, column)| format!("{line}:{column}"));
+    let right_cells = position
+        .as_deref()
+        .map(|text| text_cells(text).min(u32::from(columns)) as u16)
+        .unwrap_or(0);
+    if let Some(position) = &position {
+        write_right(position, 0, columns, row, ground, buffer);
+    }
+
+    // Everything that is true only sometimes, and leaves the row when it stops
+    // being true.
+    let mut transient = Vec::new();
+    if let Some(pending) = &status.pending_keys {
+        transient.push(pending.clone());
     }
     if status.rewrapping {
-        line.push_str(" [wrapping…]");
+        transient.push("wrapping…".to_owned());
+    }
+    if let Some((index, count)) = status.panes {
+        transient.push(format!("pane {index}/{count}"));
+    }
+    if status.empty {
+        transient.push("no buffer".to_owned());
+    }
+    if transient.is_empty() {
+        return;
     }
 
-    let mut right = String::new();
-    if let Some(pending) = &status.pending_keys {
-        right.push_str(pending);
-        right.push(' ');
+    let middle = transient.join("  ");
+    let cells = text_cells(&middle).min(u32::from(columns)) as u16;
+    let gap = columns.saturating_sub(right_cells).saturating_sub(left);
+    // Dropped rather than truncated when it does not fit: half a pending
+    // keystroke is worse than none, and everything here is on the row only
+    // because it is momentarily true.
+    if cells == 0 || cells + 2 > gap {
+        return;
     }
-    if let Some((line_number, column)) = status.position {
-        right.push_str(&format!("{line_number}:{column}"));
+    let x = left + (gap - cells) / 2;
+    write(
+        &middle,
+        Rect::new(x, row, columns.saturating_sub(x), 1),
+        ground,
+        buffer,
+    );
+}
+
+/// Keeps the head and the tail of a string and drops its middle.
+///
+/// Written for vim's `ctrl-g` location string, which is a path followed by a
+/// line count and a percentage: the numbers are short and sit at the end, so
+/// what a narrow grid eats is the middle of the path — the part a reader can
+/// most easily do without, since the file's name is at one end of it and its
+/// worktree at the other.
+fn elide_middle(text: &str, width: u16) -> String {
+    let width = usize::from(width);
+    if text_cells(text) as usize <= width || width == 0 {
+        return text.to_owned();
+    }
+    if width <= 1 {
+        return "…".to_owned();
     }
 
-    let style = Style::default().add_modifier(Modifier::REVERSED);
-    let area = Rect::new(0, row, columns, 1);
-    fill(area, style, buffer);
-    write(&line, area, style, buffer);
+    const TAIL_CELLS: usize = 18;
+    let tail_cells = (width / 2).min(TAIL_CELLS);
+    let head_cells = width - 1 - tail_cells;
 
-    let right_cells = text_cells(&right).min(u32::from(columns)) as u16;
-    if right_cells > 0 {
-        let start = columns - right_cells;
-        write(&right, Rect::new(start, row, right_cells, 1), style, buffer);
+    let mut head = String::new();
+    let mut cells = 0usize;
+    for cluster in text.graphemes(true) {
+        let next = cells + cluster_cells(cluster) as usize;
+        if next > head_cells {
+            break;
+        }
+        head.push_str(cluster);
+        cells = next;
     }
+
+    let mut tail = String::new();
+    let mut cells = 0usize;
+    for cluster in text.graphemes(true).rev() {
+        let next = cells + cluster_cells(cluster) as usize;
+        if next > tail_cells {
+            break;
+        }
+        tail.insert_str(0, cluster);
+        cells = next;
+    }
+
+    format!("{head}…{tail}")
+}
+
+/// Writes at `x` cells into a one-row area and reports where the next run may
+/// start.
+fn write_run(text: &str, x: u16, area: Rect, style: Style, buffer: &mut Buffer) -> u16 {
+    let room = area.width.saturating_sub(x);
+    let cells = text_cells(text).min(u32::from(room)) as u16;
+    if cells == 0 {
+        return x;
+    }
+    write(text, Rect::new(area.x + x, area.y, cells, 1), style, buffer);
+    x + cells
 }
 
 fn render_command_line(
@@ -959,22 +1314,7 @@ fn color_or_default(color: Option<gpui::Hsla>, palette: &Palette) -> ratatui::st
 /// thing a list row does that plain text does not.
 fn write_matched(text: &MatchedText, area: Rect, style: Style, buffer: &mut Buffer) {
     write(&text.text, area, style, buffer);
-    if text.matched.is_empty() {
-        return;
-    }
-
-    let table = crate::snapshot::byte_to_cell_table(&text.text);
-    for byte in &text.matched {
-        let Some(&column) = table.get(*byte) else {
-            continue;
-        };
-        if column >= area.width {
-            continue;
-        }
-        if let Some(cell) = buffer.cell_mut((area.x + column, area.y)) {
-            cell.modifier.insert(Modifier::BOLD);
-        }
-    }
+    embolden(&text.matched, &text.text, area, buffer);
 }
 
 /// Right-aligns `text` inside a run of cells, clipping it away entirely rather
@@ -1063,8 +1403,8 @@ mod tests {
     use super::*;
     use crate::palette::ColorDepth;
     use crate::snapshot::{
-        CreaseState, DiffMarker, GutterView, HoverBlock, OverlayRow, QueryView, RowKind,
-        SelectionSpan, StyledSpan, TabView, Underline,
+        CreaseState, DiagnosticCounts, DiffMarker, GutterView, HintRow, HoverBlock, OverlayRow,
+        QueryView, RowKind, SelectionSpan, StyledSpan, TabView, Underline,
     };
     use gpui::hsla;
 
@@ -1149,7 +1489,7 @@ mod tests {
         assert_eq!(grid[0], "a   ");
         assert_eq!(grid[1], "b   ");
         // Row index 2 is the status line, so "c" and "d" have nowhere to go.
-        assert_eq!(grid[2], "[No Name]".chars().take(4).collect::<String>());
+        assert_eq!(grid[2], "    ");
     }
 
     #[test]
@@ -1159,28 +1499,104 @@ mod tests {
         assert_eq!(grid[0], "e\u{0301}x  ");
     }
 
+    /// SPEC §21/M3.5: the mode and the counts at the left, the position at the
+    /// right, no path anywhere, and an otherwise empty row.
     #[test]
-    fn the_status_line_reports_mode_path_and_dirty_state() {
+    fn the_status_line_carries_the_mode_the_counts_and_the_position() {
         let mut snapshot = snapshot_of(30, 2, &["x"]);
         snapshot.status = StatusView {
             mode: Some("NORMAL".to_owned()),
-            path: Some("a.rs".to_owned()),
-            dirty: true,
             position: Some((3, 7)),
+            diagnostics: Some(DiagnosticCounts {
+                errors: 2,
+                warnings: 1,
+                error_color: Some(hsla(0.0, 0.8, 0.5, 1.0)),
+                warning_color: Some(hsla(0.1, 0.8, 0.5, 1.0)),
+            }),
             ..Default::default()
         };
-        assert_eq!(grid(&snapshot)[1], "NORMAL a.rs [+]            3:7");
+        assert_eq!(grid(&snapshot)[1], "NORMAL ● 2 ● 1             3:7");
     }
 
     #[test]
-    fn pending_keys_sit_beside_the_cursor_position() {
+    fn a_project_with_nothing_wrong_with_it_says_nothing() {
+        let mut snapshot = snapshot_of(20, 2, &["x"]);
+        snapshot.status = StatusView {
+            mode: Some("NORMAL".to_owned()),
+            diagnostics: Some(DiagnosticCounts::default()),
+            position: Some((1, 1)),
+            ..Default::default()
+        };
+        assert_eq!(grid(&snapshot)[1], "NORMAL           1:1");
+    }
+
+    /// The counts are told apart by colour and nothing else, the same decision
+    /// the buffer's underlines take (SPEC §24.8).
+    #[test]
+    fn the_two_counts_are_told_apart_by_colour() {
+        let mut snapshot = snapshot_of(20, 2, &["x"]);
+        let error = hsla(0.0, 0.8, 0.5, 1.0);
+        let warning = hsla(0.1, 0.8, 0.5, 1.0);
+        snapshot.status = StatusView {
+            diagnostics: Some(DiagnosticCounts {
+                errors: 1,
+                warnings: 1,
+                error_color: Some(error),
+                warning_color: Some(warning),
+            }),
+            ..Default::default()
+        };
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 2));
+        render(&snapshot, &palette(), &mut buffer);
+        assert_eq!(
+            buffer.cell((0, 1)).map(|cell| cell.fg),
+            Some(palette().color(error))
+        );
+        assert_eq!(
+            buffer.cell((4, 1)).map(|cell| cell.fg),
+            Some(palette().color(warning))
+        );
+    }
+
+    /// Everything transient sits in the middle of the row, between the standing
+    /// left group and the standing right one (SPEC §21/M3.5).
+    #[test]
+    fn pending_keys_sit_in_the_middle_of_the_row() {
         let mut snapshot = snapshot_of(20, 2, &["x"]);
         snapshot.status = StatusView {
             pending_keys: Some("d2".to_owned()),
             position: Some((1, 1)),
             ..Default::default()
         };
-        assert_eq!(grid(&snapshot)[1], "[No Name]     d2 1:1");
+        assert_eq!(grid(&snapshot)[1], "       d2        1:1");
+    }
+
+    /// `ctrl-g` takes the whole row rather than opening a surface or claiming
+    /// the notification line (SPEC §24.5).
+    #[test]
+    fn the_location_string_takes_the_whole_row() {
+        let mut snapshot = snapshot_of(30, 2, &["x"]);
+        snapshot.status = StatusView {
+            mode: Some("NORMAL".to_owned()),
+            position: Some((3, 7)),
+            takeover: Some("src/a.rs 12 lines --25%--".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(grid(&snapshot)[1], "src/a.rs 12 lines --25%--     ");
+    }
+
+    /// The one thing on the bar that elides, and what it drops first is the
+    /// middle of the path (SPEC §23's remaining list).
+    #[test]
+    fn a_narrow_grid_eats_the_middle_of_the_path_and_keeps_the_numbers() {
+        let elided = elide_middle("crates/ted/src/snapshot.rs 2064 lines --50%--", 30);
+        assert_eq!(text_cells(&elided), 30);
+        assert!(elided.starts_with("crates/te"), "{elided:?}");
+        assert!(elided.ends_with("--50%--"), "{elided:?}");
+        assert_eq!(
+            elide_middle("a.rs 1 lines --0%--", 40),
+            "a.rs 1 lines --0%--"
+        );
     }
 
     #[test]
@@ -1267,7 +1683,7 @@ mod tests {
         });
         let grid = grid(&snapshot);
         assert_eq!(grid[2], ":wq                 ");
-        assert!(grid[3].starts_with("[No Name]"));
+        assert_eq!(grid[3].trim_end(), "");
     }
 
     #[test]
@@ -1284,7 +1700,7 @@ mod tests {
         let grid = grid(&snapshot);
         assert_eq!(grid[2].trim_end(), "unable to save");
         assert_eq!(grid[3].trim_end(), "/needle  2/9");
-        assert!(grid[4].starts_with("[No Name]"));
+        assert_eq!(grid[4].trim_end(), "");
     }
 
     #[test]
@@ -1296,7 +1712,8 @@ mod tests {
         };
         let grid = grid(&snapshot);
         assert_eq!(grid[0], "            ");
-        assert_eq!(grid[1], "[No Name]   ");
+        // The sparse bar with nothing true on it is an empty row (SPEC §21/M3.5).
+        assert_eq!(grid[1], "            ");
     }
 
     #[test]
@@ -1326,7 +1743,7 @@ mod tests {
         let grid = grid(&snapshot);
         assert_eq!(grid[2].trim_end(), "a.rs has changes. Save them?");
         assert_eq!(grid[3].trim_end(), "[1] Save  [2] Don't Save  [3] Cancel");
-        assert!(grid[4].starts_with("[No Name]"));
+        assert_eq!(grid[4].trim_end(), "");
     }
 
     #[test]
@@ -1347,7 +1764,7 @@ mod tests {
         assert_eq!(grid[2].trim_end(), "Overwrite? — changed on disk");
         assert_eq!(grid[3].trim_end(), "[1] Overwrite  [2] Cancel");
         assert_eq!(grid[4].trim_end(), ":q");
-        assert!(grid[5].starts_with("[No Name]"));
+        assert_eq!(grid[5].trim_end(), "");
     }
 
     fn overlay_row(label: &str, detail: &str) -> OverlayRow {
@@ -1613,11 +2030,17 @@ mod tests {
             blocks: vec![
                 HoverBlock {
                     rail: Some(error),
-                    lines: vec!["error E0061".to_owned(), "takes 5 arguments".to_owned()],
+                    lines: vec![
+                        StyledText::plain("error E0061"),
+                        StyledText::plain("takes 5 arguments"),
+                    ],
                 },
                 HoverBlock {
                     rail: Some(hsla(0.6, 0.5, 0.5, 1.0)),
-                    lines: vec![String::new(), "fn f(a: u16) -> Row".to_owned()],
+                    lines: vec![
+                        StyledText::default(),
+                        StyledText::plain("fn f(a: u16) -> Row"),
+                    ],
                 },
             ],
         });
@@ -1641,6 +2064,178 @@ mod tests {
             buffer.cell((2, 1)).map(|cell| cell.fg),
             Some(palette().color(text))
         );
+    }
+
+    /// SPEC §21/M3.5: markdown reaches the panel as styling rather than as
+    /// stripped text, so a rendered line's spans have to survive the projection
+    /// and land on the cells they cover.
+    #[test]
+    fn a_rendered_markdown_line_keeps_its_styling_in_the_panel() {
+        let mut snapshot = snapshot_of(40, 6, &["let x = f();"]);
+        let code = hsla(0.2, 0.5, 0.5, 1.0);
+        snapshot.hover = Some(HoverView {
+            rect: CellRect::new(0, 1, 40, 2),
+            background: None,
+            foreground: Some(hsla(0.0, 0.0, 0.9, 1.0)),
+            blocks: vec![HoverBlock {
+                rail: None,
+                lines: vec![StyledText {
+                    text: "takes a Row".to_owned(),
+                    spans: vec![StyledSpan {
+                        range: 8..11,
+                        style: SpanStyle {
+                            foreground: Some(code),
+                            bold: true,
+                            ..Default::default()
+                        },
+                    }],
+                }],
+            }],
+        });
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 6));
+        render(&snapshot, &palette(), &mut buffer);
+        // The rail takes a cell and a space, so byte 8 of the line is cell 10.
+        assert_eq!(
+            buffer.cell((10, 1)).map(|cell| cell.fg),
+            Some(palette().color(code))
+        );
+        assert!(
+            buffer
+                .cell((10, 1))
+                .is_some_and(|cell| cell.modifier.contains(Modifier::BOLD))
+        );
+        // And the prose either side of it is left alone.
+        assert!(
+            buffer
+                .cell((2, 1))
+                .is_some_and(|cell| !cell.modifier.contains(Modifier::BOLD))
+        );
+    }
+
+    fn completion(label: &str, kind: &str, signature: &str, matched: Vec<usize>) -> MenuRow {
+        MenuRow::Entry {
+            label: StyledText::plain(label),
+            matched,
+            kind: Some(kind.to_owned()),
+            signature: StyledText::plain(signature),
+        }
+    }
+
+    /// SPEC §24.9: three columns, lined up down the box, and no documentation
+    /// row under the list.
+    #[test]
+    fn the_completions_box_lays_its_three_columns_out_in_line() {
+        let mut snapshot = snapshot_of(40, 10, &["let x = f"]);
+        snapshot.menu = Some(MenuView {
+            rect: CellRect::new(0, 1, 32, 4),
+            rows: vec![
+                completion("filter", "fn", "(self) -> Iter", vec![0]),
+                completion("first", "fn", "(self) -> Option", vec![0]),
+            ],
+            selected: Some(0),
+            first: 0,
+            kind_column: 7,
+            signature_column: 13,
+            background: None,
+            foreground: Some(hsla(0.0, 0.0, 0.9, 1.0)),
+            selection_background: None,
+            border: None,
+        });
+
+        let grid = grid(&snapshot);
+        assert_eq!(grid[1].trim_end(), "╭──────────────────────────────╮");
+        assert_eq!(grid[2].trim_end(), "│filter fn    (self) -> Iter   │");
+        assert_eq!(grid[3].trim_end(), "│first  fn    (self) -> Option │");
+        assert_eq!(grid[4].trim_end(), "╰──────────────────────────────╯");
+    }
+
+    /// Colour says what kind of thing an entry is, weight says why it matched,
+    /// and the two are orthogonal (SPEC §24.9).
+    #[test]
+    fn the_typed_characters_are_bold_over_whatever_colour_the_label_has() {
+        let mut snapshot = snapshot_of(40, 8, &["f"]);
+        let syntax = hsla(0.5, 0.5, 0.5, 1.0);
+        snapshot.menu = Some(MenuView {
+            rect: CellRect::new(0, 1, 20, 3),
+            rows: vec![MenuRow::Entry {
+                label: StyledText {
+                    text: "filter".to_owned(),
+                    spans: vec![StyledSpan {
+                        range: 0..6,
+                        style: SpanStyle {
+                            foreground: Some(syntax),
+                            ..Default::default()
+                        },
+                    }],
+                },
+                matched: vec![0],
+                kind: None,
+                signature: StyledText::default(),
+            }],
+            selected: Some(0),
+            first: 0,
+            kind_column: 7,
+            signature_column: 8,
+            background: None,
+            foreground: Some(hsla(0.0, 0.0, 0.9, 1.0)),
+            selection_background: None,
+            border: None,
+        });
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 8));
+        render(&snapshot, &palette(), &mut buffer);
+        let matched = buffer.cell((1, 2)).expect("no cell for the matched byte");
+        assert_eq!(matched.fg, palette().color(syntax));
+        assert!(matched.modifier.contains(Modifier::BOLD));
+        // The rest of the label is the same colour and not bold.
+        let rest = buffer.cell((2, 2)).expect("no cell after the match");
+        assert_eq!(rest.fg, palette().color(syntax));
+        assert!(!rest.modifier.contains(Modifier::BOLD));
+    }
+
+    /// SPEC §24.7: an empty pane is a state `ted` sits in, and the screen names
+    /// the ways out of it rather than leaving a blank grid.
+    #[test]
+    fn an_empty_pane_names_the_ways_out_of_it() {
+        let snapshot = ViewSnapshot {
+            columns: 30,
+            rows: 8,
+            status: StatusView {
+                empty: true,
+                ..Default::default()
+            },
+            hint: Some(HintView {
+                rows: vec![
+                    HintRow {
+                        key: "ctrl-p".to_owned(),
+                        description: "find a file".to_owned(),
+                    },
+                    HintRow {
+                        key: ":q".to_owned(),
+                        description: "quit ted".to_owned(),
+                    },
+                ],
+                key_cells: 6,
+                background: None,
+                foreground: None,
+                accent: None,
+            }),
+            ..Default::default()
+        };
+
+        let grid = grid(&snapshot);
+        assert!(
+            grid.iter().any(|row| row.contains("ctrl-p  find a file")),
+            "{grid:?}"
+        );
+        // Right-aligned in the key column, so the descriptions line up.
+        assert!(
+            grid.iter().any(|row| row.contains("    :q  quit ted")),
+            "{grid:?}"
+        );
+        // And the bar says there is nothing open rather than going silent.
+        assert!(grid[7].contains("no buffer"), "{:?}", grid[7]);
     }
 
     #[test]
